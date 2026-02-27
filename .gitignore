@@ -1,0 +1,8 @@
+tests/
+*.ipynb
+*.wav
+*.mp3
+results/
+__pycache__/
+*.pt
+
