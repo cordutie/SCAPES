@@ -1,8 +1,15 @@
+# Non-publishable code
 tests/
 *.ipynb
+
+# Ignore audio files and results
 *.wav
 *.mp3
 results/
-__pycache__/
 *.pt
+datasets/
+
+# Ignore Python cache files
+__pycache__/
+
 
