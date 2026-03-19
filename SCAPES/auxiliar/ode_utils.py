@@ -3,8 +3,6 @@ import torch
 import torch.nn as nn
 from torchdiffeq import odeint
 
-# (Assuming AtomFlowGenerator, AtomEncoder, and MemoryPositionalEncoding are imported here)
-
 # ==========================================
 # 1. YOUR ODE SOLVER LOGIC
 # ==========================================

@@ -1,0 +1,8 @@
+torchdiffeq
+torch
+librosa
+numpy
+matplotlib
+soundfile
+transformers
+tqdm

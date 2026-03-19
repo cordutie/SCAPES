@@ -1,6 +1,7 @@
 # Non-publishable code
 tests/
-*.ipynb
+slowstart/
+dev/
 
 # Ignore audio files and results
 *.wav

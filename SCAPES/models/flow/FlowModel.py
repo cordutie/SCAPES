@@ -1,17 +1,45 @@
 import torch
 import torch.nn as nn
-from models.flow.PosEnc import MemoryPositionalEncoding, RotaryEmbedding
-from auxiliar.ode_util_v2 import sample_with_ode_capped
+from SCAPES.models.flow.PosEnc import MemoryPositionalEncoding, RotaryEmbedding
+from SCAPES.auxiliar.ode_utils import sample_with_ode_capped
+import json
+
+def load_flow_model(checkpoint_path, json_path, device="cpu"):
+    """Loads the FlowModel using the saved JSON config and PT weights."""
+    with open(json_path, 'r') as f:
+        config = json.load(f)
+        
+    model = FlowModel(
+        frame_dim=config.get("frame_dim", 129),
+        context_vector_dim=config.get("context_vector_dim", 1024),
+        num_past_atoms=config.get("num_past_atoms", 5),
+        frames_per_atom=config.get("frames_per_atom", 21),
+        d_model=config.get("d_model", 256),
+        nhead=config.get("nhead", 8),
+        num_layers=config.get("num_layers", 6),
+        dim_feedforward=config.get("dim_feedforward", 1024),
+        device=device # Crucial: pass the device so memory_pos_enc initializes on the right hardware
+    )
+    
+    # Handle the difference between a raw state_dict and your custom resume dict
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+        
+    model.eval()
+    return model.to(device)
 
 class AdaLN(nn.Module):
     """
     Adaptive Layer Normalization.
     Injects the Time (s) and Context (CLAP) into the network by modulating the normalization.
     """
-    def __init__(self, d_model, cond_dim):
+    def __init__(self, d_model, cond_dim, device=None):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
-        self.proj = nn.Linear(cond_dim, d_model * 2)
+        self.norm = nn.LayerNorm(d_model, elementwise_affine=False, device=device)
+        self.proj = nn.Linear(cond_dim, d_model * 2, device=device)
         
         # Initialize projection to output exactly 0 so it starts as a standard LayerNorm
         nn.init.zeros_(self.proj.weight)
@@ -23,25 +51,26 @@ class AdaLN(nn.Module):
         beta = beta.unsqueeze(1)
         return self.norm(x) * (1 + gamma) + beta
 
+
 class TransformerLayer(nn.Module):
     """
     A standard Flow Matching Transformer Layer using AdaLN.
     """
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, cond_dim: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, cond_dim: int, dropout: float = 0.1, device=None):
         super().__init__()
         
-        self.norm1 = AdaLN(d_model, cond_dim)
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm1 = AdaLN(d_model, cond_dim, device=device)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True, device=device)
         
-        self.norm2 = AdaLN(d_model, cond_dim)
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm2 = AdaLN(d_model, cond_dim, device=device)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True, device=device)
         
-        self.norm3 = AdaLN(d_model, cond_dim)
+        self.norm3 = AdaLN(d_model, cond_dim, device=device)
         self.ffn = nn.Sequential(
-            nn.Linear(d_model, dim_feedforward),
+            nn.Linear(d_model, dim_feedforward, device=device),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
+            nn.Linear(dim_feedforward, d_model, device=device),
             nn.Dropout(dropout)
         )
 
@@ -75,36 +104,40 @@ class VectorField(nn.Module):
         dim_feedforward: int = 1024,
         context_dim: int = 1024,
         max_atom_frames: int = 21,
+        device=None
     ):
         super().__init__()
         self.d_model = d_model
         
         # --- 1. Target Encoding Pipeline (The Present/Future) ---
-        self.target_proj = nn.Linear(frame_dim, d_model)
+        self.target_proj = nn.Linear(frame_dim, d_model, device=device)
+        
+        # Note: Depending on your implementation of RotaryEmbedding, you might need to pass device here too.
+        # Leaving it untouched to avoid breaking imported code. It normally handles device via registered buffers.
         self.target_rope = RotaryEmbedding(d_model, max_position=max_atom_frames+1)
         
         # --- 2. Global Conditioning (Time + Timbre) ---
         cond_dim = d_model 
         self.time_mlp = nn.Sequential(
-            nn.Linear(1, d_model),
+            nn.Linear(1, d_model, device=device),
             nn.GELU(),
-            nn.Linear(d_model, cond_dim)
+            nn.Linear(d_model, cond_dim, device=device)
         )
         self.context_mlp = nn.Sequential(
-            nn.Linear(context_dim, d_model),
+            nn.Linear(context_dim, d_model, device=device),
             nn.GELU(),
-            nn.Linear(d_model, cond_dim)
+            nn.Linear(d_model, cond_dim, device=device)
         )
         
         # --- 3. The Transformer ---
         self.layers = nn.ModuleList([
-            TransformerLayer(d_model, nhead, dim_feedforward, cond_dim)
+            TransformerLayer(d_model, nhead, dim_feedforward, cond_dim, device=device)
             for _ in range(num_layers)
         ])
         
         # --- 4. Output Projection ---
-        self.final_norm = AdaLN(d_model, cond_dim)
-        self.output_proj = nn.Linear(d_model, frame_dim)
+        self.final_norm = AdaLN(d_model, cond_dim, device=device)
+        self.output_proj = nn.Linear(d_model, frame_dim, device=device)
         
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
@@ -146,6 +179,7 @@ class VectorField(nn.Module):
         
         return velocity_field
 
+
 class FlowModel(nn.Module):
     """
     Wrapper for the Flow Matching Generator.
@@ -160,11 +194,17 @@ class FlowModel(nn.Module):
         d_model: int = 256,                    
         nhead: int = 8,                        
         num_layers: int = 6,                   
-        dim_feedforward: int = 1024,           
+        dim_feedforward: int = 1024,
+        device=None           
     ):
         super().__init__()
         
+        # --- Learned NULL token for missing past atoms ---
+        # Shape: (1, 1, 21, d_model) -> Broadcastable across Batch and N_past
+        self.null_past_embed = nn.Parameter(torch.randn(1, 1, frames_per_atom, d_model) * 0.02)
+
         # 1. Positional Encoding (Applies Macro & Micro time to the already-encoded past)
+        # Assuming MemoryPositionalEncoding handles device intrinsically or via .to(device)
         self.memory_pos_enc = MemoryPositionalEncoding(
             d_model=d_model, 
             n_atoms_max=num_past_atoms + 5, 
@@ -179,7 +219,8 @@ class FlowModel(nn.Module):
             num_layers=num_layers,
             dim_feedforward=dim_feedforward,
             context_dim=context_vector_dim,
-            max_atom_frames=frames_per_atom
+            max_atom_frames=frames_per_atom,
+            device=device
         )
 
     def prepare_memory(self, encoded_past: torch.Tensor) -> torch.Tensor:
@@ -216,6 +257,7 @@ class FlowModel(nn.Module):
         """
         # Prepare context dictionary
         memory = self.prepare_memory(encoded_past)
+
         context_dict = {'memory': memory, 'clap': clap_context}
         
         # Run the ODE solver using the user-provided x0

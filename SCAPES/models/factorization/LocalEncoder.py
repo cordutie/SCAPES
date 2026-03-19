@@ -1,5 +1,29 @@
 import torch
 import torch.nn as nn
+import json
+
+def load_local_encoder(checkpoint_path, json_path, device="cpu"):
+    """Loads the LocalEncoder using the saved JSON config and PT weights."""
+    with open(json_path, 'r') as f:
+        config = json.load(f)
+        
+    model = LocalEncoder(
+        in_channels=config.get("in_channels", 129),
+        hidden_dim=config.get("hidden_dim", 256),
+        out_channels=config.get("out_channels", 256), # This is your d_model
+        time_entanglement=config.get("time_entanglement", True),
+        temporal_compression=config.get("temporal_compression", 1)
+    )
+    
+    # Handle the difference between a raw state_dict and your custom resume dict
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+        
+    model.eval()
+    return model.to(device)
 
 # ==========================================
 # 1. ATOM ENCODER (Unified CNN / MLP)

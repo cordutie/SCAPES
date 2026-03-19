@@ -1,10 +1,36 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import json
+
+def load_global_encoder(checkpoint_path, json_path, device="cpu"):
+    """Loads the GlobalEncoder using the saved JSON config and PT weights."""
+    with open(json_path, 'r') as f:
+        config = json.load(f)
+        
+    model = GlobalEncoder(
+        latent_dim=config.get("latent_dim", 128),
+        frames_per_atom=config.get("frames_per_atom", 21),
+        cnn_hidden=config.get("cnn_hidden", 256),
+        transformer_dim=config.get("transformer_dim", 256),
+        num_heads=config.get("num_heads", 4),
+        num_layers=config.get("num_layers", 4),
+        clap_dim=config.get("clap_dim", 1024)
+    )
+    
+    # Handle the difference between a raw state_dict and your custom resume dict
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
+        
+    model.eval()
+    return model.to(device)
 
 class GlobalEncoder(nn.Module):
     def __init__(self, latent_dim=128, frames_per_atom=21, cnn_hidden=256, 
-                 transformer_dim=512, num_heads=8, num_layers=4, clap_dim=1024):
+                 transformer_dim=256, num_heads=4, num_layers=4, clap_dim=1024):
         super().__init__()
         
         # 1. Intra-Atom CNN (Local)

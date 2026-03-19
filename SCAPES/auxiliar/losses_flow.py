@@ -32,33 +32,36 @@ def Dt_psi_conditioned(s, X0, X1):
     """The derivative of the path (the target velocity vector)."""
     return X1 - X0
 
-def flow_matching_loss(model, x1, context, encoded_past):
+def flow_matching_loss(model, x0, x1, context, encoded_past, scale_weight=1.0):
     """
-    Computes the Flow Matching MSE loss.
-    x1: (B, T_frames, frame_dim) - Ground truth target atom
-    context: (B, context_dim) - CLAP embedding
-    encoded_past: (B, N_past, T_frames, d_model) - LocalEncoder output
-
-    Mathematically this is computing a estimator of the form:
-        E_{s ~ U(0,1), x0 ~ N(0,I)} [ || u_model(s, psi_conditioned(s, x0, x1), context) - Dt_psi_conditioned(s, x0, x1) ||^2 ]
+    x0, x1: (B, 21, 129)
+    scale_weight: Hyperparameter to boost the importance of the 129th channel.
     """
-    # 1. Generate Noise
-    x0 = torch.randn_like(x1) 
-    
-    # 2. Sample time 's'. 
-    # Shape it as (B, 1, 1) so it broadcasts perfectly over (B, T_frames, frame_dim) for the math
+    # 1. Sample time 's'
     s = torch.rand(x1.size(0), 1, 1, device=x1.device)
 
-    # 3. Calculate Path and Target Velocity
+    # 2. Calculate Path and Target Velocity
     xs = psi_conditioned(s, x0, X1=x1)
     u_conditioned = Dt_psi_conditioned(s, x0, X1=x1)
     
-    # 4. Predict Velocity
-    # The model expects 's' as (B, 1), so we squeeze the last dimension
+    # 3. Predict Velocity
     s_model = s.squeeze(-1) 
     u_model = model(x_t=xs, s=s_model, context_vector=context, encoded_past=encoded_past)
     
-    # 5. Compute MSE
-    loss = F.mse_loss(u_model, u_conditioned)
+    # --- NEW: Split Latents (0-127) and Scale (128) ---
+    # Velocity for latents
+    u_model_latents = u_model[:, :, :128]
+    u_cond_latents  = u_conditioned[:, :, :128]
     
-    return loss, u_model, u_conditioned
+    # Velocity for scale
+    u_model_scale = u_model[:, :, 128:]
+    u_cond_scale  = u_conditioned[:, :, 128:]
+    
+    # 4. Compute Independent MSEs
+    loss_latents = F.mse_loss(u_model_latents, u_cond_latents)
+    loss_scale   = F.mse_loss(u_model_scale, u_cond_scale)
+    
+    # Combine with weighting
+    total_loss = loss_latents + (scale_weight * loss_scale)
+    
+    return total_loss, loss_latents, loss_scale
