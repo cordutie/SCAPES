@@ -7,8 +7,13 @@ dev/
 *.wav
 *.mp3
 results/
-*.pt
 datasets/
+
+# Ignore all .pt files
+*.pt
+
+# But do NOT ignore .pt files in weights/ and its subfolders
+!SCAPES/**/*.pt
 
 # Ignore Python cache files
 __pycache__/
