@@ -1,5 +1,6 @@
 torchdiffeq
 torch
+torchaudio
 librosa
 numpy
 matplotlib

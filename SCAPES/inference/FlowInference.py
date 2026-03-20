@@ -32,7 +32,15 @@ class FlowInference:
         # 1. Load and lock models in eval mode
         self.model = model.to(self.device).eval()
         self.local_encoder = local_encoder.to(self.device).eval()
-        self.context_model = context_model.to(self.device).eval()
+
+        self.context_model_type = context_model.name # can be either "GlobalEncoder" or "CLAPWrapper"
+
+        # If GlobalEncoder is used, put in eval mode.
+        if self.context_model_type == "GlobalEncoder":
+            self.context_model = context_model.to(self.device).eval()
+        else:
+            self.context_model = context_model # CLAPWrapper handles its own device and eval internally
+        
         self.processor = processor # Assumes processor handles its own device internally
         
         # 2. Structural Hyperparameters
@@ -135,6 +143,9 @@ class FlowInference:
         
         last_valid_emb = None
         
+        # Pre-view the OLA window for broadcasting during audio reconstruction
+        ola_window_local = self.ola_window.view(1, 1, -1)
+        
         for t in range(total_atoms):
             # Assuming context_shift is relative to the target atom t
             start_idx = t + self.context_shift 
@@ -145,15 +156,43 @@ class FlowInference:
                 # 1. We are safe. Grab the real sequence.
                 window_atoms = atoms_129D[start_idx:end_idx]
                 
-                # Stack into batch sequence: [1, N, 129, 21]
-                chunk_129D = torch.cat(window_atoms, dim=0).unsqueeze(0) 
-                
-                # Split for GlobalEncoder
-                latent = chunk_129D[:, :, :128, :] # [1, N, 128, 21]
-                scale = chunk_129D[:, :, 128, 0:1] # [1, N, 1]
-                
-                # Compute embedding
-                emb = self.context_model(latent, scale).squeeze(0) # [1024]
+                if self.context_model_type == "GlobalEncoder":
+                    # Stack into batch sequence: [1, N, 129, 21]
+                    chunk_129D = torch.cat(window_atoms, dim=0).unsqueeze(0) 
+                    
+                    # Split for GlobalEncoder
+                    latent = chunk_129D[:, :, :128, :] # [1, N, 128, 21]
+                    scale = chunk_129D[:, :, 128, 0:1] # [1, N, 1]
+                    
+                    # Compute embedding
+                    emb = self.context_model(latent, scale).squeeze(0) # [1024]
+                    
+                else:
+                    # --- CLAPWrapper AUDIO RECONSTRUCTION ---
+                    N = len(window_atoms)
+                    total_samples = (N - 1) * self.hop_samples + self.segment_samples
+                    window_audio = torch.zeros(1, 2, total_samples, device=self.device)
+                    
+                    # Decode and OLA each atom in the context window
+                    for i, atom in enumerate(window_atoms):
+                        # Decode (returns CPU tensor, so move to device for mixing)
+                        atom_audio = self._decode_single_atom(atom).to(self.device)
+                        
+                        # Apply OLA Hann window
+                        atom_audio = atom_audio * ola_window_local
+                        
+                        # Add to local window buffer
+                        start_sample = i * self.hop_samples
+                        end_sample = start_sample + self.segment_samples
+                        window_audio[:, :, start_sample:end_sample] += atom_audio
+                        
+                    # Compute CLAP embedding
+                    emb = self.context_model.compute_embedding(
+                        window_audio, 
+                        og_sr=self.sr, 
+                        random_extension=True
+                    ).squeeze(0) # [1024]
+
                 context_embeddings.append(emb)
                 
                 # Update our fallback
@@ -161,8 +200,7 @@ class FlowInference:
                 
             else:
                 # 2. We hit the edge of the file! 
-                # The GlobalEncoder would need padding here, which is bad.
-                # Instead, we just reuse the last valid acoustic goal.
+                # Instead of padding, we just reuse the last valid acoustic goal.
                 if last_valid_emb is not None:
                     context_embeddings.append(last_valid_emb)
                 else:
@@ -291,55 +329,110 @@ class FlowInference:
         return audio.cpu()
 
     @torch.no_grad()
-    def decode_timeline(self, timeline: List[Dict[str, Any]], output_path: str = None):
+    def decode_timeline(self, timeline: List[Dict[str, Any]], output_path: str = None, method: str = "ola"):
         """
-        REAL-TIME RENDERER:
-        Decodes atom-by-atom and applies the OLA window immediately.
+        Renders the timeline into audio.
+        method: 
+            - "ola": Real-time atom-by-atom decoding with Overlap-Add.
+            - "latent_stitch": Concatenates latents first (removing overlap tails), 
+                               decodes in one massive pass, then mixes.
         """
         if not timeline:
             raise ValueError("Timeline is empty!")
-        
-        if self.verbose:
-            print("\n--- Rendering Audio Timeline (Real-Time OLA) ---")
-        
-        total_steps = len(timeline)
-        total_samples = (total_steps - 1) * self.hop_samples + self.segment_samples
-        output_buffer = torch.zeros(1, 2, total_samples) # [1, Stereo, T]
-        
-        ola_window = self.ola_window.view(1, 1, -1).cpu()
+            
+        if method == "latent_stitch":
+            if self.verbose:
+                print("\n--- Rendering Audio Timeline (Latent Stitching Mode) ---")
+                
+            hop_frames = self.atoms_frames - self.atoms_overlap_frames
+            gen_chunks = []
+            given_chunks = []
+            
+            # --- THE FIX: A dummy zero atom for missing outpainting steps ---
+            dummy_atom = torch.zeros(1, 129, self.atoms_frames, device=self.device)
+            
+            # 1. Stitch latents (removing the right tail of overlap)
+            for t, step_dict in enumerate(timeline):
+                is_last = (t == len(timeline) - 1)
+                
+                # Safely fetch latents (fallback to dummy if None)
+                a_gen = step_dict.get("atom_generated")
+                a_giv = step_dict.get("atom_given")
+                
+                if a_gen is None: a_gen = dummy_atom
+                if a_giv is None: a_giv = dummy_atom
+                
+                if not is_last:
+                    gen_chunks.append(a_gen[:, :, :hop_frames])
+                    given_chunks.append(a_giv[:, :, :hop_frames])
+                else:
+                    # Keep the full tail for the very last atom
+                    gen_chunks.append(a_gen)
+                    given_chunks.append(a_giv)
+                    
+            stitched_gen = torch.cat(gen_chunks, dim=-1)
+            stitched_given = torch.cat(given_chunks, dim=-1)
+            
+            # 2. Decode the massive latent tensors at once
+            audio_gen = self._decode_single_atom(stitched_gen).to(self.device)
+            audio_given = self._decode_single_atom(stitched_given).to(self.device)
+            
+            # 3. Apply Audio Forcing (AF) Mix via a sample-accurate envelope
+            total_samples = audio_gen.shape[-1]
+            AF_envelope = torch.zeros(1, 1, total_samples, device=self.device)
+            
+            for t in range(len(timeline)):
+                AF = float(timeline[t].get("AF", 0.0))
+                AF = max(0.0, min(1.0, AF))
+                
+                start_sample = t * self.hop_samples
+                end_sample = start_sample + self.hop_samples if t < len(timeline) - 1 else total_samples
+                AF_envelope[:, :, start_sample:end_sample] = AF
+                
+            final_audio = torch.sqrt(AF_envelope) * audio_given + torch.sqrt(1.0 - AF_envelope) * audio_gen
+            final_audio_tensor = final_audio.squeeze(0).cpu()
 
-        for t in tqdm(range(total_steps), desc="Mixing Audio", disable=not self.verbose):
-            step_dict = timeline[t]
-            AF = float(step_dict.get("AF", 0.0))
-            AF = max(0.0, min(1.0, AF))
-            
-            audio_mix = torch.zeros(1, 2, self.segment_samples)
-            
-            # --- Selective Decoding to prevent unnecessary cache thrashing ---
-            # If AF is 1.0, we ONLY decode the given audio.
-            # If AF is 0.0, we ONLY decode the generated audio.
-            
-            if AF > 0.0:
-                audio_given = self._decode_single_atom(step_dict["atom_given"])
-                audio_mix += math.sqrt(AF) * audio_given
+        elif method == "ola":
+            if self.verbose:
+                print("\n--- Rendering Audio Timeline (Real-Time OLA Mode) ---")
                 
-            if AF < 1.0:
-                audio_generated = self._decode_single_atom(step_dict["atom_generated"])
-                audio_mix += math.sqrt(1.0 - AF) * audio_generated
+            total_steps = len(timeline)
+            total_samples = (total_steps - 1) * self.hop_samples + self.segment_samples
+            output_buffer = torch.zeros(1, 2, total_samples) # [1, Stereo, T]
+            ola_window = self.ola_window.view(1, 1, -1).cpu()
+
+            for t in tqdm(range(total_steps), desc="Mixing Audio", disable=not self.verbose):
+                step_dict = timeline[t]
+                AF = float(step_dict.get("AF", 0.0))
+                AF = max(0.0, min(1.0, AF))
                 
-            # Apply the OLA Hann Window
-            audio_mix = audio_mix * ola_window
+                audio_mix = torch.zeros(1, 2, self.segment_samples)
+                
+                # Safely skip decoding if the latent is missing
+                if AF > 0.0 and step_dict.get("atom_given") is not None:
+                    audio_given = self._decode_single_atom(step_dict["atom_given"])
+                    audio_mix += math.sqrt(AF) * audio_given
+                    
+                if AF < 1.0 and step_dict.get("atom_generated") is not None:
+                    audio_generated = self._decode_single_atom(step_dict["atom_generated"])
+                    audio_mix += math.sqrt(1.0 - AF) * audio_generated
+                    
+                audio_mix = audio_mix * ola_window
+                
+                start_sample = t * self.hop_samples
+                end_sample = start_sample + self.segment_samples
+                output_buffer[:, :, start_sample:end_sample] += audio_mix
+                
+            final_audio_tensor = output_buffer.squeeze(0)
             
-            # Add to the global timeline buffer
-            start_sample = t * self.hop_samples
-            end_sample = start_sample + self.segment_samples
-            output_buffer[:, :, start_sample:end_sample] += audio_mix
-            
-        final_audio_tensor = output_buffer.squeeze(0)
-        
+        else:
+            raise ValueError(f"Unknown rendering method: {method}")
+
+        # Final Save and Return
         if output_path:
             sf_audio = final_audio_tensor.transpose(0, 1).numpy()
             sf.write(output_path, sf_audio, self.sr)
-            print(f"✅ Audio perfectly rendered and saved to: {output_path}")
+            if self.verbose:
+                print(f"✅ Audio perfectly rendered and saved to: {output_path}")
             
         return final_audio_tensor

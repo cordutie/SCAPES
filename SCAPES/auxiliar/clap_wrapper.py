@@ -10,6 +10,8 @@ class CLAPWrapper(CLAPWrapper):
     def __init__(self, version="2023", use_cuda=False):
         super().__init__(version=version, use_cuda=use_cuda)
 
+        self.name = "CLAPWrapper"
+
     def compute_embedding(self, audio, og_sr=48000, random_extension=True):
         # Check that dimensions are B x C x T
         if audio.dim() != 3:

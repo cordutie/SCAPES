@@ -32,6 +32,8 @@ class GlobalEncoder(nn.Module):
     def __init__(self, latent_dim=128, frames_per_atom=21, cnn_hidden=256, 
                  transformer_dim=256, num_heads=4, num_layers=4, clap_dim=1024):
         super().__init__()
+
+        self.name = "GlobalEncoder"
         
         # 1. Intra-Atom CNN (Local)
         # Input channels = latent_dim (128) + 1 (scale) = 129

@@ -113,9 +113,9 @@ class AtomSequenceDataset(Dataset):
         #     print(f"Annotations target: {self.annotations_dir.name}/{self.config_folder_name}/...")
         
         # Calculate samples logic
-        self.segment_samples = self.atoms_frames * self.samples_per_frame
+        self.atoms_samples   = self.atoms_frames * self.samples_per_frame
         self.overlap_samples = self.atoms_overlap_frames * self.samples_per_frame
-        self.hop_samples     = self.segment_samples - self.overlap_samples
+        self.hop_samples     = self.atoms_samples - self.overlap_samples
 
         self.filenames = sorted(list(self.manifest.keys()))
         self.all_indices = self._build_mapping(self.filenames)
@@ -135,11 +135,12 @@ class AtomSequenceDataset(Dataset):
             print(f"    Atoms were extracted using {self.atoms_frames} frames and they overlap with each other in {self.atoms_overlap_frames} frames.")
             time_per_atom = self.atoms_frames * self.samples_per_frame / self.sr
             time_per_overlap = self.atoms_overlap_frames * self.samples_per_frame / self.sr
-            unique_time = self.segment_samples / self.sr - 2 * self.overlap_samples / self.sr
+            atoms_hop_time = self.atoms_samples / self.sr - self.overlap_samples / self.sr
+            control_rate = 1 / atoms_hop_time
             print(f"    With this setting every atom is {1000*time_per_atom} ms long and its overlapped on each side by {1000*time_per_overlap} ms.")
-            print(f"    This imply that all atoms carry exactly {1000*unique_time} ms of unique information.")
+            print(f"    This imply that the control rate of the model is {control_rate} Hz.")
             print(f"    Your atoms are then grouped together in sequences of {self.segment_length} atoms and a new sequence is created every {self.hop_size} atoms.")
-            print(f"    With this settings each sequence carry {self.segment_length*unique_time} seconds of unique information and is created every {self.hop_size*unique_time} seconds.")
+            print(f"    With this settings each sequence carry {self.segment_length*atoms_hop_time+time_per_overlap} seconds of audio and is created every {self.segment_length*atoms_hop_time} seconds.")
             print(f"    Your dataset has {len(self.all_indices)} sequences in total.")
             print(f"    For each sequence, other two sequences are created automatically: present and context window")
             print(f"    Present correspond to the atom that goes exactly after the main (past) sequence ends. This is used as target when training.")
@@ -201,7 +202,7 @@ class AtomSequenceDataset(Dataset):
         return any_emb
 
     def _build_ola_window(self):
-        window = torch.ones(self.segment_samples - 2 * self.overlap_samples)
+        window = torch.ones(self.atoms_samples - 2 * self.overlap_samples)
         hann_window = torch.hann_window(self.overlap_samples * 2)
         left_hann = hann_window[:self.overlap_samples]
         right_hann = hann_window[self.overlap_samples:]
@@ -250,7 +251,7 @@ class AtomSequenceDataset(Dataset):
 
         start_sample = atom_start_idx * self.hop_samples
         last_atom_idx = atom_start_idx + (atom_count - 1)
-        end_sample = (last_atom_idx * self.hop_samples) + self.segment_samples
+        end_sample = (last_atom_idx * self.hop_samples) + self.atoms_samples
         duration_samples = end_sample - start_sample
 
         audio_input, _ = librosa.load(audio_path, sr=self.sr, mono=False)
@@ -269,7 +270,7 @@ class AtomSequenceDataset(Dataset):
         filename, seq_start_idx = self.all_indices[idx]
         atom_start_idx, atom_count = self._get_part_indices(seq_start_idx, part)
         
-        total_samples = (atom_count - 1) * self.hop_samples + self.segment_samples
+        total_samples = (atom_count - 1) * self.hop_samples + self.atoms_samples
         out_audio = torch.zeros((1, 2, total_samples), device=processor.device)
         window = self.window.to(processor.device)
 
@@ -289,8 +290,8 @@ class AtomSequenceDataset(Dataset):
                 decoded_chunk = processor.decode_latents_audio(latent_cont, metadata=metadata)
             
             start_s = i * self.hop_samples
-            end_s = start_s + self.segment_samples
-            out_audio[:, :, start_s:end_s] += decoded_chunk[:, :, :self.segment_samples] * window
+            end_s = start_s + self.atoms_samples
+            out_audio[:, :, start_s:end_s] += decoded_chunk[:, :, :self.atoms_samples] * window
             
         return out_audio.squeeze(0)
 

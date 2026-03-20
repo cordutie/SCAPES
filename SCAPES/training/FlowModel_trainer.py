@@ -8,6 +8,81 @@ from pathlib import Path
 
 from SCAPES.auxiliar.losses_flow import flow_matching_loss
 
+def get_model_configs(
+    size, 
+    segment_length, 
+    frame_dim=129,
+    frames_per_atom = 21,
+    context_vector_dim=1024,
+    LocalEncoder_in_channels=129,
+    LocalEncoder_hidden_dim=256,
+    LocalEncoder_time_entanglement=True,
+    LocalEncoder_temporal_compression=1
+):
+    configs = {
+        "small": {
+            "d_model": 512,
+            "num_layers": 6,
+            "nhead": 8,
+            "dim_feedforward": 2048,
+            "max_seq_len": 2048,
+        },
+        "medium": {
+            "d_model": 768,
+            "num_layers": 8,
+            "nhead": 12,
+            "dim_feedforward": 2048,
+            "max_seq_len": 2048,
+        },
+        "large": {
+            "d_model": 1024,
+            "num_layers": 12,
+            "nhead": 16,
+            "dim_feedforward": 2048,
+            "max_seq_len": 2048,
+        },
+        "extra_large": {
+            "d_model": 1024,
+            "num_layers": 24,
+            "nhead": 16,
+            "dim_feedforward": 4096,
+            "max_seq_len": 6000,
+        }
+    }
+    
+    if size not in configs:
+        raise ValueError(f"Invalid size '{size}'. Choose from: {list(configs.keys())}")
+    
+    # Extract config values
+    cfg = configs[size]
+    d_model = cfg["d_model"]
+    nhead = cfg["nhead"]
+    num_layers = cfg["num_layers"]
+    dim_feedforward = cfg["dim_feedforward"]
+    
+    # LocalEncoder configuration
+    LocalEncoder_config = {
+        "in_channels": LocalEncoder_in_channels,
+        "hidden_dim": LocalEncoder_hidden_dim,
+        "out_channels": d_model,
+        "time_entanglement": LocalEncoder_time_entanglement,
+        "temporal_compression": LocalEncoder_temporal_compression
+    }
+
+    # FlowModel configuration
+    FlowModel_config = {
+        "frame_dim": frame_dim,
+        "context_vector_dim": context_vector_dim,
+        "num_past_atoms": segment_length,
+        "frames_per_atom": frames_per_atom,
+        "d_model": d_model,
+        "nhead": nhead,
+        "num_layers": num_layers,
+        "dim_feedforward": dim_feedforward
+    }
+
+    return LocalEncoder_config, FlowModel_config
+
 class FlowTrainer:
     def __init__(
             self, 
@@ -38,6 +113,7 @@ class FlowTrainer:
         self.past_dropout = past_dropout
         self.model_config = model_config
         self.encoder_config = encoder_config
+        self.atom_frames = model_config.get("frames_per_atom", 21)  # For OLA rendering
         
         # Ensure it's a list for iteration
         if isinstance(val_audio_files, str):
@@ -72,13 +148,13 @@ class FlowTrainer:
         # 1. Past Memory: [B, N, 128, 21] + [B, N, 1] -> [B, N, 129, 21]
         past_latent = batch["latent_past"].to(self.device)
         past_scale = batch["scale_past"].to(self.device)
-        past_scale_exp = past_scale.unsqueeze(-1).expand(-1, -1, -1, 21)
+        past_scale_exp = past_scale.unsqueeze(-1).expand(-1, -1, -1, self.atom_frames)
         past_memory = torch.cat([past_latent, past_scale_exp], dim=2)
 
         # 2. Present Target: [B, 128, 21] + [B, 1] -> [B, 21, 129]
         present_latent = batch["latent_present"].to(self.device)
         present_scale = batch["scale_present"].to(self.device)
-        present_scale_exp = present_scale.unsqueeze(-1).expand(-1, -1, 21)
+        present_scale_exp = present_scale.unsqueeze(-1).expand(-1, -1, self.atom_frames)
         present_target = torch.cat([present_latent, present_scale_exp], dim=1).transpose(1, 2)
 
         # 3. Context Toggle
