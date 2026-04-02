@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.data import Dataset, Subset
 import json
 from pathlib import Path
 import random
@@ -9,16 +9,6 @@ import warnings
 def batch_from_latents_to_audio(batch, dataset, processor, mode="decoded", part="past"):
     """
     Converts a DataLoader batch to audio.
-
-    Args:
-        batch: dict containing at least "index"
-        dataset: AtomSequenceDataset instance
-        processor: EncodecProcessor
-        mode: "raw" or "decoded"
-        part: "past", "context", or "full"
-    
-    Returns:
-        Tensor: [Batch, Channels, Samples]
     """
     audios = []
     indices = batch["index"]
@@ -48,29 +38,20 @@ class AtomSequenceDataset(Dataset):
         verbose=False
     ):
         self.dataset_path    = Path(dataset_path)
-        # Hardcoded to always live inside the dataset root
         self.annotations_dir = self.dataset_path / "annotations"
         
         # Sliding Window Config
         self.segment_length = segment_length
         self.context_length = context_length
-        self.context_shift  = segment_length # By default, context window starts right after the past segment
+        self.context_shift  = segment_length 
         self.hop_size = hop_size
         
-        # Total required atoms to satisfy the furthest reaching window
-        # print("segment_length:", segment_length)
-        # print("context_length:", context_length)
-        # print("context_shift:", context_shift)
         self.total_length = max(self.segment_length + 1, self.context_shift + self.context_length)
-        
-        # The rigid version-control folder name
         self.config_folder_name = f"seg_{self.segment_length}_ctx_{self.context_length}_shift_{self.context_shift}_hop_{self.hop_size}"
         
-        # Default requested keys if none provided
         if requested_keys is None:
             self.requested_keys = ["latent_past", "scale_past", "index"]
         else:
-            # check that requested_keys is a list of valid strings
             valid_keys = {"latent_past", "latent_present", "latent_context_win", 
                         "scale_past", "scale_present", "scale_context_win", 
                         "ctx_emb_past", "ctx_emb_context_win", "clap_past", "clap_context_win",
@@ -91,95 +72,122 @@ class AtomSequenceDataset(Dataset):
         with open(json_path, 'r') as f:
             self.manifest = json.load(f)
             
-        # Reading dataprep.json
+        # --- NEW: Reading dataprep.json with Prefix Padding Logic ---
         dataprep_config_path = self.dataset_path / "config" / "dataprep.json"
         if dataprep_config_path.exists():
             with open(dataprep_config_path, 'r') as f:
                 dataprep_config = json.load(f)
 
-            self.atoms_frames = dataprep_config.get("atoms_frames", 21)
-            self.atoms_overlap_frames = dataprep_config.get("atoms_overlap_frames", 3)
+            self.atoms_frames = dataprep_config.get("atoms_frames", 39)
+            self.atoms_hop_frames = dataprep_config.get("atoms_hop_frames", 18)
+            self.crossfade_frames = dataprep_config.get("crossfade_frames", 3) # The acoustic fade
+            
             self.train_split_key = dataprep_config.get("train_split")
             self.val_split_key = dataprep_config.get("val_split")
         else:
-            self.atoms_frames = 21
-            self.atoms_overlap_frames = 3
+            self.atoms_frames = 39
+            self.atoms_hop_frames = 18
+            self.crossfade_frames = 3
             self.train_split_key = None
             self.val_split_key = None
 
-        # print(f"Dataset initialized with segment={self.segment_length}, context={self.context_length}, shift={self.context_shift}, hop={self.hop_size}")
-        # print(f"Requested Keys: {self.requested_keys}")
-        # if self.annotations_dir:
-        #     print(f"Annotations target: {self.annotations_dir.name}/{self.config_folder_name}/...")
+        # --- Math for the Asymmetric Geometry ---
+        self.macro_overlap_frames = self.atoms_frames - self.atoms_hop_frames # Total baked past (e.g. 21)
         
-        # Calculate samples logic
-        self.atoms_samples   = self.atoms_frames * self.samples_per_frame
-        self.overlap_samples = self.atoms_overlap_frames * self.samples_per_frame
-        self.hop_samples     = self.atoms_samples - self.overlap_samples
+        self.atoms_samples = self.atoms_frames * self.samples_per_frame
+        self.hop_samples = self.atoms_hop_frames * self.samples_per_frame
+        self.crossfade_samples = self.crossfade_frames * self.samples_per_frame
+        self.macro_overlap_samples = self.macro_overlap_frames * self.samples_per_frame
 
         self.filenames = sorted(list(self.manifest.keys()))
         self.all_indices = self._build_mapping(self.filenames)
 
-        # Pre-compute Overlap-Add Window
+        # Pre-compute Overlap-Add Window (Now Asymmetric!)
         self.window = self._build_ola_window()
 
         self.file_id_lookup = {fname: i for i, fname in enumerate(self.filenames)}
-        
-        # 2. Map every sequence to its File ID (integer is much smaller than string)
         self.sequence_to_file_id = [self.file_id_lookup[fname] for fname, _ in self.all_indices]
 
         if verbose:
-            # print in bold Dataset Summary:
+            atoms_hop_time = self.atoms_hop_frames / self.frame_rate
+            control_rate = 1 / atoms_hop_time
+            macro_overlap_time = self.macro_overlap_samples / self.frame_rate
             print("\n\033[1mDataset Summary:\033[0m ---------------------------------------------------------------------------")
             print(f"    Your dataset is made of {len(self.filenames)} audio files")
-            print(f"    Atoms were extracted using {self.atoms_frames} frames and they overlap with each other in {self.atoms_overlap_frames} frames.")
-            time_per_atom = self.atoms_frames * self.samples_per_frame / self.sr
-            time_per_overlap = self.atoms_overlap_frames * self.samples_per_frame / self.sr
-            atoms_hop_time = self.atoms_samples / self.sr - self.overlap_samples / self.sr
-            control_rate = 1 / atoms_hop_time
-            print(f"    With this setting every atom is {1000*time_per_atom} ms long and its overlapped on each side by {1000*time_per_overlap} ms.")
-            print(f"    This imply that the control rate of the model is {control_rate} Hz.")
-            print(f"    Your atoms are then grouped together in sequences of {self.segment_length} atoms and a new sequence is created every {self.hop_size} atoms.")
-            print(f"    With this settings each sequence carry {self.segment_length*atoms_hop_time+time_per_overlap} seconds of audio and is created every {self.segment_length*atoms_hop_time} seconds.")
+            print(f"    A total of {self.count_atoms()} atoms are in your dataset")
+            print(f"    Atoms are {self.atoms_frames} frames long, hopping forward by {self.atoms_hop_frames} frames.")
+            print(f"    This implies that the dataset is made of {atoms_hop_time*self.count_atoms() + len(self.filenames)*macro_overlap_time:.1f} seconds of audio in total (taking overlap into account).")
+            print(f"    Atoms are overlapped using a MACRO overlap of {self.macro_overlap_frames} frames acting as context history.")
+            print(f"    During audio rendering, a MICRO crossfade of {self.crossfade_frames} frames is used to stitch seams.")
+            print(f"    This implies the temporal control rate of the model is {control_rate:.2f} Hz ({atoms_hop_time*1000:.1f} ms steps).")
             print(f"    Your dataset has {len(self.all_indices)} sequences in total.")
-            print(f"    For each sequence, other two sequences are created automatically: present and context window")
-            print(f"    Present correspond to the atom that goes exactly after the main (past) sequence ends. This is used as target when training.")
-            print(f"    Context window is another sequence that start {self.context_shift} atoms after the main (past) sequence ends and it is {self.context_length} atoms long.")
-            print(f"    Context window is used to compute context embeddings that are used to help predicting the present atom.")
-            print(f"    Requested keys: {self.requested_keys}")
-            self.check_if_manifest_has_splits()
-            self.check_annotations_exist()
-        else:
-            print("\n\033[1mDataset Summary:\033[0m ---------------------------------------------------------------------------")
-            print(f"    Audio files: {len(self.filenames)}")
-            print(f"    Atoms: {self.atoms_frames} frames, {self.atoms_overlap_frames} frames overlap")
-            print(f"    Sequence: {self.segment_length} atoms, hop every {self.hop_size} atoms")
-            print(f"    Context window: {self.context_length} atoms, shifted from past by {self.context_shift} atoms")
-            print(f"    Total sequences: {len(self.all_indices)}")
             print(f"    Requested keys: {self.requested_keys}")
             self.check_if_manifest_has_splits()
             self.check_annotations_exist()
 
+    def count_atoms(self):
+        count = 0
+        for fname in self.filenames:
+            count += self.manifest[fname]["atoms_count"]
+        return count
+
     def check_if_manifest_has_splits(self):
-        """
-        Checks if the manifest has a complete train/val split and prints the file counts.
-        Returns True if a valid split exists, False otherwise.
-        """
-        # 1. Ensure every file has the 'validation' key
         has_split = all("validation" in self.manifest[f] for f in self.filenames)
-        
         if not has_split:
             print("    No complete split found in manifest.json.")
-            print("    → Run dataset.make_split(val_split=0.1) to create a random split with 10% validation data or organize your files into train/val folders and run dataset.make_split() to create a split from directory structure.")
             return False
             
-        # 2. Count the files in each split
         train_count = sum(1 for f in self.filenames if self.manifest[f]["validation"] is False)
         val_count = sum(1 for f in self.filenames if self.manifest[f]["validation"] is True)
+        partial_count = sum(1 for f in self.filenames if self.manifest[f]["validation"] == "partial")
         
-        print(f"    Manifest has an existing split: {train_count} train files, {val_count} val files.")
+        if partial_count > 0:
+            print(f"    Manifest has a chronological split: {partial_count} files split across train/val.")
+        else:
+            print(f"    Manifest has an existing full-file split: {train_count} train files, {val_count} val files.")
         return True
-    
+
+    def get_splits(self):
+        """
+        Builds (train_subset, val_subset) based on the 'validation' field
+        stored in manifest.json. Supports both full-file and partial-file splits.
+        """
+        if not all("validation" in self.manifest[f] for f in self.filenames):
+            warnings.warn(
+                "No split found in manifest.json. "
+                "Run dataset.make_split(val_split=...) first."
+            )
+            return None, None
+
+        train_indices = []
+        val_indices = []
+
+        for i, (f, start) in enumerate(self.all_indices):
+            val_flag = self.manifest[f].get("validation")
+            
+            # Handle the new intra-file splitting
+            if val_flag == "partial":
+                if start in self.manifest[f].get("val_starts", []):
+                    val_indices.append(i)
+                else:
+                    train_indices.append(i)
+                    
+            # Handle old full-file validation
+            elif val_flag is True:
+                val_indices.append(i)
+                
+            # Handle old full-file training
+            else:
+                train_indices.append(i)
+
+        train_subset = Subset(self, train_indices)
+        val_subset = Subset(self, val_indices)
+
+        print(f"Loaded split: {len(train_indices)} train sequences, "
+              f"{len(val_indices)} val sequences.")
+
+        return train_subset, val_subset
+
     def check_annotations_exist(self): 
         base_anno_path = self.annotations_dir / self.config_folder_name
         if not base_anno_path.exists():
@@ -187,12 +195,10 @@ class AtomSequenceDataset(Dataset):
             return False
         
         print(f"    Annotations found in {base_anno_path}:")
-        # list recursive subdirectories
         any_emb = False
         for cat in ["ctx", "clap"]:
             for time_part in ["past", "context_win"]:
                 path = base_anno_path / cat / time_part
-                # print(f"    Checking {cat}_{time_part} in {path}...")
                 if not path.exists():
                     print(f"    ✗ {cat}_{time_part} (should be in {path})")
                 else:
@@ -202,17 +208,28 @@ class AtomSequenceDataset(Dataset):
         return any_emb
 
     def _build_ola_window(self):
-        window = torch.ones(self.atoms_samples - 2 * self.overlap_samples)
-        hann_window = torch.hann_window(self.overlap_samples * 2)
-        left_hann = hann_window[:self.overlap_samples]
-        right_hann = hann_window[self.overlap_samples:]
-        return torch.cat([left_hann, window, right_hann])
+        """
+        Builds an asymmetric window for Prefix Padding geometry:
+        [ Zeros (discard redundant past) | Hann Fade In | Ones (new audio) | Hann Fade Out ]
+        """
+        zeros_frames = self.macro_overlap_frames - self.crossfade_frames
+        zeros = torch.zeros(zeros_frames * self.samples_per_frame)
+        
+        hann_window = torch.hann_window(self.crossfade_samples * 2)
+        left_hann = hann_window[:self.crossfade_samples]
+        right_hann = hann_window[self.crossfade_samples:]
+        
+        ones_frames = self.atoms_hop_frames - self.crossfade_frames
+        ones = torch.ones(ones_frames * self.samples_per_frame)
+        
+        # Final window is exactly `atoms_samples` long
+        window = torch.cat([zeros, left_hann, ones, right_hann])
+        return window
 
     def _build_mapping(self, filenames):
         mapping = []
         for fname in filenames:
             count = self.manifest[fname]["atoms_count"]
-            # Check against the new max boundary (self.total_length)
             if count >= self.total_length:
                 for start in range(0, count - self.total_length + 1, self.hop_size):
                     mapping.append((fname, start))
@@ -232,7 +249,6 @@ class AtomSequenceDataset(Dataset):
         return self.dataset_path / "atoms" / relative_parent / stem / atom_filename
         
     def _get_part_indices(self, start_idx, part):
-        """Helper to get start and count for audio loaders."""
         if part == "past":
             return start_idx, self.segment_length
         elif part == "context":
@@ -243,16 +259,15 @@ class AtomSequenceDataset(Dataset):
             raise ValueError("part must be 'past', 'context', or 'full'")
 
     def get_raw_audio(self, idx, part="past"):
-        """Loads raw audio. Part can be 'past', 'context', or 'full'."""
         filename, seq_start_idx = self.all_indices[idx]
         atom_start_idx, atom_count = self._get_part_indices(seq_start_idx, part)
         
         audio_path = self.manifest[filename]["path"]
 
+        # Calculate absolute bounds
         start_sample = atom_start_idx * self.hop_samples
-        last_atom_idx = atom_start_idx + (atom_count - 1)
-        end_sample = (last_atom_idx * self.hop_samples) + self.atoms_samples
-        duration_samples = end_sample - start_sample
+        # The total length stretches to the end of the final atom
+        duration_samples = ((atom_count - 1) * self.hop_samples) + self.atoms_samples
 
         audio_input, _ = librosa.load(audio_path, sr=self.sr, mono=False)
         audio_input = torch.tensor(audio_input).unsqueeze(0) 
@@ -266,13 +281,12 @@ class AtomSequenceDataset(Dataset):
         return audio_input.squeeze(0).to(self.device)
 
     def get_decoded_audio(self, idx, processor, part="past"):
-        """Decodes OLA audio. Part can be 'past', 'context', or 'full'."""
         filename, seq_start_idx = self.all_indices[idx]
         atom_start_idx, atom_count = self._get_part_indices(seq_start_idx, part)
         
         total_samples = (atom_count - 1) * self.hop_samples + self.atoms_samples
         out_audio = torch.zeros((1, 2, total_samples), device=processor.device)
-        window = self.window.to(processor.device)
+        window = self.window.to(processor.device).view(1, 1, -1)
 
         for i in range(atom_count):
             atom_path = self._get_atom_path(filename, atom_start_idx + i)
@@ -291,11 +305,15 @@ class AtomSequenceDataset(Dataset):
             
             start_s = i * self.hop_samples
             end_s = start_s + self.atoms_samples
-            out_audio[:, :, start_s:end_s] += decoded_chunk[:, :, :self.atoms_samples] * window
             
+            # Apply the asymmetric prefix-padding mask
+            out_audio[:, :, start_s:end_s] += decoded_chunk[:, :, :self.atoms_samples] * window
+        
         return out_audio.squeeze(0)
 
-    def make_split(self, val_split=None, seed=42, overwrite=False):
+    def make_split(self, val_split="dataprep", seed=42, overwrite=False):
+        if val_split == "dataprep":
+            val_split = None  # This will trigger the directory-based split logic
 
         json_path = self.dataset_path / "config" / "manifest.json"
 
@@ -355,7 +373,7 @@ class AtomSequenceDataset(Dataset):
             return
 
         # ------------------------------------------------
-        # RANDOM SPLIT (fallback)
+        # PER-FILE CHRONOLOGICAL SPLIT (Texture Setup)
         # ------------------------------------------------
 
         if val_split is None:
@@ -363,8 +381,6 @@ class AtomSequenceDataset(Dataset):
                 "val_split must be provided because dataprep.json "
                 "does not define train_split/val_split."
             )
-
-        rng = random.Random(seed)
 
         already_split = all("validation" in self.manifest[f] for f in self.filenames)
 
@@ -375,57 +391,33 @@ class AtomSequenceDataset(Dataset):
             )
             return
 
-        shuffled_files = list(self.filenames)
-        rng.shuffle(shuffled_files)
-
-        split_idx = int(len(shuffled_files) * (1 - val_split))
-
-        train_files = set(shuffled_files[:split_idx])
-        val_files = set(shuffled_files[split_idx:])
+        total_train_seqs = 0
+        total_val_seqs = 0
 
         for f in self.filenames:
-            self.manifest[f]["validation"] = f in val_files
+            # Figure out all valid start indices for this specific file
+            count = self.manifest[f]["atoms_count"]
+            starts = list(range(0, count - self.total_length + 1, self.hop_size))
+            
+            # Chronological split to prevent overlap leakage!
+            split_idx = int(len(starts) * (1 - val_split))
+            
+            val_starts = starts[split_idx:]
+            
+            # Mark the file as 'partial' to tell get_splits to look at the exact indices
+            self.manifest[f]["validation"] = "partial" 
+            self.manifest[f]["val_starts"] = val_starts
+            
+            total_train_seqs += split_idx
+            total_val_seqs += len(val_starts)
 
         with open(json_path, "w") as f:
             json.dump(self.manifest, f, indent=4)
 
         print(
-            f"Random split created: {len(train_files)} train files, "
-            f"{len(val_files)} val files."
+            f"Per-file chronological split created: {total_train_seqs} train sequences, "
+            f"{total_val_seqs} val sequences."
         )
-
-    def get_splits(self):
-        """
-        Builds (train_subset, val_subset) based on 'validation' field
-        stored in manifest.json.
-
-        Raises warning if split has not been created.
-        """
-
-        # Check if split exists
-        if not all("validation" in self.manifest[f] for f in self.filenames):
-            warnings.warn(
-                "No split found in manifest.json. "
-                "Run dataset.make_split(val_split=...) first."
-            )
-            return None, None
-
-        train_indices = []
-        val_indices = []
-
-        for i, (f, _) in enumerate(self.all_indices):
-            if self.manifest[f]["validation"]:
-                val_indices.append(i)
-            else:
-                train_indices.append(i)
-
-        train_subset = Subset(self, train_indices)
-        val_subset = Subset(self, val_indices)
-
-        print(f"Loaded split: {len(train_indices)} train sequences, "
-            f"{len(val_indices)} val sequences.")
-
-        return train_subset, val_subset
 
     def __len__(self):
         return len(self.all_indices)

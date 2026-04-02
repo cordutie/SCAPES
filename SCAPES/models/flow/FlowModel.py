@@ -195,7 +195,8 @@ class FlowModel(nn.Module):
         nhead: int = 8,                        
         num_layers: int = 6,                   
         dim_feedforward: int = 1024,
-        device=None           
+        device=None,
+        **kwargs # <--- THE MAGIC ABSORBER
     ):
         super().__init__()
         

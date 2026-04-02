@@ -18,4 +18,14 @@ datasets/
 # Ignore Python cache files
 __pycache__/
 
+# experiments stuff
+run_experiments.sh
+1_dataprep.py
+2_training.py
+3_inference.py
+1.5. GlobalEncoder trainer.ipynb
+experiments/
 
+# Other training experiments
+all_experiments_log.txt
+inference_log.txt

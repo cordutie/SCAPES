@@ -23,7 +23,8 @@ def to_cpu(obj):
         return obj
 
 # Takes a file and makes a list of its atoms
-def extractor_atoms(audio_path, processor, segment_frames=21, overlap_frames=3):
+# Takes a file and makes a list of its atoms
+def extractor_atoms(audio_path, processor, segment_frames=39, hop_frames=18):
     # Use sample rate from processor
     sr         = processor.sample_rate
     frame_rate = processor.frame_rate
@@ -32,26 +33,29 @@ def extractor_atoms(audio_path, processor, segment_frames=21, overlap_frames=3):
     # Load audio
     audio_input, _ = librosa.load(audio_path, sr=sr, mono=False)
     audio_input = torch.tensor(audio_input).unsqueeze(0) # Add batch dimension
+    
     # If mono, make it stereo by duplicating the mono channel to create a stereo signal (2 channels)
     if audio_input.dim() == 2:
         audio_input = audio_input.unsqueeze(1).repeat(1, 2, 1)
     # If it has more than 2 channels, take only the first 2 channels
     elif audio_input.shape[1] > 2:
         audio_input = audio_input[:, :2, :]
-    audio_input = audio_input.to(processor.device) # Move to the same device as the processor
+        
+    audio_input = audio_input.to(processor.device) 
     audio_input_sample = audio_input.shape[-1]
 
-    # Calculate segment and overlap in samples
+    # Calculate segment and hop directly in samples
     segment_samples = segment_frames * samples_per_frame
-    overlap_samples = overlap_frames * samples_per_frame
-    hop_samples     = segment_samples - overlap_samples
+    hop_samples     = hop_frames * samples_per_frame
 
     # Segmentation
     segments = []
+    # Notice we step by hop_samples now!
     for start in range(0, audio_input_sample, hop_samples):
         end = start + segment_samples
         segment = audio_input[:, :, start:end]
-        # Skip last segment if it's too short 
+        
+        # Skip last segment if it's too short (must be exactly 39 frames)
         if segment.shape[-1] < segment_samples:
             break
         segments.append(segment)
@@ -143,16 +147,16 @@ def atoms_maker(dataset_path):
     if config_path.exists():
         with open(config_path, 'r') as f:
             current_config = json.load(f)
-        segment_frames = current_config.get("atoms_frames", 21)
-        overlap_frames = current_config.get("atoms_overlap_frames", 3)
+        segment_frames = current_config.get("atoms_frames", 39)
+        hop_frames = current_config.get("atoms_hop_frames", 18)
     else:
-        segment_frames = 21
-        overlap_frames = 3
+        segment_frames = 39
+        hop_frames = 18
     
     # Standardize current config for comparison
     active_config = {
         "atoms_frames": segment_frames,
-        "atoms_overlap_frames": overlap_frames
+        "atoms_hop_frames": hop_frames
     }
 
     # 2. --- SAFETY HANDSHAKE ---
@@ -210,7 +214,8 @@ def atoms_maker(dataset_path):
             count = len(atom_files)
         else:
             print(f"Processing {audio_file.name}...")
-            atoms = extractor_atoms(audio_file, processor_48k_streamable, segment_frames, overlap_frames)
+            # Using hop_frames instead of overlap_frames
+            atoms = extractor_atoms(audio_file, processor_48k_streamable, segment_frames, hop_frames)
             torch_save_atoms(atoms, audio_file)
             count = len(atoms)
 

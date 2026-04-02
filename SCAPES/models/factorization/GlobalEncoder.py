@@ -10,7 +10,7 @@ def load_global_encoder(checkpoint_path, json_path, device="cpu"):
         
     model = GlobalEncoder(
         latent_dim=config.get("latent_dim", 128),
-        frames_per_atom=config.get("frames_per_atom", 21),
+        frames_per_atom=config.get("frames_per_atom", 39),
         cnn_hidden=config.get("cnn_hidden", 256),
         transformer_dim=config.get("transformer_dim", 256),
         num_heads=config.get("num_heads", 4),
@@ -29,7 +29,7 @@ def load_global_encoder(checkpoint_path, json_path, device="cpu"):
     return model.to(device)
 
 class GlobalEncoder(nn.Module):
-    def __init__(self, latent_dim=128, frames_per_atom=21, cnn_hidden=256, 
+    def __init__(self, latent_dim=128, frames_per_atom=39, cnn_hidden=256, 
                  transformer_dim=256, num_heads=4, num_layers=4, clap_dim=1024):
         super().__init__()
 

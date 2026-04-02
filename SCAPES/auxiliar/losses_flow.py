@@ -21,11 +21,21 @@ import torch.nn.functional as F
 #     loss          = F.mse_loss(u_model, u_conditioned)
 #     return loss
 
+# # The conditional flow psi_t(x) = psi_t(x|x1) taking N(0, sigma_max*I) to N(x1, sigma_min*I)
+#     def psi(self, t, x, x1, sigma_min=0.01, sigma_max=1.0):
+#         return (t * (sigma_min / sigma_max - 1) + 1) * x + t * x1
+
+#     # The speed of the conditional flow (D/Dt)psi_t(x) = u_t( psi_t(x) | x1)
+#     def Dt_psi(self, t, x, x1, sigma_min=0.01, sigma_max=1.0):
+#         return (sigma_min / sigma_max - 1) * x + x1
+
 # ==========================================
 # FLOW MATCHING MATH FUNCTIONS
 # ==========================================
-def psi_conditioned(s, X0, X1):
+def psi_conditioned(s, X0, X1, sigma_min = 0.01, sigma_max = 1.0):
     """The Optimal Transport path between noise and data."""
+    s = sigma_min + (sigma_max - sigma_min) * s
+
     return (1 - s) * X0 + s * X1
 
 def Dt_psi_conditioned(s, X0, X1):

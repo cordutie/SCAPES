@@ -20,9 +20,15 @@ class CLAPWrapper(CLAPWrapper):
         # Resampling + mono if needed
         audio = resample_and_mono_audio(audio, og_sr, clap_sr, mono=True)
         # Extend/trim to 8 seconds
-        audio = audio_extender(audio, random_extension=random_extension,
-                                       sample_rate=clap_sr, duration=8.0, overlap_ratio=0.1)
-        embedding = self._get_audio_embeddings(audio)
+        audio = audio_extender(audio, 
+                            random_extension=random_extension,
+                            sample_rate=clap_sr, 
+                            duration=8.0, 
+                            overlap_ratio=0.1) # [B, 1, 8*48000]
+        embedding = self._get_audio_embeddings(audio) # [B, 1024]
+
+        # Normalize embeddings to unit norm
+        embedding = F.normalize(embedding, p=2, dim=1)
         return embedding
 
 def resample_and_mono_audio(audio, og_sr, target_sr, mono=True):
