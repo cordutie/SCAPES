@@ -24,7 +24,7 @@ def to_cpu(obj):
 
 # Takes a file and makes a list of its atoms
 # Takes a file and makes a list of its atoms
-def extractor_atoms(audio_path, processor, segment_frames=39, hop_frames=18):
+def extractor_atoms(audio_path, processor, segment_frames=48, hop_frames=15):
     # Use sample rate from processor
     sr         = processor.sample_rate
     frame_rate = processor.frame_rate
@@ -55,7 +55,7 @@ def extractor_atoms(audio_path, processor, segment_frames=39, hop_frames=18):
         end = start + segment_samples
         segment = audio_input[:, :, start:end]
         
-        # Skip last segment if it's too short (must be exactly 39 frames)
+        # Skip last segment if it's too short (must be exactly 48 frames)
         if segment.shape[-1] < segment_samples:
             break
         segments.append(segment)
@@ -147,11 +147,11 @@ def atoms_maker(dataset_path):
     if config_path.exists():
         with open(config_path, 'r') as f:
             current_config = json.load(f)
-        segment_frames = current_config.get("atoms_frames", 39)
-        hop_frames = current_config.get("atoms_hop_frames", 18)
+        segment_frames = current_config.get("atoms_frames", 48)
+        hop_frames = current_config.get("atoms_hop_frames", 15)
     else:
-        segment_frames = 39
-        hop_frames = 18
+        segment_frames = 48
+        hop_frames = 15
     
     # Standardize current config for comparison
     active_config = {

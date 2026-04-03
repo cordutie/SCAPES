@@ -78,15 +78,26 @@ class AtomSequenceDataset(Dataset):
             with open(dataprep_config_path, 'r') as f:
                 dataprep_config = json.load(f)
 
-            self.atoms_frames = dataprep_config.get("atoms_frames", 39)
-            self.atoms_hop_frames = dataprep_config.get("atoms_hop_frames", 18)
+            self.atoms_frames = dataprep_config.get("atoms_frames", 48)
+            self.atoms_hop_frames = dataprep_config.get("atoms_hop_frames", 15)
             self.crossfade_frames = dataprep_config.get("crossfade_frames", 3) # The acoustic fade
             
             self.train_split_key = dataprep_config.get("train_split")
             self.val_split_key = dataprep_config.get("val_split")
         else:
-            self.atoms_frames = 39
-            self.atoms_hop_frames = 18
+            # create the dataprep.json with default values for the Prefix Padding geometry and save it
+            dataprep_config = {
+                "atoms_frames": 48,
+                "atoms_hop_frames": 15,
+                "crossfade_frames": 3,
+                "train_split": None,
+                "val_split": None
+            }
+            # save the json file 
+            with open(dataprep_config_path, 'w') as f:
+                json.dump(dataprep_config, f, indent=4)
+            self.atoms_frames = 48
+            self.atoms_hop_frames = 15
             self.crossfade_frames = 3
             self.train_split_key = None
             self.val_split_key = None
@@ -111,7 +122,7 @@ class AtomSequenceDataset(Dataset):
         if verbose:
             atoms_hop_time = self.atoms_hop_frames / self.frame_rate
             control_rate = 1 / atoms_hop_time
-            macro_overlap_time = self.macro_overlap_samples / self.frame_rate
+            macro_overlap_time = self.macro_overlap_frames / self.frame_rate
             print("\n\033[1mDataset Summary:\033[0m ---------------------------------------------------------------------------")
             print(f"    Your dataset is made of {len(self.filenames)} audio files")
             print(f"    A total of {self.count_atoms()} atoms are in your dataset")
