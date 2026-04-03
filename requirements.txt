@@ -7,3 +7,4 @@ matplotlib
 soundfile
 transformers
 tqdm
+msclap
