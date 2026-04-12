@@ -134,7 +134,7 @@ def run_interpolation_pipeline(
     engine,
     audio_path_1,
     audio_path_2,
-    timeline_size=200,
+    timeline_size=300,
     stay_time=1,
     stickyness = 1.0,
     plot_stickyness_curve=False,
@@ -142,7 +142,8 @@ def run_interpolation_pipeline(
     save_path=None,
     NFE = 32,
     context_static=True,  # If True, uses the first context embedding for each audio only
-    decode_method="ola_smooth"
+    decode_method="ola_smooth",
+    cache=True
 ):
     # Generate interpolation alpha values with stickiness and smooth them with a low-pass filter
     alpha_values      = sticky_curve_torch(n_points=timeline_size - 2 * stay_time, stickiness=stickyness)
@@ -157,15 +158,52 @@ def run_interpolation_pipeline(
         plt.grid()
         plt.show()
 
+    cache_1_found = False
+    cache_2_found = False
+    if cache==True:
+        # look for cached encodings in the same directory as the audio files, with the same name but .pt extension
+        filename_1 = Path(audio_path_1).stem
+        filename_2 = Path(audio_path_2).stem
+        atoms_1_path    = filename_1 + "_atoms.pt"
+        contexts_1_path = filename_1 + "_contexts.pt"
+        atoms_2_path    = filename_2 + "_atoms.pt"
+        contexts_2_path = filename_2 + "_contexts.pt"
+        # check for files in atoms_1_path and contexts_1_path
+        if Path(atoms_1_path).exists() and Path(contexts_1_path).exists():
+            print(f"Loading cached encodings for {audio_path_1}...")
+            atoms_1    = torch.load(atoms_1_path)
+            contexts_1 = torch.load(contexts_1_path)
+            cache_1_found = True
+
+        # check for files in atoms_2_path and contexts_2_path
+        if Path(atoms_2_path).exists() and Path(contexts_2_path).exists():
+            print(f"Loading cached encodings for {audio_path_2}...")
+            atoms_2    = torch.load(atoms_2_path)
+            contexts_2 = torch.load(contexts_2_path)
+            cache_2_found = True
+
     # Load both audios
-    atoms_1, contexts_1 = load_and_encode(engine, audio_path_1, max_duration=30)
-    atoms_2, contexts_2 = load_and_encode(engine, audio_path_2, max_duration=30)
+    if not cache_1_found:
+        atoms_1, contexts_1 = load_and_encode(engine, audio_path_1, max_duration=31)
+    if not cache_2_found:
+        atoms_2, contexts_2 = load_and_encode(engine, audio_path_2, max_duration=31)
+
+    # If cache and they were not found earlier save the encodings for future use
+    if cache==True:
+        if not cache_1_found:
+            torch.save(atoms_1, atoms_1_path)
+            torch.save(contexts_1, contexts_1_path)
+            print(f"Cached encodings saved for {audio_path_1} at {atoms_1_path} and {contexts_1_path}")
+        if not cache_2_found:
+            torch.save(atoms_2, atoms_2_path)
+            torch.save(contexts_2, contexts_2_path)
+            print(f"Cached encodings saved for {audio_path_2} at {atoms_2_path} and {contexts_2_path}")
 
     # stay time must be an integer bigger than 0
     if stay_time < 0 or not isinstance(stay_time, int):
         raise ValueError("Stay time must be a non-negative integer.")
 
-    # if context is not static ,each context should have at least timeline size number of embeddings, if not error:
+    # if context is not static, each context should have at least timeline size number of embeddings, if not error:
     if context_static==False:
         if len(contexts_1) < timeline_size:
             raise ValueError(f"Audio 1 does not have enough context embeddings for the timeline size. Required: {timeline_size}, Available: {len(contexts_1)}")
@@ -200,7 +238,7 @@ def run_interpolation_pipeline(
     )
 
     # Generate
-    completed_timeline = engine.generate(timeline, NFE=32)
+    completed_timeline = engine.generate(timeline, NFE=NFE)
 
     # Decode
     final_wav = engine.decode_timeline(completed_timeline, output_path=None, method=decode_method)
