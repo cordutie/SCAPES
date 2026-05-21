@@ -9,61 +9,73 @@ from IPython.display import Audio, display
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-# audio to atoms and context that can be used for conditioning
+from SCAPES.data.dataprep.structure import _compute_structure_features
+
+# ==========================================
+# PIPELINE HELPER FUNCTIONS
+# ==========================================
+
 def load_and_encode(engine, audio_path, max_duration=None):
     audio_tensor = engine.load_audio_to_tensor(audio_path)
     if max_duration != None and audio_tensor.shape[-1] > engine.sr * max_duration:
         audio_tensor = audio_tensor[:,:,:48000*max_duration]
-    print((f"--- Encoding audio: {audio_path}"))
+        
+    print(f"--- Encoding audio: {audio_path}")
     atoms = engine.encode_audio_to_atoms(audio_tensor)
-    print((f"--- Computing context for audio: {audio_path}"))
+    
+    print(f"--- Computing context for audio: {audio_path}")
     contexts = engine.compute_context_track(atoms)
-    # print((len(atoms), "atoms extracted, ", len(contexts), "context embeddings computed."))
-    return atoms, contexts
+    
+    structures = None
+    if engine.use_structure:
+        print(f"--- Computing structure for audio: {audio_path}")
+        structures = engine.compute_structure_track(audio_tensor)
+        
+    return atoms, contexts, structures
 
-# Resynthesis task
 def run_resynthesis_pipeline(
     engine,
     audio_path,
     duration=60,
     play=True,
     save_path=None,
-    TF=False, # True = looks at the data atoms; False = purely autoregressive; "partial" = warm start with 5 steps of TF=True, then drops to False for the rest of the timeline.
+    TF=False, 
     NFE = 32,
-    context_static=False,  # If True, uses the first context embedding for the entire timeline
+    cfg_scale = 3.0,       
+    context_static=False,  
     decode_method="ola_smooth"
 ):
-    atoms_src, contexts_src = load_and_encode(engine, audio_path, max_duration=duration)
+    atoms_src, contexts_src, structures_src = load_and_encode(engine, audio_path, max_duration=duration)
 
-    atoms    = atoms_src
+    atoms = atoms_src
     contexts = contexts_src
+    structures = structures_src
 
-    if context_static==True:  
-        c0 = contexts_src[0]
-        contexts = [c0 for _ in range(len(atoms))]    
+    if context_static:  
+        contexts = [contexts_src[0] for _ in range(len(atoms))]    
+        if structures is not None:
+            structures = [structures_src[0] for _ in range(len(atoms))]
 
     cold_start = True
-    if TF!=True and TF!=False:
+    if TF != True and TF != False:
         cold_start = False
         TF = False
 
     timeline = engine.build_base_timeline(
         atoms_129D=atoms,
         context_embeddings=contexts,
-        default_TF=TF,
-        default_AF=0.0
+        structure_embeddings=structures, 
+        default_TF=TF
     )
 
-    # If cold_start is False, we set the first 5 steps to TF=True to provide a warm launch for the generation.
-    if cold_start==False:
+    if not cold_start:
         for t in range(0, 5):
             timeline[t]["TF"] = True
 
-    completed_timeline = engine.generate(timeline, NFE=NFE)
+    completed_timeline = engine.generate(timeline, NFE=NFE, cfg_scale=cfg_scale)
     final_wav = engine.decode_timeline(completed_timeline, output_path=None, method=decode_method)
 
     if play:
-        # pick filename without extension for display
         filename = Path(audio_path).stem
         print("Resynthesis: ", filename)
         display(Audio(final_wav, rate=engine.sr))
@@ -74,62 +86,40 @@ def run_resynthesis_pipeline(
         print(f"✅ Resynthesized audio saved to: {save_path}")
     return final_wav
 
-# Stickiness curve for interpolation alpha values
 def sticky_curve_torch(n_points=100, stickiness=1.0):
-    # stickiness must be positive, if not error:
     if stickiness <= 0:
         raise ValueError("Stickiness must be a positive value greater than 0.")
-    
     stickiness = 1/stickiness
-
     alpha_linear = torch.linspace(0, 1, n_points)
-
     eps = 1e-8
     alpha_linear = alpha_linear.clamp(eps, 1 - eps)
-
     alpha_sticky = alpha_linear.pow(stickiness) / (
         alpha_linear.pow(stickiness) + (1 - alpha_linear).pow(stickiness)
     )
-
     return alpha_sticky
 
-# Simplest low-pass filter
 def low_pass_filter(signal, alpha=0.5):
     filtered = torch.zeros_like(signal)
     filtered[0] = signal[0]
-    # first pass
     for t in range(1, signal.shape[0]):
         filtered[t] = alpha * signal[t] + (1 - alpha) * filtered[t-1]
-    # 9 passes more
     for i in range(9):
         for t in range(1, signal.shape[0]):
             filtered[t] = alpha * filtered[t] + (1 - alpha) * filtered[t-1]
     return filtered
 
-# Spherical interpolation for context embeddings
 def slerp(v0, v1, alpha, eps=1e-7):
-    """
-    Spherical linear interpolation between two normalized vectors.
-    v0, v1: (..., D)
-    alpha: scalar in [0,1]
-    """
     v0 = v0 / v0.norm(p=2)
     v1 = v1 / v1.norm(p=2)
-
     dot = torch.clamp(torch.dot(v0, v1), -1.0 + eps, 1.0 - eps)
     theta = torch.acos(dot)
-
     if theta < eps:
-        # vectors are almost identical; fall back to lerp
         return (1 - alpha) * v0 + alpha * v1
-
     sin_theta = torch.sin(theta)
     w0 = torch.sin((1 - alpha) * theta) / sin_theta
     w1 = torch.sin(alpha * theta) / sin_theta
-
     return w0 * v0 + w1 * v1
 
-# Run interpolation between two audios
 def run_interpolation_pipeline(
     engine,
     audio_path_1,
@@ -141,16 +131,15 @@ def run_interpolation_pipeline(
     play=True,
     save_path=None,
     NFE = 32,
-    context_static=True,  # If True, uses the first context embedding for each audio only
+    cfg_scale = 3.0,       
+    context_static=True,  
     decode_method="ola_smooth",
     cache=True
 ):
-    # Generate interpolation alpha values with stickiness and smooth them with a low-pass filter
     alpha_values      = sticky_curve_torch(n_points=timeline_size - 2 * stay_time, stickiness=stickyness)
     alpha_values_full = torch.cat([torch.zeros(stay_time), alpha_values, torch.ones(stay_time)])
     alpha_values_full = low_pass_filter(alpha_values_full, alpha=0.5)
 
-    # Optionally plot the stickiness curve
     if plot_stickyness_curve:
         plt.figure(figsize=(10, 4))
         plt.plot(alpha_values_full.detach().cpu().numpy())
@@ -160,87 +149,96 @@ def run_interpolation_pipeline(
 
     cache_1_found = False
     cache_2_found = False
-    if cache==True:
-        # look for cached encodings in the same directory as the audio files, with the same name but .pt extension
-        filename_1 = Path(audio_path_1).stem
-        filename_2 = Path(audio_path_2).stem
-        atoms_1_path    = filename_1 + "_atoms.pt"
-        contexts_1_path = filename_1 + "_contexts.pt"
-        atoms_2_path    = filename_2 + "_atoms.pt"
-        contexts_2_path = filename_2 + "_contexts.pt"
-        # check for files in atoms_1_path and contexts_1_path
+    
+    filename_1 = Path(audio_path_1).stem
+    filename_2 = Path(audio_path_2).stem
+    
+    atoms_1_path    = filename_1 + "_atoms.pt"
+    contexts_1_path = filename_1 + "_contexts.pt"
+    struct_1_path   = filename_1 + "_structures.pt"
+    
+    atoms_2_path    = filename_2 + "_atoms.pt"
+    contexts_2_path = filename_2 + "_contexts.pt"
+    struct_2_path   = filename_2 + "_structures.pt"
+
+    if cache:
         if Path(atoms_1_path).exists() and Path(contexts_1_path).exists():
             print(f"Loading cached encodings for {audio_path_1}...")
             atoms_1    = torch.load(atoms_1_path)
             contexts_1 = torch.load(contexts_1_path)
+            structures_1 = torch.load(struct_1_path) if Path(struct_1_path).exists() else None
             cache_1_found = True
 
-        # check for files in atoms_2_path and contexts_2_path
         if Path(atoms_2_path).exists() and Path(contexts_2_path).exists():
             print(f"Loading cached encodings for {audio_path_2}...")
             atoms_2    = torch.load(atoms_2_path)
             contexts_2 = torch.load(contexts_2_path)
+            structures_2 = torch.load(struct_2_path) if Path(struct_2_path).exists() else None
             cache_2_found = True
 
-    # Load both audios
     if not cache_1_found:
-        atoms_1, contexts_1 = load_and_encode(engine, audio_path_1, max_duration=31)
+        atoms_1, contexts_1, structures_1 = load_and_encode(engine, audio_path_1, max_duration=31)
     if not cache_2_found:
-        atoms_2, contexts_2 = load_and_encode(engine, audio_path_2, max_duration=31)
+        atoms_2, contexts_2, structures_2 = load_and_encode(engine, audio_path_2, max_duration=31)
 
-    # If cache and they were not found earlier save the encodings for future use
-    if cache==True:
+    if cache:
         if not cache_1_found:
             torch.save(atoms_1, atoms_1_path)
             torch.save(contexts_1, contexts_1_path)
-            print(f"Cached encodings saved for {audio_path_1} at {atoms_1_path} and {contexts_1_path}")
+            if structures_1 is not None: torch.save(structures_1, struct_1_path)
         if not cache_2_found:
             torch.save(atoms_2, atoms_2_path)
             torch.save(contexts_2, contexts_2_path)
-            print(f"Cached encodings saved for {audio_path_2} at {atoms_2_path} and {contexts_2_path}")
+            if structures_2 is not None: torch.save(structures_2, struct_2_path)
 
-    # stay time must be an integer bigger than 0
     if stay_time < 0 or not isinstance(stay_time, int):
         raise ValueError("Stay time must be a non-negative integer.")
 
-    # if context is not static, each context should have at least timeline size number of embeddings, if not error:
-    if context_static==False:
-        if len(contexts_1) < timeline_size:
-            raise ValueError(f"Audio 1 does not have enough context embeddings for the timeline size. Required: {timeline_size}, Available: {len(contexts_1)}")
-        if len(contexts_2) < timeline_size:
-            raise ValueError(f"Audio 2 does not have enough context embeddings for the timeline size. Required: {timeline_size}, Available: {len(contexts_2)}")
+    if not context_static:
+        if len(contexts_1) < timeline_size or len(contexts_2) < timeline_size:
+            raise ValueError("Audio does not have enough context embeddings for the timeline size.")
         contexts_1 = contexts_1[:timeline_size]
         contexts_2 = contexts_2[:timeline_size]
+        
+        if engine.use_structure:
+            structures_1 = structures_1[:timeline_size]
+            structures_2 = structures_2[:timeline_size]
 
     c0 = contexts_1[0]
     c1 = contexts_2[0]
 
     atoms = [None] * timeline_size
     contexts = [] 
+    structures = [] if engine.use_structure else None
 
-    # Send alpha_values_full to the same device as the context embeddings
     alpha_values_full = alpha_values_full.to(c0.device)
 
     for t in range(timeline_size):
         alpha = alpha_values_full[t]
-        if context_static==True:
+        
+        # 1. Slerp CLAP Contexts
+        if context_static:
             ctx = slerp(c0, c1, alpha)
         else:
             ctx = slerp(contexts_1[t], contexts_2[t], alpha)
         contexts.append(ctx)
+        
+        # 2. Lerp Structure Embeddings (Scalars interpolate linearly)
+        if engine.use_structure:
+            if context_static:
+                s_interp = (1 - alpha) * structures_1[0] + alpha * structures_2[0]
+            else:
+                s_interp = (1 - alpha) * structures_1[t] + alpha * structures_2[t]
+            structures.append(s_interp)
 
-    # Build timeline
     timeline = engine.build_base_timeline(
         atoms_129D=atoms,
         context_embeddings=contexts,
-        default_TF=False,
-        default_AF=0.0
+        structure_embeddings=structures,
+        default_TF=False
     )
 
-    # Generate
-    completed_timeline = engine.generate(timeline, NFE=NFE)
-
-    # Decode
+    completed_timeline = engine.generate(timeline, NFE=NFE, cfg_scale=cfg_scale)
     final_wav = engine.decode_timeline(completed_timeline, output_path=None, method=decode_method)
 
     if play:
@@ -254,45 +252,46 @@ def run_interpolation_pipeline(
 
     return final_wav
 
-# FlowInference class encapsulates the entire inference pipeline for Flow Matching Audio, including loading, encoding, context computation, generation, and decoding.
+# ==========================================
+# FLOW INFERENCE ENGINE
+# ==========================================
+
 class FlowInference:
     def __init__(
         self,
-        model: nn.Module,              # The trained FlowModel
-        local_encoder: nn.Module,      # The trained LocalEncoder
-        processor,                     # The EncodecProcessor
-        context_model: nn.Module,      # CLAP or your lightweight Proxy
-        segment_length: int = 5,       # M: Number of past atoms for memory
-        context_length: int = 10,      # Number of atoms in the context window
-        atoms_frames: int = 39,        # <-- NEW: Total frames per atom
-        atoms_hop_frames: int = 18,    # <-- NEW: How far we step forward
-        crossfade_frames: int = 3,     # <-- NEW: Acoustic blending overlap
-        sr: int = 48000,               # Audio sample rate
-        frame_rate: int = 150,         # EnCodec frame rate
+        model: nn.Module,              
+        local_encoder: nn.Module,      
+        processor,                     
+        context_model: nn.Module,      
+        segment_length: int = 5,       
+        context_length: int = 10,      
+        atoms_frames: int = 39,        
+        atoms_hop_frames: int = 18,    
+        crossfade_frames: int = 3,     
+        sr: int = 48000,               
+        frame_rate: int = 150,    
+        structure_feature_names: List[str] = None, # <--- NEW     
         device: str = "cuda",
         verbose = False
     ):
-        """
-        Initializes the Programmable Inference Engine for Flow Matching Audio.
-        """
         self.device = device
         self.verbose = verbose
 
-        # 1. Load and lock models in eval mode
+        self.structure_feature_names = structure_feature_names
+
         self.model = model.to(self.device).eval()
         self.local_encoder = local_encoder.to(self.device).eval()
+        self.processor = processor 
+        
+        # Detect if model uses structure (either as direct attribute or via transformer)
+        self.use_structure = getattr(self.model, "use_structure", False) or getattr(self.model.transformer, "use_structure", False)
 
-        self.context_model_type = context_model.name 
-
-        # If GlobalEncoder is used, put in eval mode.
+        self.context_model_type = getattr(context_model, "name", "Unknown") 
         if self.context_model_type == "GlobalEncoder":
             self.context_model = context_model.to(self.device).eval()
         else:
             self.context_model = context_model 
         
-        self.processor = processor 
-        
-        # 2. Structural Hyperparameters
         self.segment_length = segment_length
         self.context_length = context_length
         self.context_shift = segment_length
@@ -300,11 +299,8 @@ class FlowInference:
         self.atoms_frames = atoms_frames
         self.atoms_hop_frames = atoms_hop_frames
         self.crossfade_frames = crossfade_frames
-        
-        # The amount of past context baked into the front of every atom
         self.macro_overlap_frames = self.atoms_frames - self.atoms_hop_frames
         
-        # 3. Audio Math (Matching AtomSequenceDataset)
         self.sr = sr
         self.frame_rate = frame_rate
         self.samples_per_frame = sr // frame_rate
@@ -314,14 +310,10 @@ class FlowInference:
         self.crossfade_samples = self.crossfade_frames * self.samples_per_frame
         self.macro_overlap_samples = self.macro_overlap_frames * self.samples_per_frame
         
-        # 4. Pre-compute the Asymmetric Overlap-Add (OLA) Window
         self.ola_window = self._build_ola_window().to(self.device)
-        
-        # 5. The Director's Script
         self.timeline: List[Dict[str, Any]] = []
 
     def _build_ola_window(self):
-        """Builds the asymmetric Prefix Padding window."""
         zeros_frames = self.macro_overlap_frames - self.crossfade_frames
         zeros = torch.zeros(zeros_frames * self.samples_per_frame)
         
@@ -335,10 +327,6 @@ class FlowInference:
         return torch.cat([zeros, left_hann, ones, right_hann])
     
     def load_audio_to_tensor(self, audio_path: str) -> torch.Tensor:
-        """
-        Loads an audio file from disk, ensures it is stereo [1, 2, T], 
-        and moves it to the correct device.
-        """
         audio_input, _ = librosa.load(audio_path, sr=self.sr, mono=False)
         audio_tensor = torch.tensor(audio_input).unsqueeze(0) 
         
@@ -354,10 +342,6 @@ class FlowInference:
 
     @torch.no_grad()
     def encode_audio_to_atoms(self, audio_tensor: torch.Tensor) -> List[torch.Tensor]:
-        """
-        Takes a raw stereo waveform tensor [1, 2, T], chops it into prefix-padded segments, 
-        and extracts the unified 129-D latents.
-        """
         audio_tensor = audio_tensor.to(self.device)
         if audio_tensor.dim() == 2:
             audio_tensor = audio_tensor.unsqueeze(0) 
@@ -365,12 +349,10 @@ class FlowInference:
         total_samples = audio_tensor.shape[-1]
         atoms_129D = []
         
-        # Sliding window using the new asymmetric hop
         for start in range(0, total_samples, self.hop_samples):
             end = start + self.segment_samples
             segment = audio_tensor[:, :, start:end]
             
-            # Skip the last segment if it doesn't have the full frames
             if segment.shape[-1] < self.segment_samples:
                 break
                 
@@ -387,9 +369,6 @@ class FlowInference:
     
     @torch.no_grad()
     def compute_context_track(self, atoms_129D: List[torch.Tensor]) -> List[torch.Tensor]:
-        """
-        Computes 1024-D context embeddings using ONLY valid, contiguous atoms.
-        """
         context_embeddings = []
         total_atoms = len(atoms_129D)
         last_valid_emb = None
@@ -437,8 +416,38 @@ class FlowInference:
                     raise ValueError("Audio file is too short to compute even one context window!")
                     
         return context_embeddings
+
+    @torch.no_grad()
+    def compute_structure_track(self, audio_tensor: torch.Tensor) -> List[torch.Tensor]:
+        """Extracts 1D Structure Features using the exact matching Sliding Window."""
+        audio_tensor = audio_tensor.to(self.device)
+        total_samples = audio_tensor.shape[-1]
+        structures = []
+        
+        n_fft = max(256, self.samples_per_frame * 4)
+        hop_length = self.samples_per_frame
+        
+        for start in range(0, total_samples, self.hop_samples):
+            end = start + self.segment_samples
+            segment = audio_tensor[:, :, start:end]
+            
+            if segment.shape[-1] < self.segment_samples:
+                break
+                
+            struct = _compute_structure_features(
+                audio=segment,
+                sr=self.sr,
+                atoms_frames=self.atoms_frames,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                feature_names=self.structure_feature_names, # <--- NEW: Force exact match
+                mean_pooling=True 
+            )
+            structures.append(struct.to(self.device))
+            
+        return structures
     
-    def build_base_timeline(self, atoms_129D, context_embeddings, default_TF=False, default_AF=0.0):
+    def build_base_timeline(self, atoms_129D, context_embeddings, structure_embeddings=None, default_TF=False):
         if len(atoms_129D) != len(context_embeddings):
             raise ValueError("Length mismatch!")
             
@@ -448,9 +457,9 @@ class FlowInference:
                 "step": t,
                 "atom_given": atoms_129D[t],           
                 "context_embedding": context_embeddings[t], 
+                "structure_embedding": structure_embeddings[t] if structure_embeddings else None,
                 "atom_generated": None,                
-                "TF": default_TF,                      
-                "AF": default_AF                       
+                "TF": default_TF                       
             }
             timeline.append(step_dict)
             
@@ -458,7 +467,7 @@ class FlowInference:
         return timeline
     
     @torch.no_grad()
-    def generate(self, timeline: List[Dict[str, Any]], NFE: int = 32) -> List[Dict[str, Any]]:
+    def generate(self, timeline: List[Dict[str, Any]], NFE: int = 32, cfg_scale: float = 3.0) -> List[Dict[str, Any]]:
         self.model.eval()
         self.local_encoder.eval()
 
@@ -470,7 +479,7 @@ class FlowInference:
         dummy_atom = torch.zeros(1, 129, self.atoms_frames, device=self.device)
 
         if self.verbose:
-            print(f"\n--- Starting Generation over {total_steps} steps (NFE={NFE}) ---")
+            print(f"\n--- Starting Generation over {total_steps} steps (NFE={NFE}, CFG={cfg_scale}) ---")
 
         for t in tqdm(range(total_steps), desc="Solving ODE", disable=not self.verbose):
             past_atoms = []
@@ -486,7 +495,6 @@ class FlowInference:
                         past_atoms.append(step_dict["atom_generated"].to(self.device))
                         
             past_buffer = torch.cat(past_atoms, dim=0).unsqueeze(0) 
-
             encoded_past = self.local_encoder(past_buffer) 
             
             num_nulls = max(0, M - t)
@@ -496,9 +504,23 @@ class FlowInference:
             context = timeline[t]["context_embedding"].to(self.device)
             if context.dim() == 1:
                 context = context.unsqueeze(0) 
+
+            structure = timeline[t].get("structure_embedding")
+            if structure is not None:
+                structure = structure.to(self.device)
+                if structure.dim() == 1:
+                    structure = structure.unsqueeze(0)
                 
             x0 = torch.randn(1, self.atoms_frames, 129, device=self.device)
-            pred = self.model.generate(x0, encoded_past, context, max_nfe=NFE) 
+            
+            pred = self.model.generate(
+                x0=x0, 
+                encoded_past=encoded_past, 
+                clap_context=context, 
+                structure_vector=structure,
+                max_nfe=NFE,
+                cfg_scale=cfg_scale
+            ) 
             
             timeline[t]["atom_generated"] = pred.transpose(1, 2)
 
@@ -506,13 +528,15 @@ class FlowInference:
             print("✅ Generation Complete!")
         return timeline
     
-    def _decode_single_atom(self, atom_129D: torch.Tensor) -> torch.Tensor:
+    def _decode_single_atom(self, atom_129D: torch.Tensor, override_scale=None) -> torch.Tensor:
         latent = atom_129D[:, :128, :] 
-        raw_scale = atom_129D[:, 128, :] 
-        scale = torch.abs(raw_scale).mean(dim=-1, keepdim=True)       
+        if override_scale is not None:
+            scale_val = override_scale
+        else:
+            scale_val = torch.abs(atom_129D[:, 128, :]).mean(dim=-1, keepdim=True)       
 
         metadata = {
-            "audio_scales": [scale.squeeze(0).float()],
+            "audio_scales": [scale_val.squeeze(0).float()],
             "padding_mask": torch.ones(
                 (1, latent.shape[-1] * self.samples_per_frame), 
                 dtype=torch.bool, device=self.device
@@ -522,161 +546,60 @@ class FlowInference:
         return audio.cpu()
 
     @torch.no_grad()
-    def decode_timeline(self, timeline: List[Dict[str, Any]], output_path: str = None, method: str = "ola"):
+    def decode_timeline(self, timeline: List[Dict[str, Any]], output_path: str = None, method: str = "ola_smooth"):
         if not timeline:
             raise ValueError("Timeline is empty!")
             
-        if method == "latent_stitch":
-            if self.verbose:
-                print("\n--- Rendering Audio Timeline (Prefix Latent Stitching Mode) ---")
-                
-            gen_chunks = []
-            given_chunks = []
-            dummy_atom = torch.zeros(1, 129, self.atoms_frames, device=self.device)
-            
-            # --- THE LATENT STITCH FIX ---
-            # Overlap is now on the LEFT. So for t > 0, we discard the first 21 frames.
-            for t, step_dict in enumerate(timeline):
-                a_gen = step_dict.get("atom_generated")
-                a_giv = step_dict.get("atom_given")
-                
-                if a_gen is None: a_gen = dummy_atom
-                if a_giv is None: a_giv = dummy_atom
-                
-                if t == 0:
-                    # Keep the entire first atom
-                    gen_chunks.append(a_gen)
-                    given_chunks.append(a_giv)
-                else:
-                    # Discard the redundant past memory, keep only the new frames
-                    gen_chunks.append(a_gen[:, :, self.macro_overlap_frames:])
-                    given_chunks.append(a_giv[:, :, self.macro_overlap_frames:])
-                    
-            stitched_gen = torch.cat(gen_chunks, dim=-1)
-            stitched_given = torch.cat(given_chunks, dim=-1)
-            
-            audio_gen = self._decode_single_atom(stitched_gen).to(self.device)
-            audio_given = self._decode_single_atom(stitched_given).to(self.device)
-            
-            # Update AF Envelope math to match Prefix geometry
-            total_samples = audio_gen.shape[-1]
-            AF_envelope = torch.zeros(1, 1, total_samples, device=self.device)
-            
-            for t in range(len(timeline)):
-                AF = float(timeline[t].get("AF", 0.0))
-                AF = max(0.0, min(1.0, AF))
-                
-                if t == 0:
-                    start_sample = 0
-                    end_sample = self.segment_samples
-                else:
-                    start_sample = self.segment_samples + (t - 1) * self.hop_samples
-                    end_sample = start_sample + self.hop_samples
-                    
-                AF_envelope[:, :, start_sample:end_sample] = AF
-                
-            final_audio = torch.sqrt(AF_envelope) * audio_given + torch.sqrt(1.0 - AF_envelope) * audio_gen
-            final_audio_tensor = final_audio.squeeze(0).cpu()
+        total_steps = len(timeline)
+        total_samples = (total_steps - 1) * self.hop_samples + self.segment_samples
+        output_buffer = torch.zeros(1, 2, total_samples) 
+        ola_window = self.ola_window.view(1, 1, -1).cpu()
 
-        elif method == "ola":
+        if method == "ola_smooth":
             if self.verbose:
-                print("\n--- Rendering Audio Timeline (Real-Time Asymmetric OLA Mode) ---")
+                print("\n--- Rendering Audio Timeline (Smooth Mode) ---")
                 
-            total_steps = len(timeline)
-            total_samples = (total_steps - 1) * self.hop_samples + self.segment_samples
-            output_buffer = torch.zeros(1, 2, total_samples) 
-            ola_window = self.ola_window.view(1, 1, -1).cpu()
+            alpha_smooth = 0.6      
+            max_jump = 1.15  
+            max_drop = 0.85  
+            prev_scale = None
 
             for t in tqdm(range(total_steps), desc="Mixing Audio", disable=not self.verbose):
                 step_dict = timeline[t]
-                AF = float(step_dict.get("AF", 0.0))
-                AF = max(0.0, min(1.0, AF))
                 
-                audio_mix = torch.zeros(1, 2, self.segment_samples)
+                atom_to_decode = step_dict.get("atom_generated")
+                is_generated = True
                 
-                if AF > 0.0 and step_dict.get("atom_given") is not None:
-                    audio_given = self._decode_single_atom(step_dict["atom_given"])
-                    audio_mix += math.sqrt(AF) * audio_given
+                if atom_to_decode is None:
+                    atom_to_decode = step_dict.get("atom_given")
+                    is_generated = False
                     
-                if AF < 1.0 and step_dict.get("atom_generated") is not None:
-                    audio_generated = self._decode_single_atom(step_dict["atom_generated"])
-                    audio_mix += math.sqrt(1.0 - AF) * audio_generated
-                    
-                audio_mix = audio_mix * ola_window
-                
-                start_sample = t * self.hop_samples
-                end_sample = start_sample + self.segment_samples
-                output_buffer[:, :, start_sample:end_sample] += audio_mix
-                
-            final_audio_tensor = output_buffer.squeeze(0)
+                if atom_to_decode is None:
+                    continue
 
-        elif method == "ola_smooth":
-            if self.verbose:
-                print("\n--- Rendering Audio Timeline (Real-Time Asymmetric OLA Smooth Mode) ---")
-                
-            total_steps = len(timeline)
-            total_samples = (total_steps - 1) * self.hop_samples + self.segment_samples
-            output_buffer = torch.zeros(1, 2, total_samples) 
-            ola_window = self.ola_window.view(1, 1, -1).cpu()
-
-            # --- Smoothing Hyperparameters ---
-            alpha = 0.6      # EMA factor (0.0 = completely flat/frozen, 1.0 = no smoothing)
-            max_jump = 1.15  # Scale cannot grow by more than 15% per step
-            max_drop = 0.85  # Scale cannot drop by more than 15% per step
-            
-            prev_scale = None
-
-            for t in tqdm(range(total_steps), desc="Mixing Audio (Smooth)", disable=not self.verbose):
-                step_dict = timeline[t]
-                AF = float(step_dict.get("AF", 0.0))
-                AF = max(0.0, min(1.0, AF))
-                
-                audio_mix = torch.zeros(1, 2, self.segment_samples)
-                
-                # --- 1. Process & Smooth Generated Atom ---
-                atom_gen = step_dict.get("atom_generated")
-                if atom_gen is not None:
-                    # Clone to prevent permanently altering the timeline dictionary
-                    atom_gen_smooth = atom_gen.clone()
-                    
-                    # Extract the raw scalar value
-                    raw_scale = torch.abs(atom_gen[:, 128, :]).mean(dim=-1, keepdim=True)
-                    
+                if is_generated:
+                    raw_scale = torch.abs(atom_to_decode[:, 128, :]).mean(dim=-1, keepdim=True)
                     if prev_scale is None:
                         smoothed_scale = raw_scale
                     else:
-                        # Rate limit the jump
                         target_scale = torch.clamp(raw_scale, prev_scale * max_drop, prev_scale * max_jump)
-                        # Apply EMA blend
-                        smoothed_scale = (alpha * target_scale) + ((1.0 - alpha) * prev_scale)
+                        smoothed_scale = (alpha_smooth * target_scale) + ((1.0 - alpha_smooth) * prev_scale)
                         
                     prev_scale = smoothed_scale
-                    
-                    # Inject smoothed scale back into the 129th dimension
-                    atom_gen_smooth[:, 128, :] = smoothed_scale.expand_as(atom_gen_smooth[:, 128, :])
+                    audio = self._decode_single_atom(atom_to_decode, override_scale=smoothed_scale)
                 else:
-                    atom_gen_smooth = None
-
-                # --- 2. Standard OLA Decoding ---
-                if AF > 0.0 and step_dict.get("atom_given") is not None:
-                    audio_given = self._decode_single_atom(step_dict["atom_given"])
-                    audio_mix += math.sqrt(AF) * audio_given
+                    audio = self._decode_single_atom(atom_to_decode)
                     
-                if AF < 1.0 and atom_gen_smooth is not None:
-                    # Pass the *smoothed* tensor to the internal decoder
-                    audio_generated = self._decode_single_atom(atom_gen_smooth)
-                    audio_mix += math.sqrt(1.0 - AF) * audio_generated
-                    
-                audio_mix = audio_mix * ola_window
+                audio = audio * ola_window
                 
                 start_sample = t * self.hop_samples
                 end_sample = start_sample + self.segment_samples
-                output_buffer[:, :, start_sample:end_sample] += audio_mix
+                output_buffer[:, :, start_sample:end_sample] += audio
                 
-            final_audio_tensor = output_buffer.squeeze(0)
-
         else:
-            raise ValueError(f"Unknown rendering method: {method}")
+            raise ValueError(f"Method '{method}' removed/unsupported. Please use 'ola_smooth'.")
+
+        final_audio_tensor = output_buffer.squeeze(0)
 
         if output_path:
             sf_audio = final_audio_tensor.transpose(0, 1).numpy()

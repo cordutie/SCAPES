@@ -65,9 +65,9 @@ class GlobalTrainer:
         self.val_loss_history = {}
 
     def _prepare_batch(self, batch):
-        latent = batch["latent_context_win"].to(self.device)
-        scale = batch["scale_context_win"].to(self.device)
-        target_clap = batch["clap_context_win"].to(self.device)
+        latent = batch["memory_buffer_latent"].to(self.device)
+        scale = batch["memory_buffer_scale"].to(self.device)
+        target_clap = batch["target_semantic"].to(self.device)
         return latent, scale, target_clap
 
     def train_epoch(self):

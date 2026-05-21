@@ -14,14 +14,15 @@ def get_model_configs(
     size, 
     segment_length, 
     frame_dim=129,
-    frames_per_atom=39,       # <--- Updated Default
-    atoms_hop_frames=18,      # <--- NEW
+    frames_per_atom=48,       # <--- Updated Default
+    atoms_hop_frames=15,      # <--- NEW
     crossfade_frames=3,       # <--- NEW
     context_vector_dim=1024,
     LocalEncoder_in_channels=129,
     LocalEncoder_hidden_dim=256,
     LocalEncoder_time_entanglement=True,
-    LocalEncoder_temporal_compression=1
+    LocalEncoder_temporal_compression=1,
+    structure_dim=0
 ):
     configs = {
         "small": {
@@ -30,35 +31,35 @@ def get_model_configs(
             "nhead": 8,
             "dim_feedforward": 2048,
             "max_seq_len": 2048,
-        },
-        "small_new": {
-            "d_model": 512,
-            "num_layers": 12,
-            "nhead": 16,
-            "dim_feedforward": 2048,
-            "max_seq_len": 2048,
-        },
+        }, # 30 M parameters
         "medium": {
             "d_model": 768,
             "num_layers": 8,
             "nhead": 12,
             "dim_feedforward": 2048,
             "max_seq_len": 2048,
-        },
+        }, # 90 M parameters
         "large": {
             "d_model": 1024,
             "num_layers": 12,
             "nhead": 16,
             "dim_feedforward": 2048,
             "max_seq_len": 2048,
-        },
+        }, # 200 M parameters
         "extra_large": {
+            "d_model": 1280,
+            "num_layers": 16,
+            "nhead": 20,
+            "dim_feedforward": 2048,
+            "max_seq_len": 20
+        }, # 400 M parameters
+        "audiobox": {
             "d_model": 1024,
             "num_layers": 24,
             "nhead": 16,
             "dim_feedforward": 4096,
             "max_seq_len": 6000,
-        }
+        } # ? parameters
     }
     
     if size not in configs:
@@ -91,7 +92,8 @@ def get_model_configs(
         "d_model": d_model,
         "nhead": nhead,
         "num_layers": num_layers,
-        "dim_feedforward": dim_feedforward
+        "dim_feedforward": dim_feedforward,
+        "structure_dim": structure_dim
     }
 
     return LocalEncoder_config, FlowModel_config
@@ -108,12 +110,15 @@ class FlowTrainer:
             optimizer,
             model_config: dict,      
             encoder_config: dict,    
-            val_loader=None,         # <--- Default to None
+            val_loader=None,         
             model_path="checkpoints/flow_model",
             context_source="clap", 
             val_audio_files=None, 
             device="cuda",
-            past_dropout=0.1
+            past_dropout=0.1,
+            conditioning_dropout=0.2,
+            save_resume_states=False,     
+            resume_from=None              # <--- CHANGED: Smart resume argument
         ):
         self.model = model.to(device)
         self.local_encoder = local_encoder.to(device)
@@ -125,11 +130,25 @@ class FlowTrainer:
         self.device = device
         self.context_source = context_source
         self.past_dropout = past_dropout
+        self.conditioning_dropout = conditioning_dropout
         self.model_config = model_config
         self.encoder_config = encoder_config
         self.atom_frames = model_config.get("frames_per_atom", 39) 
+        self.use_structure = dataset.structure_feature_dimension > 0
+
+        if self.use_structure and "target_structure" not in self.dataset.requested_keys:
+            raise ValueError("Model expects structure but dataset does not request it")
         
-        # Ensure it's a list for iteration
+        # ---> NEW: Inject feature names directly into the config dictionary <---
+        if self.use_structure:
+            # We use getattr just to be safe, defaulting to None if it somehow doesn't exist
+            self.model_config["structure_feature_names"] = getattr(self.dataset, "structure_feature_names", None)
+
+        # State Variables
+        self.save_resume_states = save_resume_states
+        self.start_epoch = 1
+        self.best_metric = float('inf')
+        
         if isinstance(val_audio_files, str):
             self.val_audio_files = [val_audio_files]
         else:
@@ -145,36 +164,157 @@ class FlowTrainer:
         os.makedirs(self.loss_dir, exist_ok=True)
         os.makedirs(self.val_dir, exist_ok=True)
 
-        # Save the JSON configs immediately
-        with open(self.ckpt_dir / "flow_model_config.json", "w") as f:
+        # <--- NEW: OVERWRITE PROTECTION
+        existing_ckpts = list(self.ckpt_dir.glob("*.pt"))
+        if existing_ckpts and not resume_from:
+            raise FileExistsError(
+                f"⚠️ Model directory '{self.ckpt_dir}' already contains checkpoints! "
+                "To prevent accidentally overwriting your trained models, please either specify a different `model_path`, "
+                "or set `resume_from='latest'` (or a specific epoch number) to continue training."
+            )
+
+        with open(self.ckpt_dir / "config_flow_model.json", "w") as f:
             json.dump(self.model_config, f, indent=4)
             
-        with open(self.ckpt_dir / "local_encoder_config.json", "w") as f:
+        with open(self.ckpt_dir / "config_local_encoder.json", "w") as f:
             json.dump(self.encoder_config, f, indent=4)
 
-        # History updated for split losses
         self.train_losses = {"total": [], "latent": [], "scale": []}
         self.val_losses   = {"total": [], "latent": [], "scale": []}
 
+        # <--- NEW: Smart Resume Trigger
+        if resume_from is not None and resume_from is not False:
+            resolved_path = self._resolve_resume_path(resume_from)
+            if resolved_path:
+                self._resume_from_state(resolved_path)
+            else:
+                print("⚠️ Could not resolve a valid trainer state to resume from.")
+
+    def _resolve_resume_path(self, resume_from):
+        """Intelligently resolves the user's intent into a concrete file path."""
+        # 1. User wants the absolute last checkpoint (Colab crash recovery)
+        if resume_from is True or resume_from in ["latest", "last"]:
+            target_path = self.ckpt_dir / "last_trainer_state.pt"
+            if target_path.exists():
+                return target_path
+            return None
+
+        # 2. User wants a specific epoch (e.g., resume_from=45)
+        elif isinstance(resume_from, int):
+            target_path = self.ckpt_dir / f"epoch_{resume_from}_trainer_state.pt"
+            if target_path.exists():
+                return target_path
+            raise FileNotFoundError(f"Requested to resume from epoch {resume_from}, but {target_path} does not exist.")
+
+        # 3. User wants the best historical model
+        elif resume_from == "best":
+            target_path = self.ckpt_dir / "best_trainer_state.pt"
+            if target_path.exists():
+                return target_path
+            raise FileNotFoundError(f"Requested 'best' resume, but {target_path} does not exist.")
+
+        # 4. User provided a manual string/Path (Fallback)
+        elif isinstance(resume_from, (str, Path)):
+            target_path = Path(resume_from)
+            if target_path.exists():
+                return target_path
+            raise FileNotFoundError(f"Manual resume path {target_path} does not exist.")
+        
+        return None
+
+    def _resume_from_state(self, state_path):
+        """Loads model weights, optimizer, and training history to resume seamlessly."""
+        state_path = Path(state_path)
+        if not state_path.exists():
+            raise FileNotFoundError(f"Resume state not found at {state_path}")
+        
+        print(f"🔄 Resuming training from {state_path.name}...")
+        
+        # 1. Derive corresponding model paths by directly swapping the target names
+        state_name = state_path.stem
+        flow_name = state_name.replace("trainer_state", "flow_model")
+        enc_name = state_name.replace("trainer_state", "local_encoder")
+        
+        flow_path = state_path.parent / f"{flow_name}.pt"
+        enc_path = state_path.parent / f"{enc_name}.pt"
+        
+        if not flow_path.exists() or not enc_path.exists():
+            raise FileNotFoundError(f"Could not find accompanying model files for {state_name}. Looked for {flow_name}.pt")
+
+        # 2. Load Weights
+        self.model.load_state_dict(torch.load(flow_path, map_location=self.device)['model_state_dict'])
+        self.local_encoder.load_state_dict(torch.load(enc_path, map_location=self.device)['model_state_dict'])
+        
+        # 3. Load Optimizer & Training States
+        state = torch.load(state_path, map_location=self.device)
+        try:
+            self.optimizer.load_state_dict(state['optimizer_state_dict'])
+        except Exception as e:
+            print(f"⚠️ Could not load optimizer state: {e}")
+        
+        self.start_epoch = state['epoch'] + 1  # Start at the next epoch
+        self.best_metric = state['best_metric']
+        
+        # Restore loss histories so plots don't start from scratch
+        self.train_losses = state.get('train_losses', self.train_losses)
+        self.val_losses = state.get('val_losses', self.val_losses)
+        
+        print(f"✅ Successfully resumed! Starting at Epoch {self.start_epoch} (Best Metric so far: {self.best_metric:.4f})")
+
     def _prepare_batch(self, batch):
         """Assembles the 129th Dimension (Latent + Scale)"""
-        # 1. Past Memory: [B, N, 128, T] + [B, N, 1] -> [B, N, 129, T]
-        past_latent = batch["latent_past"].to(self.device)
-        past_scale = batch["scale_past"].to(self.device)
-        past_scale_exp = past_scale.unsqueeze(-1).expand(-1, -1, -1, self.atom_frames)
-        past_memory = torch.cat([past_latent, past_scale_exp], dim=2)
 
-        # 2. Present Target: [B, 128, T] + [B, 1] -> [B, T, 129]
-        present_latent = batch["latent_present"].to(self.device)
-        present_scale = batch["scale_present"].to(self.device)
-        present_scale_exp = present_scale.unsqueeze(-1).expand(-1, -1, self.atom_frames)
-        present_target = torch.cat([present_latent, present_scale_exp], dim=1).transpose(1, 2)
+        # -------------------------------------------------
+        # 1. Past Memory
+        # -------------------------------------------------
+        past_latent = batch["memory_buffer_latent"].to(self.device)
+        past_scale = batch["memory_buffer_scale"].to(self.device)
 
-        # 3. Context Toggle
-        ctx_key = "clap_context_win" if self.context_source == "clap" else "ctx_emb_context_win"
-        context = batch[ctx_key].to(self.device)
+        past_scale_exp = past_scale.unsqueeze(-1).expand(
+            -1, -1, -1, self.atom_frames
+        )
 
-        return past_memory, present_target, context
+        past_memory = torch.cat(
+            [past_latent, past_scale_exp],
+            dim=2
+        )
+
+        # -------------------------------------------------
+        # 2. Present Target
+        # -------------------------------------------------
+        present_latent = batch["target_latent"].to(self.device)
+        present_scale = batch["target_scale"].to(self.device)
+
+        present_scale_exp = present_scale.unsqueeze(-1).expand(
+            -1, -1, self.atom_frames
+        )
+
+        present_target = torch.cat(
+            [present_latent, present_scale_exp],
+            dim=1
+        ).transpose(1, 2)
+
+        # -------------------------------------------------
+        # 3. Semantic Context
+        # -------------------------------------------------
+        if self.context_source not in ["clap", None]:
+            raise ValueError(
+                "Only 'clap' target_semantic is supported."
+            )
+
+        context = batch["target_semantic"].to(self.device)
+
+        # -------------------------------------------------
+        # 4. Optional Structure Conditioning
+        # -------------------------------------------------
+        structure = batch.get("target_structure", None)
+        if structure is not None:
+            structure = structure.to(self.device)
+
+        if self.use_structure and structure is None:
+            raise ValueError("Model expects structure_vector but dataset did not provide it")
+
+        return past_memory, present_target, context, structure
 
     def _plot_and_save_losses(self, current_epoch):
         """Generates and saves a grid plot of the loss history."""
@@ -234,8 +374,15 @@ class FlowTrainer:
         
         pbar = tqdm(self.train_loader, desc="Training")
         for batch in pbar:
-            past_memory, present_target, context = self._prepare_batch(batch)
+            past_memory, present_target, context, structure = self._prepare_batch(batch)
             
+            # Drop the CLAP embedding 10% of the time by replacing it with zeros
+            if self.conditioning_dropout > 0.0:
+                # Create a boolean mask of shape [Batch, 1]
+                mask = torch.rand(context.shape[0], 1, device=self.device) < self.conditioning_dropout
+                # Where mask is True, replace CLAP with zeros. Otherwise, keep CLAP.
+                context = torch.where(mask, torch.zeros_like(context), context)
+
             self.optimizer.zero_grad()
             
             # 1. Encode memory
@@ -244,22 +391,43 @@ class FlowTrainer:
             # 2. Dropout logic
             if self.past_dropout > 0.0:
                 B, N_past, T_frames, d_model = encoded_past.shape
-                mask = torch.zeros((B, N_past, T_frames, d_model), dtype=torch.bool, device=self.device)
+                
+                # option 1: Randomly drop frames within atoms (less aggressive, more noisy)
+                # mask = torch.zeros((B, N_past, T_frames, d_model), dtype=torch.bool, device=self.device)
+                # for b in range(B):
+                #     if torch.rand(1).item() < self.past_dropout:
+                #         num_drop = torch.randint(1, N_past + 1, (1,)).item()
+                #         mask[b, :num_drop, :, :] = True 
+                # encoded_past = torch.where(mask, self.model.null_past_embed, encoded_past)
+
+                # option 2: Drop entire atoms instead of random frames within atoms (more aggressive but cleaner)
+                mask = torch.zeros((B, N_past, 1, 1), dtype=torch.bool, device=self.device)
+
                 for b in range(B):
                     if torch.rand(1).item() < self.past_dropout:
                         num_drop = torch.randint(1, N_past + 1, (1,)).item()
-                        mask[b, :num_drop, :, :] = True 
+                        mask[b, :num_drop] = True
+
                 encoded_past = torch.where(mask, self.model.null_past_embed, encoded_past)
             
             # 3. Flow Loss with Scale Weighting
             noise = torch.randn_like(present_target)
             loss, l_lat, l_scale = flow_matching_loss(
-                self.model, noise, present_target, context, encoded_past, 
-                scale_weight=1.0 
+                self.model,
+                noise,
+                present_target,
+                context,
+                encoded_past,
+                structure_vector=structure,
+                scale_weight=1.0
             )
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.parameters()) +
+                list(self.local_encoder.parameters()),
+                1.0
+            )
             self.optimizer.step()
             
             total_loss += loss.item()
@@ -288,13 +456,19 @@ class FlowTrainer:
         total_scale = 0
         
         for batch in self.val_loader:
-            past_memory, present_target, context = self._prepare_batch(batch)
+            past_memory, present_target, context, structure = self._prepare_batch(batch)
             encoded_past = self.local_encoder(past_memory)
             noise = torch.randn_like(present_target)
             
             # Use the same weighted loss as training
             loss, l_lat, l_scale = flow_matching_loss(
-                self.model, noise, present_target, context, encoded_past, scale_weight=1.0
+                self.model,
+                noise,
+                present_target,
+                context,
+                encoded_past,
+                structure_vector=structure,
+                scale_weight=1.0
             )
             
             total_loss += loss.item()
@@ -308,8 +482,8 @@ class FlowTrainer:
         )
 
     @torch.no_grad()
-    def generate_validation_audio(self, epoch, num_atoms=50, NFE=32):
-        """Generates audio using Asymmetric OLA Prefix Padding."""
+    def generate_validation_audio(self, epoch, NFE=32):
+        """Generates TF validation audio using Asymmetric OLA Smooth Padding."""
         if not self.val_audio_files: 
             return
             
@@ -317,21 +491,23 @@ class FlowTrainer:
         self.local_encoder.eval()
 
         # --- DYNAMIC ASYMMETRIC OLA SETUP ---
-        # 1. Pull atom geometry from model_config
         atoms_frames = self.model_config.get("frames_per_atom", 39)
         hop_frames = self.model_config.get("atoms_hop_frames", 18)
+
+        hop_time = hop_frames / 150.0
+        time = 5 # seconds
+        num_atoms = int(time // hop_time)
+
         crossfade_frames = self.model_config.get("crossfade_frames", 3)
         macro_overlap_frames = atoms_frames - hop_frames
         
-        # 2. Pull sample rate math from dataset
         samples_per_frame = self.dataset.samples_per_frame
         
         segment_samples = atoms_frames * samples_per_frame
         hop_samples     = hop_frames * samples_per_frame
         crossfade_samples = crossfade_frames * samples_per_frame
-        macro_overlap_samples = macro_overlap_frames * samples_per_frame
         
-        # 3. Build the Asymmetric Window
+        # Build the Asymmetric Window
         zeros_frames = macro_overlap_frames - crossfade_frames
         zeros = torch.zeros(zeros_frames * samples_per_frame, device=self.device)
         
@@ -347,89 +523,83 @@ class FlowTrainer:
             hann[crossfade_samples:]
         ]).view(1, 1, -1)
 
+        # --- OLA Smooth Hyperparameters ---
+        alpha_smooth = 0.6      # EMA factor
+        max_jump = 1.15         # Max 15% growth
+        max_drop = 0.85         # Max 15% drop
+
         for target_file in self.val_audio_files:
-            # Find indices for this specific file
             file_indices = [i for i, (fname, _) in enumerate(self.dataset.all_indices) if fname == target_file]
             if not file_indices: 
                 continue
                 
             seq_indices = file_indices[:num_atoms]
-            ar_buffer = None # Will initialize from first batch
             
-            # Initialize Audio Buffers for OLA
+            # Initialize Audio Buffer
             total_samples = (len(seq_indices) - 1) * hop_samples + segment_samples
             tf_out_audio = torch.zeros(1, 2, total_samples, device=self.device)
-            ar_out_audio = torch.zeros(1, 2, total_samples, device=self.device)
+            
+            prev_scale = None
 
-            for i, idx in enumerate(tqdm(seq_indices, desc=f"Generating {target_file}")):
+            for i, idx in enumerate(tqdm(seq_indices, desc=f"Generating {target_file} (TF)")):
                 # Prepare single-item batch
                 raw_batch = self.dataset[idx]
                 for k in raw_batch: 
                     if isinstance(raw_batch[k], torch.Tensor): 
                         raw_batch[k] = raw_batch[k].unsqueeze(0)
                 
-                gt_past, _, context = self._prepare_batch(raw_batch)
-                
-                # Initialize AR buffer at step 0
-                if ar_buffer is None: 
-                    ar_buffer = torch.zeros_like(gt_past)
+                gt_past, _, context, structure = self._prepare_batch(raw_batch)
                 
                 # Sample noise: [1, T_frames, 129]
                 x0 = torch.randn(1, atoms_frames, 129, device=self.device)
                 
-                # --- 1. Teacher Forcing Step ---
+                # --- Teacher Forcing Generation ---
                 enc_tf = self.local_encoder(gt_past)
-                tf_pred = self.model.generate(x0, enc_tf, context, max_nfe=NFE).transpose(1, 2)
+                tf_pred = self.model.generate(
+                    x0, 
+                    enc_tf, 
+                    context, 
+                    structure_vector=structure, # <--- Structure Injected
+                    max_nfe=NFE
+                ).transpose(1, 2)
                 
-                # --- 2. Autoregressive Step (with NULL cold-start) ---
-                enc_ar = self.local_encoder(ar_buffer)
-                num_nulls = max(0, gt_past.shape[1] - i)
-                if num_nulls > 0:
-                    enc_ar[:, :num_nulls, :, :] = self.model.null_past_embed
+                # --- OLA Smooth Processing ---
+                tf_pred_smooth = tf_pred.clone()
+                raw_scale = torch.abs(tf_pred[:, 128, :]).mean(dim=-1, keepdim=True)
                 
-                ar_pred = self.model.generate(x0, enc_ar, context, max_nfe=NFE).transpose(1, 2)
+                if prev_scale is None:
+                    smoothed_scale = raw_scale
+                else:
+                    target_scale = torch.clamp(raw_scale, prev_scale * max_drop, prev_scale * max_jump)
+                    smoothed_scale = (alpha_smooth * target_scale) + ((1.0 - alpha_smooth) * prev_scale)
+                    
+                prev_scale = smoothed_scale
+                tf_pred_smooth[:, 128, :] = smoothed_scale.expand_as(tf_pred_smooth[:, 128, :])
                 
-                # --- 3. Internal Decoder + OLA Function ---
-                def decode_and_add(pred, buffer, index):
-                    # Robust Scale Handling: Force positive and average over the atom
-                    latents = pred[:, :128, :]
-                    scale = torch.abs(pred[:, 128, :]).mean(dim=-1, keepdim=True)
-                    
-                    meta = {
-                        "audio_scales": [scale.squeeze(0).float()],
-                        "padding_mask": torch.ones((1, atoms_frames * samples_per_frame), 
-                                                 dtype=torch.bool, device=self.device)
-                    }
-                    
-                    # Decode to audio [1, 2, T]
-                    audio = self.processor.decode_latents_audio(latents, metadata=meta)
-                    # Apply asymmetric window and OLA
-                    audio = audio * window
-                    
-                    start = index * hop_samples
-                    buffer[:, :, start : start + segment_samples] += audio
+                # --- Internal Decoder ---
+                latents = tf_pred_smooth[:, :128, :]
+                meta = {
+                    "audio_scales": [smoothed_scale.squeeze(0).float()],
+                    "padding_mask": torch.ones((1, atoms_frames * samples_per_frame), 
+                                             dtype=torch.bool, device=self.device)
+                }
+                
+                audio = self.processor.decode_latents_audio(latents, metadata=meta)
+                audio = audio * window
+                
+                start = i * hop_samples
+                tf_out_audio[:, :, start : start + segment_samples] += audio
 
-                # Process both streams
-                decode_and_add(tf_pred, tf_out_audio, i)
-                decode_and_add(ar_pred, ar_out_audio, i)
-
-                # Update AR Buffer for next step: Roll left, insert new prediction as latest atom
-                new_ar_atom = ar_pred.unsqueeze(1)
-                ar_buffer = torch.cat([ar_buffer[:, 1:], new_ar_atom], dim=1)
-
-            # Save results to validation directory
+            # Save results to validation directory (Only TF now)
             file_stem = Path(target_file).stem
             sf.write(self.val_dir / f"epoch_{epoch}_{file_stem}_TF.wav", 
                      tf_out_audio.squeeze(0).T.cpu().numpy(), 48000)
-            sf.write(self.val_dir / f"epoch_{epoch}_{file_stem}_AR.wav", 
-                     ar_out_audio.squeeze(0).T.cpu().numpy(), 48000)
             
         print(f"✅ Validation audio for epoch {epoch} saved!")
 
     def train(self, epochs, audio_val_freq=5, val_nfe=32):
-        best_metric = float('inf') # <--- NEW: renamed to be generic for train or val
         
-        for epoch in range(1, epochs + 1):
+        for epoch in range(self.start_epoch, epochs + 1):
             print(f"\n=== Epoch {epoch}/{epochs} ===")
             
             # Run Training 
@@ -441,7 +611,7 @@ class FlowTrainer:
             
             print(f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f})")
 
-            # <--- NEW: Conditional Validation Logic
+            # Conditional Validation Logic
             if self.val_loader is not None:
                 avg_v_total, avg_v_lat, avg_v_scale = self.val_epoch()
                 
@@ -452,31 +622,56 @@ class FlowTrainer:
                 print(f"Val   | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
                 current_metric = avg_v_total
             else:
-                # If no validation set, use training loss to track the "best" model
                 current_metric = avg_t_total
             
-            # 1. Save "Best" Checkpoint
-            if current_metric < best_metric:
-                best_metric = current_metric
+            # ----------------------------------------------------
+            # STATE PACKAGING (If enabled)
+            # ----------------------------------------------------
+            trainer_state = None
+            if self.save_resume_states:
+                trainer_state = {
+                    'epoch': epoch,
+                    'best_metric': min(current_metric, self.best_metric),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'train_losses': self.train_losses,
+                    'val_losses': self.val_losses
+                }
+
+            # 1. Save "Best" Checkpoint (No changes here)
+            if current_metric < self.best_metric:
+                self.best_metric = current_metric
                 torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "best_flow_model.pt")
                 torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "best_local_encoder.pt")
+                
+                if self.save_resume_states:
+                    torch.save(trainer_state, self.ckpt_dir / "best_trainer_state.pt")
+                    
                 print("🌟 Saved new best models!")
                 
             # 2. Save Periodic Checkpoints & Generate Audio
             if epoch % audio_val_freq == 0:
-                torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / f"flow_model_epoch_{epoch}.pt")
-                torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / f"local_encoder_epoch_{epoch}.pt")
+                torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / f"epoch_{epoch}_flow_model.pt")
+                torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / f"epoch_{epoch}_local_encoder.pt")
                 
-                # Audio generation still runs based purely on self.val_audio_files
+                if self.save_resume_states:
+                    torch.save(trainer_state, self.ckpt_dir / f"epoch_{epoch}_trainer_state.pt")
+                
+                # Audio generation
                 self.generate_validation_audio(epoch, NFE=val_nfe)
+
+            # 3. Always save the "Last" Checkpoint (Overwrites every epoch)
+            torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "last_flow_model.pt")
+            torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "last_local_encoder.pt")
+            if self.save_resume_states:
+                torch.save(trainer_state, self.ckpt_dir / "last_trainer_state.pt")
                 
-            # 3. Save Detailed Loss History
+            # 4. Save Detailed Loss History
             history_path = self.loss_dir / "loss_history.json"
             with open(history_path, "w") as f:
                 json.dump({
                     "train": self.train_losses,
-                    "val": self.val_losses if self.val_loader else {} # Skip val dict if empty
+                    "val": self.val_losses if self.val_loader else {} 
                 }, f, indent=4)
                 
-            # 4. Generate and Save Loss Plots
+            # 5. Generate and Save Loss Plots
             self._plot_and_save_losses(epoch)

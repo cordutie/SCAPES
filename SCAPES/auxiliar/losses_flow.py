@@ -42,7 +42,7 @@ def Dt_psi_conditioned(s, X0, X1):
     """The derivative of the path (the target velocity vector)."""
     return X1 - X0
 
-def flow_matching_loss(model, x0, x1, context, encoded_past, scale_weight=1.0):
+def flow_matching_loss(model, x0, x1, context, encoded_past, structure_vector = None, scale_weight=1.0):
     """
     x0, x1: (B, 21, 129)
     scale_weight: Hyperparameter to boost the importance of the 129th channel.
@@ -56,7 +56,7 @@ def flow_matching_loss(model, x0, x1, context, encoded_past, scale_weight=1.0):
     
     # 3. Predict Velocity
     s_model = s.squeeze(-1) 
-    u_model = model(x_t=xs, s=s_model, context_vector=context, encoded_past=encoded_past)
+    u_model = model(x_t=xs, s=s_model, context_vector=context, encoded_past=encoded_past, structure_vector=structure_vector)
     
     # --- NEW: Split Latents (0-127) and Scale (128) ---
     # Velocity for latents

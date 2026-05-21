@@ -1,10 +1,43 @@
+import math
+import random
+import warnings
+from pathlib import Path
+
+import json
+import librosa
 import torch
 from torch.utils.data import Dataset, Subset
-import json
-from pathlib import Path
-import random
-import librosa
-import warnings
+
+from SCAPES.data.config_loader import load_config
+
+def _get_config_value(config, keys, default=None):
+    current = config
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _auto_device():
+    if hasattr(torch, "hpu") and torch.hpu.is_available():
+        return "hpu"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def _resolve_device(requested):
+    if requested in [None, "auto"]:
+        return _auto_device()
+    if requested == "hpu" and not (hasattr(torch, "hpu") and torch.hpu.is_available()):
+        warnings.warn("Requested device 'hpu' but it is not available. Falling back to auto.")
+        return _auto_device()
+    if requested == "cuda" and not torch.cuda.is_available():
+        warnings.warn("Requested device 'cuda' but it is not available. Falling back to cpu.")
+        return "cpu"
+    return requested
+
 
 def batch_from_latents_to_audio(batch, dataset, processor, mode="decoded", part="past"):
     """
@@ -29,78 +62,111 @@ class AtomSequenceDataset(Dataset):
         self, 
         dataset_path, 
         requested_keys=None,
-        segment_length=20, 
-        context_length=10, 
-        hop_size=10, 
-        sr=48000, 
-        frame_rate=150, 
-        device='cpu',
+        memory_buffer_atoms=None,
+        hop_atoms=None, 
+        context_time=None,
+        # sr=None, 
+        # frame_rate=None, 
+        device="auto",
         verbose=False
     ):
         self.dataset_path    = Path(dataset_path)
         self.annotations_dir = self.dataset_path / "annotations"
+
+        config_dir = self.dataset_path / "config"
+        config, config_path = load_config(config_dir)
+        self.config_path = config_path
         
-        # Sliding Window Config
-        self.segment_length = segment_length
-        self.context_length = context_length
-        self.context_shift  = segment_length 
-        self.hop_size = hop_size
+        # Sliding Window Config (atom-level)
+        dataset_config = _get_config_value(config, ["dataset"], {})
+        if memory_buffer_atoms is None:
+            memory_buffer_atoms = dataset_config.get("memory_buffer_atoms", 3)
+        if hop_atoms is None:
+            hop_atoms = dataset_config.get("hop_atoms", 1)
+
+        self.memory_buffer_atoms = memory_buffer_atoms
+        self.hop_atoms = hop_atoms
         
-        self.total_length = max(self.segment_length + 1, self.context_shift + self.context_length)
-        self.config_folder_name = f"seg_{self.segment_length}_ctx_{self.context_length}_shift_{self.context_shift}_hop_{self.hop_size}"
-        
+        valid_keys = {
+                "memory_buffer_latent", "target_latent",
+                "memory_buffer_scale", "target_scale",
+                "target_semantic", "target_structure",
+                "target_audio", "target_context_audio",
+                "index"
+            }
         if requested_keys is None:
-            self.requested_keys = ["latent_past", "scale_past", "index"]
+            self.requested_keys = valid_keys
+            print(f"No requested_keys provided; defaulting to all: {self.requested_keys}")
         else:
-            valid_keys = {"latent_past", "latent_present", "latent_context_win", 
-                        "scale_past", "scale_present", "scale_context_win", 
-                        "ctx_emb_past", "ctx_emb_context_win", "clap_past", "clap_context_win",
-                        "index"}
             if not all(key in valid_keys for key in requested_keys):
                 raise ValueError(f"Invalid keys in requested_keys. Valid keys are: {valid_keys}")
             self.requested_keys = requested_keys
 
-        self.device = device
-        
-        # Parameters for audio math
-        self.sr = sr
-        self.frame_rate = frame_rate
-        self.samples_per_frame = sr // frame_rate
+        config_device = _get_config_value(config, ["device"], "auto")
+        if device is None or device == "auto":
+            self.device = _resolve_device(config_device)
+        else:
+            self.device = _resolve_device(device)
+
+        self.seed = _get_config_value(config, ["seed"], None)
+
+        self.sr = 48000
+        self.frame_rate = 150
+        self.samples_per_frame = self.sr // self.frame_rate
         
         # Load the manifest
         json_path = self.dataset_path / "config" / "manifest.json"
         with open(json_path, 'r') as f:
             self.manifest = json.load(f)
-            
-        # --- NEW: Reading dataprep.json with Prefix Padding Logic ---
-        dataprep_config_path = self.dataset_path / "config" / "dataprep.json"
-        if dataprep_config_path.exists():
-            with open(dataprep_config_path, 'r') as f:
-                dataprep_config = json.load(f)
 
-            self.atoms_frames = dataprep_config.get("atoms_frames", 48)
-            self.atoms_hop_frames = dataprep_config.get("atoms_hop_frames", 15)
-            self.crossfade_frames = dataprep_config.get("crossfade_frames", 3) # The acoustic fade
-            
-            self.train_split_key = dataprep_config.get("train_split")
-            self.val_split_key = dataprep_config.get("val_split")
+        atoms_config          = _get_config_value(config, ["atoms"], {})
+        self.atoms_frames     = atoms_config.get("frames", 48)
+        self.atoms_hop_frames = atoms_config.get("hop_frames", 15)
+        self.crossfade_frames = atoms_config.get("crossfade_frames", 3)
+
+        splits_config        = _get_config_value(config, ["splits"], {})
+        self.train_split_key = splits_config.get("train_split", None)
+        self.val_split_key   = splits_config.get("val_split", None)
+        self.val_split_ratio = splits_config.get("val_split_ratio", None)
+
+        semantic_config = _get_config_value(config, ["semantic"], {})
+        if context_time is None:
+            self.context_time = semantic_config.get("context_time", 1.0)
+        self.semantic_random_extension = semantic_config.get("random_extension", True)
+
+        structure_config = _get_config_value(config, ["structure"], {})
+        self.structure_mean_pooling = structure_config.get("mean_pooling", True)
+        stft_config = structure_config.get("stft", {})
+        self.structure_feature_names = structure_config.get("features")
+        if not self.structure_feature_names:
+            self.structure_feature_names = [
+                "acoustic_complexity",
+                "spectral_entropy",
+                "transient_density",
+                "spectral_centroid",
+                "spectral_bandwidth",
+                "spectral_flatness",
+                "rms",
+            ]
+        self.structure_hop_length = self.samples_per_frame
+
+        # Fix index for each feature
+        self.structure_feature_index = {
+            name: i for i, name in enumerate(self.structure_feature_names)
+        }
+
+        self.structure_feature_dimension = len(self.structure_feature_names) if "target_structure" in self.requested_keys else 0
+
+        # STFT related stuff for certain features
+        config_hop_length = stft_config.get("hop_length")
+        if config_hop_length not in [None, "auto"] and config_hop_length != self.structure_hop_length:
+            warnings.warn("structure.stft.hop_length is forced to match the codec frame rate (150 fps).")
+
+        config_n_fft = stft_config.get("n_fft")
+        if config_n_fft is None or config_n_fft == "auto":
+            self.structure_n_fft = max(256, self.structure_hop_length * 4)
         else:
-            # create the dataprep.json with default values for the Prefix Padding geometry and save it
-            dataprep_config = {
-                "atoms_frames": 48,
-                "atoms_hop_frames": 15,
-                "crossfade_frames": 3,
-                "train_split": None,
-                "val_split": None
-            }
-            # save the json file 
-            with open(dataprep_config_path, 'w') as f:
-                json.dump(dataprep_config, f, indent=4)
-            self.atoms_frames = 48
-            self.atoms_hop_frames = 15
-            self.crossfade_frames = 3
-            self.train_split_key = None
-            self.val_split_key = None
+            self.structure_n_fft = int(config_n_fft)
 
         # --- Math for the Asymmetric Geometry ---
         self.macro_overlap_frames = self.atoms_frames - self.atoms_hop_frames # Total baked past (e.g. 21)
@@ -109,6 +175,53 @@ class AtomSequenceDataset(Dataset):
         self.hop_samples = self.atoms_hop_frames * self.samples_per_frame
         self.crossfade_samples = self.crossfade_frames * self.samples_per_frame
         self.macro_overlap_samples = self.macro_overlap_frames * self.samples_per_frame
+
+        # --- Context Window (Target-aligned, time-based) ---
+        self.context_samples = int(round(self.context_time * self.sr))
+
+        if self.context_samples <= self.atoms_samples:
+            self.context_atoms_required = 1
+        else:
+            self.context_atoms_required = int(
+                math.ceil((self.context_samples - self.atoms_samples) / self.hop_samples)
+            ) + 1
+
+        self.total_length = max(self.memory_buffer_atoms + 1, self.memory_buffer_atoms + self.context_atoms_required)
+
+        context_time_str = f"{self.context_time:.3f}".rstrip("0").rstrip(".")
+        if context_time_str == "":
+            context_time_str = "0"
+
+        self.config = {
+            # "dataset": {"sr": self.sr, "frame_rate": self.frame_rate},
+            "atoms": {
+                "frames": self.atoms_frames,
+                "hop_frames": self.atoms_hop_frames,
+                "crossfade_frames": self.crossfade_frames,
+            },
+            "dataset": {
+                "memory_buffer_atoms": self.memory_buffer_atoms,
+                "hop_atoms": self.hop_atoms,
+            },
+            "semantic": {
+                "context_seconds": self.context_time,
+                "random_extension": self.semantic_random_extension,
+            },
+            "structure": {
+                "features": self.structure_feature_names,
+                "stft": {
+                    "n_fft": self.structure_n_fft,
+                    "hop_length": self.structure_hop_length,
+                },
+            },
+            "splits": {
+                "train_split": self.train_split_key,
+                "val_split": self.val_split_key,
+                "val_split_ratio": self.val_split_ratio,
+            },
+            "seed": self.seed,
+            "device": self.device,
+        }
 
         self.filenames = sorted(list(self.manifest.keys()))
         self.all_indices = self._build_mapping(self.filenames)
@@ -200,23 +313,30 @@ class AtomSequenceDataset(Dataset):
         return train_subset, val_subset
 
     def check_annotations_exist(self): 
-        base_anno_path = self.annotations_dir / self.config_folder_name
-        if not base_anno_path.exists():
-            print(f"    There are not annotations for your settings (they should be in {base_anno_path}).")
+        if self.annotations_dir is None:
             return False
-        
-        print(f"    Annotations found in {base_anno_path}:")
-        any_emb = False
-        for cat in ["ctx", "clap"]:
-            for time_part in ["past", "context_win"]:
-                path = base_anno_path / cat / time_part
-                if not path.exists():
-                    print(f"    ✗ {cat}_{time_part} (should be in {path})")
-                else:
-                    num_files = len(list(path.glob("emb_*.pt")))
-                    print(f"    ✓ {cat}_{time_part}: Found {num_files} files in {path}")
-                    any_emb = True
-        return any_emb
+
+        any_found = False
+
+        if "target_semantic" in self.requested_keys:
+            semantic_dir = self.annotations_dir / "semantic"
+            if not semantic_dir.exists():
+                print(f"    ✗ semantic (should be in {semantic_dir})")
+            else:
+                num_files = len(list(semantic_dir.glob("semantic_*.pt")))
+                print(f"    ✓ semantic: Found {num_files} files in {semantic_dir}")
+                any_found = True
+
+        if "target_structure" in self.requested_keys:
+            structure_dir = self.annotations_dir / "structure"
+            if not structure_dir.exists():
+                print(f"    ✗ structure (should be in {structure_dir})")
+            else:
+                num_files = len(list(structure_dir.glob("structure_*.pt")))
+                print(f"    ✓ structure: Found {num_files} files in {structure_dir}")
+                any_found = True
+
+        return any_found
 
     def _build_ola_window(self):
         """
@@ -242,7 +362,7 @@ class AtomSequenceDataset(Dataset):
         for fname in filenames:
             count = self.manifest[fname]["atoms_count"]
             if count >= self.total_length:
-                for start in range(0, count - self.total_length + 1, self.hop_size):
+                for start in range(0, count - self.total_length + 1, self.hop_atoms):
                     mapping.append((fname, start))
         return mapping
 
@@ -261,39 +381,69 @@ class AtomSequenceDataset(Dataset):
         
     def _get_part_indices(self, start_idx, part):
         if part == "past":
-            return start_idx, self.segment_length
+            return start_idx, self.memory_buffer_atoms
+        elif part == "target":
+            return start_idx + self.memory_buffer_atoms, 1
         elif part == "context":
-            return start_idx + self.context_shift, self.context_length
+            return start_idx + self.memory_buffer_atoms, self.context_atoms_required
         elif part == "full":
             return start_idx, self.total_length
         else:
-            raise ValueError("part must be 'past', 'context', or 'full'")
+            raise ValueError("part must be 'past', 'target', 'context', or 'full'")
+
+    def _load_raw_audio_file(self, audio_path):
+        audio_input, _ = librosa.load(audio_path, sr=self.sr, mono=False)
+        audio_input = torch.tensor(audio_input)
+
+        if audio_input.dim() == 1:
+            audio_input = audio_input.unsqueeze(0)
+
+        if audio_input.dim() == 2:
+            if audio_input.shape[0] == 1:
+                audio_input = audio_input.repeat(2, 1)
+        elif audio_input.shape[0] > 2:
+            audio_input = audio_input[:2, :]
+
+        return audio_input.to(self.device)
+
+    def _slice_audio(self, audio, start_sample, duration_samples):
+        end_sample = start_sample + duration_samples
+        if end_sample > audio.shape[-1]:
+            pad_len = end_sample - audio.shape[-1]
+            pad = torch.zeros((audio.shape[0], pad_len), device=audio.device, dtype=audio.dtype)
+            audio = torch.cat([audio, pad], dim=-1)
+        return audio[:, start_sample:end_sample]
 
     def get_raw_audio(self, idx, part="past"):
         filename, seq_start_idx = self.all_indices[idx]
-        atom_start_idx, atom_count = self._get_part_indices(seq_start_idx, part)
-        
         audio_path = self.manifest[filename]["path"]
+        audio_input = self._load_raw_audio_file(audio_path)
 
-        # Calculate absolute bounds
+        if part in ["context", "target_context"]:
+            target_start = (seq_start_idx + self.memory_buffer_atoms) * self.hop_samples
+            return self._slice_audio(audio_input, target_start, self.context_samples)
+
+        if part == "target":
+            target_start = (seq_start_idx + self.memory_buffer_atoms) * self.hop_samples
+            return self._slice_audio(audio_input, target_start, self.atoms_samples)
+
+        atom_start_idx, atom_count = self._get_part_indices(seq_start_idx, part)
         start_sample = atom_start_idx * self.hop_samples
-        # The total length stretches to the end of the final atom
         duration_samples = ((atom_count - 1) * self.hop_samples) + self.atoms_samples
 
-        audio_input, _ = librosa.load(audio_path, sr=self.sr, mono=False)
-        audio_input = torch.tensor(audio_input).unsqueeze(0) 
-        
-        if audio_input.dim() == 2:
-            audio_input = audio_input.unsqueeze(1).repeat(1, 2, 1)
-        elif audio_input.shape[1] > 2:
-            audio_input = audio_input[:, :2, :]
-            
-        audio_input = audio_input[:, :2, start_sample:start_sample+duration_samples]
-        return audio_input.squeeze(0).to(self.device)
+        return self._slice_audio(audio_input, start_sample, duration_samples)
 
     def get_decoded_audio(self, idx, processor, part="past"):
         filename, seq_start_idx = self.all_indices[idx]
-        atom_start_idx, atom_count = self._get_part_indices(seq_start_idx, part)
+
+        if part in ["context", "target_context"]:
+            atom_start_idx = seq_start_idx + self.memory_buffer_atoms
+            atom_count = self.context_atoms_required
+        elif part == "target":
+            atom_start_idx = seq_start_idx + self.memory_buffer_atoms
+            atom_count = 1
+        else:
+            atom_start_idx, atom_count = self._get_part_indices(seq_start_idx, part)
         
         total_samples = (atom_count - 1) * self.hop_samples + self.atoms_samples
         out_audio = torch.zeros((1, 2, total_samples), device=processor.device)
@@ -320,9 +470,19 @@ class AtomSequenceDataset(Dataset):
             # Apply the asymmetric prefix-padding mask
             out_audio[:, :, start_s:end_s] += decoded_chunk[:, :, :self.atoms_samples] * window
         
+        if part in ["context", "target_context"]:
+            out_audio = out_audio[:, :, :self.context_samples]
+
         return out_audio.squeeze(0)
 
-    def make_split(self, val_split="dataprep", seed=42, overwrite=False):
+    def make_split(self, val_split=None, seed=None, overwrite=False):
+        if seed is None:
+            seed = self.seed
+        if seed is not None:
+            random.seed(seed)
+
+        if val_split is None:
+            val_split = self.val_split_ratio
         if val_split == "dataprep":
             val_split = None  # This will trigger the directory-based split logic
 
@@ -335,13 +495,12 @@ class AtomSequenceDataset(Dataset):
 
             if val_split is not None:
                 raise ValueError(
-                    "val_split was provided but dataprep.json defines "
-                    "train_split/val_split directories."
+                    "val_split was provided but config defines train_split/val_split directories."
                 )
 
             if not (self.train_split_key and self.val_split_key):
                 raise ValueError(
-                    "dataprep.json must define BOTH 'train_split' and 'val_split'."
+                    "config must define BOTH 'train_split' and 'val_split'."
                 )
 
             print(
@@ -389,8 +548,7 @@ class AtomSequenceDataset(Dataset):
 
         if val_split is None:
             raise ValueError(
-                "val_split must be provided because dataprep.json "
-                "does not define train_split/val_split."
+                "val_split_ratio must be set in config or passed to make_split()."
             )
 
         already_split = all("validation" in self.manifest[f] for f in self.filenames)
@@ -408,7 +566,7 @@ class AtomSequenceDataset(Dataset):
         for f in self.filenames:
             # Figure out all valid start indices for this specific file
             count = self.manifest[f]["atoms_count"]
-            starts = list(range(0, count - self.total_length + 1, self.hop_size))
+            starts = list(range(0, count - self.total_length + 1, self.hop_atoms))
             
             # Chronological split to prevent overlap leakage!
             split_idx = int(len(starts) * (1 - val_split))
@@ -450,53 +608,50 @@ class AtomSequenceDataset(Dataset):
         }
         req = self.requested_keys
 
-        # --- 1. Load Past Latents (Segment) ---
-        if any(k in req for k in ["latent_past", "latent_present", "scale_past", "scale_present"]):
-            past_latents, past_scales = self._load_atom_sequence(filename, start_idx, self.segment_length)
+        # --- 1. Load Memory Buffer (Past) ---
+        if any(k in req for k in ["memory_buffer_latent", "memory_buffer_scale", "target_latent", "target_scale"]):
+            past_latents, past_scales = self._load_atom_sequence(filename, start_idx, self.memory_buffer_atoms)
             
-            if "latent_past" in req:
-                batch_dict["latent_past"] = past_latents.to(self.device)
-            if "scale_past" in req:
-                batch_dict["scale_past"] = past_scales.to(self.device)
+            if "memory_buffer_latent" in req:
+                batch_dict["memory_buffer_latent"] = past_latents.to(self.device)
+            if "memory_buffer_scale" in req:
+                batch_dict["memory_buffer_scale"] = past_scales.to(self.device)
                 
             # Present is defined as the single atom immediately following the segment
-            if "latent_present" in req or "scale_present" in req:
-                present_path = self._get_atom_path(filename, start_idx + self.segment_length)
+            if "target_latent" in req or "target_scale" in req:
+                present_path = self._get_atom_path(filename, start_idx + self.memory_buffer_atoms)
                 present_atom = torch.load(present_path, weights_only=True, map_location='cpu')
-                if "latent_present" in req:
-                    batch_dict["latent_present"] = present_atom["latent"].squeeze(0).float().to(self.device)
-                if "scale_present" in req:
-                    batch_dict["scale_present"] = present_atom["scale"].squeeze(0).float().to(self.device)
+                if "target_latent" in req:
+                    batch_dict["target_latent"] = present_atom["latent"].squeeze(0).float().to(self.device)
+                if "target_scale" in req:
+                    batch_dict["target_scale"] = present_atom["scale"].squeeze(0).float().to(self.device)
 
-        # --- 2. Load Context Window Latents ---
-        if "latent_context_win" in req or "scale_context_win" in req:
-            ctx_start = start_idx + self.context_shift
-            ctx_latents, ctx_scales = self._load_atom_sequence(filename, ctx_start, self.context_length)
-            
-            if "latent_context_win" in req:
-                batch_dict["latent_context_win"] = ctx_latents.to(self.device)
-            if "scale_context_win" in req:
-                batch_dict["scale_context_win"] = ctx_scales.to(self.device)
+        # --- 2. Raw Target Audio Windows ---
+        if "target_audio" in req or "target_context_audio" in req:
+            audio_path = self.manifest[filename]["path"]
+            audio_input = self._load_raw_audio_file(audio_path)
+            target_start = (start_idx + self.memory_buffer_atoms) * self.hop_samples
 
-        # --- 3. Pre-computed Embeddings ---
+            if "target_audio" in req:
+                batch_dict["target_audio"] = self._slice_audio(audio_input, target_start, self.atoms_samples)
+            if "target_context_audio" in req:
+                batch_dict["target_context_audio"] = self._slice_audio(audio_input, target_start, self.context_samples)
+
+        # --- 3. Pre-computed Annotations ---
         if self.annotations_dir is not None:
-            base_anno_path = self.annotations_dir / self.config_folder_name
-            
-            # Helper to load a specific file
-            def load_emb(cat, time_part):
-                path = base_anno_path / cat / time_part / f"emb_{idx}.pt"
-                if not path.exists():
-                    raise FileNotFoundError(f"Requested {cat}_{time_part} but file missing: {path}")
-                return torch.load(path, weights_only=True, map_location='cpu').to(self.device)
+            semantic_dir = self.annotations_dir / "semantic"
+            structure_dir = self.annotations_dir / "structure"
 
-            if "ctx_emb_past" in req:
-                batch_dict["ctx_emb_past"] = load_emb("ctx", "past")
-            if "ctx_emb_context_win" in req:
-                batch_dict["ctx_emb_context_win"] = load_emb("ctx", "context_win")
-                
-            if "clap_past" in req:
-                batch_dict["clap_past"] = load_emb("clap", "past")
-            if "clap_context_win" in req:
-                batch_dict["clap_context_win"] = load_emb("clap", "context_win")
+            if "target_semantic" in req:
+                path = semantic_dir / f"semantic_{idx}.pt"
+                if not path.exists():
+                    raise FileNotFoundError(f"Requested target_semantic but file missing: {path}")
+                batch_dict["target_semantic"] = torch.load(path, weights_only=True, map_location='cpu').to(self.device)
+
+            if "target_structure" in req:
+                path = structure_dir / f"structure_{idx}.pt"
+                if not path.exists():
+                    raise FileNotFoundError(f"Requested target_structure but file missing: {path}")
+                batch_dict["target_structure"] = torch.load(path, weights_only=True, map_location='cpu').to(self.device)
 
         return batch_dict

@@ -1,0 +1,37 @@
+# SCAPES config.gin template
+# Copy to <dataset>/config/config.gin and edit as needed.
+
+# Codec parameters (fixed by EnCodec)
+dataset.sr = 48000
+dataset.frame_rate = 150
+
+# Atom geometry
+atoms.frames = 48
+atoms.hop_frames = 15
+atoms.crossfade_frames = 3
+
+# Semantic conditioning
+semantic.context_seconds = 1.0
+semantic.random_extension = True
+
+# Structure features
+# Available features:
+#   acoustic_complexity, spectral_entropy, transient_density, spectral_centroid,
+#   spectral_bandwidth, spectral_rolloff, spectral_flatness, rms, zcr
+structure.features = [
+  "acoustic_complexity",
+  "spectral_entropy",
+  "transient_density"
+]
+structure.rolloff_pct = 0.85
+structure.stft.n_fft = "auto"
+structure.stft.hop_length = "auto"
+
+# Split controls (optional)
+splits.train_split = None
+splits.val_split = None
+splits.val_split_ratio = 0.1
+
+# Misc
+seed = 42
+device = "auto"

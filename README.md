@@ -77,3 +77,10 @@ You can quickly prepare your data and train a model using the quickstart noteboo
 ## Acknowledgments
 
 SCAPES builds on a rich ecosystem including EnCodec, CLAP, Neural ODE/CNF methods, flow matching and Freesound.
+
+## Future work
+
+There is a lot of future work to be done in SCAPES in case anyone wants to collaborate in extending the capacities of the model. The following is a list of options:
+1. New Neural Audio Codecs appear every year. Maybe EnCodec is not the best one suited for the job anymore?
+2. Currently SCAPES uses a MSE loss to compare EnCodec latents, however this loss has proven to be not enough in some scenarios. Maybe one could train a surrogate loss that learns how to replicate other perceptual audio losses between audio latents.
+3. Currently SCAPES is conditioned on CLAP. A lot of exploration could be made by trying other conditioning features.

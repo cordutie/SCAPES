@@ -18,7 +18,8 @@ def load_flow_model(checkpoint_path, json_path, device="cpu"):
         nhead=config.get("nhead", 8),
         num_layers=config.get("num_layers", 6),
         dim_feedforward=config.get("dim_feedforward", 1024),
-        device=device # Crucial: pass the device so memory_pos_enc initializes on the right hardware
+        structure_dim=config.get("structure_dim", 0),
+        device=device
     )
     
     # Handle the difference between a raw state_dict and your custom resume dict
@@ -89,7 +90,6 @@ class TransformerLayer(nn.Module):
         
         return x
 
-
 class VectorField(nn.Module):
     """
     The Core Neural Network for Flow Matching.
@@ -103,6 +103,7 @@ class VectorField(nn.Module):
         num_layers: int = 6,
         dim_feedforward: int = 1024,
         context_dim: int = 1024,
+        structure_dim: int = 0,
         max_atom_frames: int = 21,
         device=None
     ):
@@ -116,7 +117,29 @@ class VectorField(nn.Module):
         # Leaving it untouched to avoid breaking imported code. It normally handles device via registered buffers.
         self.target_rope = RotaryEmbedding(d_model, max_position=max_atom_frames+1)
         
-        # --- 2. Global Conditioning (Time + Timbre) ---
+        # --- 2.Structure conditioning (if enabled)
+        print("structure_dim in VectorField:", structure_dim)
+        if structure_dim > 0:
+            self.use_structure = True
+        else:
+            self.use_structure = False
+
+        print("self.use_structure in VectorField:", self.use_structure)
+
+        if self.use_structure:
+            self.structure_proj = nn.Sequential(
+                nn.BatchNorm1d(structure_dim, device=device), # <--- ADD THIS CRITICAL LINE!
+                nn.Linear(structure_dim, context_dim, device=device),
+                nn.GELU(),
+                nn.Linear(context_dim, context_dim, device=device),
+            )
+
+        #     # context becomes CLAP + structure
+        #     combined_context_dim = 2*context_dim
+        # else:
+        #     combined_context_dim = context_dim
+
+        # --- 3. Global Conditioning (Time + Timbre) ---
         cond_dim = d_model 
         self.time_mlp = nn.Sequential(
             nn.Linear(1, d_model, device=device),
@@ -147,7 +170,8 @@ class VectorField(nn.Module):
         noisy_target: torch.Tensor, 
         precomputed_memory: torch.Tensor, 
         context_vector: torch.Tensor, 
-        s: torch.Tensor
+        s: torch.Tensor,
+        structure_vector: torch.Tensor = None
     ) -> torch.Tensor:
         """
         noisy_target: (B, 21, 128) - White noise (or partially solved data) for Atom 21
@@ -158,7 +182,12 @@ class VectorField(nn.Module):
         B, T_new, _ = noisy_target.shape
         
         # 1. Process Global Conditioning
-        t_emb = self.time_mlp(s)                  
+        t_emb = self.time_mlp(s)  
+        if self.use_structure:
+            if structure_vector is None:
+                raise ValueError("structure_vector must be provided when structure_dim > 0")
+            structure_emb = self.structure_proj(structure_vector)        
+            context_vector = context_vector + structure_emb      
         c_emb = self.context_mlp(context_vector)  
         cond = t_emb + c_emb                      
         
@@ -195,6 +224,7 @@ class FlowModel(nn.Module):
         nhead: int = 8,                        
         num_layers: int = 6,                   
         dim_feedforward: int = 1024,
+        structure_dim: int = 0,
         device=None,
         **kwargs # <--- THE MAGIC ABSORBER
     ):
@@ -211,7 +241,7 @@ class FlowModel(nn.Module):
             n_atoms_max=num_past_atoms + 5, 
             max_atom_frames=frames_per_atom + 5
         )
-        
+        print("structure_dim in FlowModel:", structure_dim)
         # 2. The Core Flow Transformer
         self.transformer = VectorField(
             frame_dim=frame_dim,
@@ -221,6 +251,7 @@ class FlowModel(nn.Module):
             dim_feedforward=dim_feedforward,
             context_dim=context_vector_dim,
             max_atom_frames=frames_per_atom,
+            structure_dim=structure_dim,
             device=device
         )
 
@@ -231,37 +262,56 @@ class FlowModel(nn.Module):
         """
         return self.memory_pos_enc(encoded_past)
 
-    def forward(self, x_t: torch.Tensor, s: torch.Tensor, context_vector: torch.Tensor, encoded_past: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_t: torch.Tensor, s: torch.Tensor, context_vector: torch.Tensor, encoded_past: torch.Tensor, structure_vector: torch.Tensor = None) -> torch.Tensor:
         """
         TRAINING PASS.
         x_t: The blended noisy data (B, T_frames, frame_dim)
         s: The time step in [0, 1] (B, 1)
         context_vector: CLAP embedding (B, context_dim)
         encoded_past: Output of your LocalEncoder (B, N_past, T_frames, d_model)
+        structure_vector: Structure embedding (B, structure_dim) if there is one, else None
         """
         precomputed_memory = self.prepare_memory(encoded_past)
-        return self.transformer(x_t, precomputed_memory, context_vector, s)
+        return self.transformer(x_t, precomputed_memory, context_vector, s, structure_vector)
 
     def vector_field(self, x, s, context_dict):
         """Used by the ODE Solver during inference."""
         precomputed_memory = context_dict['memory']
-        clap_context = context_dict['clap']
-        return self.transformer(x, precomputed_memory, clap_context, s)
-    
+        clap_context       = context_dict['clap']
+        structure_vector   = context_dict.get('structure', None)
+        cfg_scale          = context_dict.get('cfg_scale', 3.0) # <--- NEW
+        
+        # Standard generation (No CFG)
+        if cfg_scale == 1.0:
+            return self.transformer(x, precomputed_memory, clap_context, s, structure_vector)
+            
+        # ---> NEW: CFG Extrapolation
+        # 1. Get the conditional velocity (with the prompt)
+        v_cond = self.transformer(x, precomputed_memory, clap_context, s, structure_vector)
+        
+        # 2. Get the unconditional velocity (with pure zeros)
+        null_clap = torch.zeros_like(clap_context)
+        v_uncond = self.transformer(x, precomputed_memory, null_clap, s, structure_vector)
+        
+        # 3. Vector math: Amplify the difference!
+        return v_uncond + cfg_scale * (v_cond - v_uncond)
+
     @torch.no_grad()
-    def generate(self, x0: torch.Tensor, encoded_past: torch.Tensor, clap_context: torch.Tensor, max_nfe: int = 16) -> torch.Tensor:
+    def generate(self, x0: torch.Tensor, encoded_past: torch.Tensor, clap_context: torch.Tensor, structure_vector: torch.Tensor = None, max_nfe: int = 16, cfg_scale: float = 3.0) -> torch.Tensor:
         """
         INFERENCE PASS.
-        x0: The starting white noise tensor of shape (B, T_frames, frame_dim)
-        encoded_past: The past audio memory of shape (B, N_past, T_frames, d_model)
-        clap_context: The timbre target of shape (B, context_dim)
+        cfg_scale: How strongly to force the model to follow the CLAP/Structure. (1.0 = Off, ~3.0 = Good)
         """
-        # Prepare context dictionary
         memory = self.prepare_memory(encoded_past)
 
-        context_dict = {'memory': memory, 'clap': clap_context}
+        # Pass the cfg_scale securely into the ODE solver's context dictionary
+        context_dict = {
+            'memory': memory, 
+            'clap': clap_context, 
+            'structure': structure_vector,
+            'cfg_scale': cfg_scale
+        }
         
-        # Run the ODE solver using the user-provided x0
         x1 = sample_with_ode_capped(
             u=self.vector_field, 
             x0=x0, 
