@@ -2,21 +2,14 @@ import math
 import random
 import warnings
 from pathlib import Path
+from typing import Optional
 
 import json
 import librosa
 import torch
 from torch.utils.data import Dataset, Subset
 
-from SCAPES.data.config_loader import load_config
-
-def _get_config_value(config, keys, default=None):
-    current = config
-    for key in keys:
-        if not isinstance(current, dict) or key not in current:
-            return default
-        current = current[key]
-    return current
+from SCAPES.data.config_loader import DataprepConfig
 
 
 def _auto_device():
@@ -40,9 +33,6 @@ def _resolve_device(requested):
 
 
 def batch_from_latents_to_audio(batch, dataset, processor, mode="decoded", part="past"):
-    """
-    Converts a DataLoader batch to audio.
-    """
     audios = []
     indices = batch["index"]
 
@@ -54,46 +44,92 @@ def batch_from_latents_to_audio(batch, dataset, processor, mode="decoded", part=
         else:
             raise ValueError(f"Unknown mode {mode}")
         audios.append(audio)
-    
+
     return torch.stack(audios, dim=0)
+
 
 class AtomSequenceDataset(Dataset):
     def __init__(
-        self, 
-        dataset_path, 
+        self,
+        dataset_path,
+        config: Optional[DataprepConfig] = None,
+        *,
         requested_keys=None,
+        verbose=True,
         memory_buffer_atoms=None,
-        hop_atoms=None, 
-        context_time=None,
-        # sr=None, 
-        # frame_rate=None, 
-        device="auto",
-        verbose=False
+        hop_atoms=None,
+        context_seconds=None,
+        atoms_frames=None,
+        atoms_hop_frames=None,
+        crossfade_frames=None,
+        seed=None,
+        device=None,
+        train_split=None,
+        val_split=None,
+        val_split_ratio=None,
+        structure_features=None,
+        semantic_random_extension=None,
     ):
-        self.dataset_path    = Path(dataset_path)
-        self.annotations_dir = self.dataset_path / "annotations"
+        if config is not None:
+            memory_buffer_atoms = config.memory_buffer_atoms
+            hop_atoms = config.hop_atoms
+            context_seconds = config.semantic_context_seconds
+            atoms_frames = config.atoms_frames
+            atoms_hop_frames = config.atoms_hop_frames
+            crossfade_frames = config.atoms_crossfade_frames
+            seed = config.seed
+            device = config.device
+            train_split = config.train_split
+            val_split = config.val_split
+            val_split_ratio = config.val_split_ratio
+            structure_features = config.structure_features
+            semantic_random_extension = config.semantic_random_extension
 
-        config_dir = self.dataset_path / "config"
-        config, config_path = load_config(config_dir)
-        self.config_path = config_path
-        
-        # Sliding Window Config (atom-level)
-        dataset_config = _get_config_value(config, ["dataset"], {})
-        if memory_buffer_atoms is None:
-            memory_buffer_atoms = dataset_config.get("memory_buffer_atoms", 3)
-        if hop_atoms is None:
-            hop_atoms = dataset_config.get("hop_atoms", 1)
+        missing = [k for k, v in [
+            ("memory_buffer_atoms", memory_buffer_atoms),
+            ("hop_atoms", hop_atoms),
+            ("context_seconds", context_seconds),
+            ("atoms_frames", atoms_frames),
+            ("atoms_hop_frames", atoms_hop_frames),
+            ("crossfade_frames", crossfade_frames),
+            ("seed", seed),
+            ("val_split_ratio", val_split_ratio),
+            ("structure_features", structure_features),
+            ("semantic_random_extension", semantic_random_extension),
+        ] if v is None]
+        if missing:
+            raise TypeError(
+                f"AtomSequenceDataset missing required arguments (provide 'config' or set explicitly): "
+                f"{', '.join(missing)}"
+            )
+
+        if device is None or device == "auto":
+            device = _auto_device()
+        device = _resolve_device(device)
+
+        self.dataset_path = Path(dataset_path)
+        self.annotations_dir = self.dataset_path / "annotations"
 
         self.memory_buffer_atoms = memory_buffer_atoms
         self.hop_atoms = hop_atoms
-        
+        self.context_seconds = context_seconds
+        self.atoms_frames = atoms_frames
+        self.atoms_hop_frames = atoms_hop_frames
+        self.crossfade_frames = crossfade_frames
+        self.seed = seed
+        self.device = device
+        self.train_split_key = train_split
+        self.val_split_key = val_split
+        self.val_split_ratio = val_split_ratio
+        self.semantic_random_extension = semantic_random_extension
+
         valid_keys = {
-                "memory_buffer_latent", "target_latent",
-                "memory_buffer_scale", "target_scale",
-                "target_semantic", "target_structure",
-                "target_audio", "target_context_audio",
-                "index"
-            }
+            "memory_buffer_latent", "target_latent",
+            "memory_buffer_scale", "target_scale",
+            "target_semantic", "target_structure",
+            "target_audio", "target_context_audio",
+            "index"
+        }
         if requested_keys is None:
             self.requested_keys = valid_keys
             print(f"No requested_keys provided; defaulting to all: {self.requested_keys}")
@@ -102,82 +138,49 @@ class AtomSequenceDataset(Dataset):
                 raise ValueError(f"Invalid keys in requested_keys. Valid keys are: {valid_keys}")
             self.requested_keys = requested_keys
 
-        config_device = _get_config_value(config, ["device"], "auto")
-        if device is None or device == "auto":
-            self.device = _resolve_device(config_device)
-        else:
-            self.device = _resolve_device(device)
-
-        self.seed = _get_config_value(config, ["seed"], None)
-
+        # Hardcoded codec constants
         self.sr = 48000
         self.frame_rate = 150
         self.samples_per_frame = self.sr // self.frame_rate
-        
-        # Load the manifest
-        json_path = self.dataset_path / "config" / "manifest.json"
-        with open(json_path, 'r') as f:
-            self.manifest = json.load(f)
 
-        atoms_config          = _get_config_value(config, ["atoms"], {})
-        self.atoms_frames     = atoms_config.get("frames", 48)
-        self.atoms_hop_frames = atoms_config.get("hop_frames", 15)
-        self.crossfade_frames = atoms_config.get("crossfade_frames", 3)
+        # Load manifest (new location with fallback)
+        self.atoms_manifest_path = self.dataset_path / "atoms" / "manifest.json"
+        manifest_path = self.atoms_manifest_path
+        if not manifest_path.exists():
+            manifest_path = self.dataset_path / "config" / "manifest.json"
+        with open(manifest_path, 'r') as f:
+            raw = json.load(f)
+        if "files" in raw:
+            self.manifest = raw["files"]
+            self.manifest_config_version = raw.get("config_version", {})
+        else:
+            self.manifest = raw
+            self.manifest_config_version = {}
 
-        splits_config        = _get_config_value(config, ["splits"], {})
-        self.train_split_key = splits_config.get("train_split", None)
-        self.val_split_key   = splits_config.get("val_split", None)
-        self.val_split_ratio = splits_config.get("val_split_ratio", None)
-
-        semantic_config = _get_config_value(config, ["semantic"], {})
-        if context_time is None:
-            self.context_time = semantic_config.get("context_time", 1.0)
-        self.semantic_random_extension = semantic_config.get("random_extension", True)
-
-        structure_config = _get_config_value(config, ["structure"], {})
-        self.structure_mean_pooling = structure_config.get("mean_pooling", True)
-        stft_config = structure_config.get("stft", {})
-        self.structure_feature_names = structure_config.get("features")
-        if not self.structure_feature_names:
-            self.structure_feature_names = [
-                "acoustic_complexity",
-                "spectral_entropy",
-                "transient_density",
-                "spectral_centroid",
-                "spectral_bandwidth",
-                "spectral_flatness",
-                "rms",
-            ]
-        self.structure_hop_length = self.samples_per_frame
-
-        # Fix index for each feature
+        # Structure feature config (from gin/config or explicit)
+        self.structure_feature_names = structure_features
         self.structure_feature_index = {
             name: i for i, name in enumerate(self.structure_feature_names)
         }
+        self.structure_feature_dimension = (
+            len(self.structure_feature_names) if "target_structure" in self.requested_keys else 0
+        )
 
-        self.structure_feature_dimension = len(self.structure_feature_names) if "target_structure" in self.requested_keys else 0
-
-        # STFT related stuff for certain features
-        config_hop_length = stft_config.get("hop_length")
-        if config_hop_length not in [None, "auto"] and config_hop_length != self.structure_hop_length:
-            warnings.warn("structure.stft.hop_length is forced to match the codec frame rate (150 fps).")
-
-        config_n_fft = stft_config.get("n_fft")
-        if config_n_fft is None or config_n_fft == "auto":
-            self.structure_n_fft = max(256, self.structure_hop_length * 4)
-        else:
-            self.structure_n_fft = int(config_n_fft)
+        # Hardcoded structure params (removed from gin)
+        self.structure_mean_pooling = True
+        self.structure_hop_length = self.samples_per_frame
+        self.structure_n_fft = max(256, self.structure_hop_length * 4)
 
         # --- Math for the Asymmetric Geometry ---
-        self.macro_overlap_frames = self.atoms_frames - self.atoms_hop_frames # Total baked past (e.g. 21)
-        
+        self.macro_overlap_frames = self.atoms_frames - self.atoms_hop_frames
+
         self.atoms_samples = self.atoms_frames * self.samples_per_frame
         self.hop_samples = self.atoms_hop_frames * self.samples_per_frame
         self.crossfade_samples = self.crossfade_frames * self.samples_per_frame
         self.macro_overlap_samples = self.macro_overlap_frames * self.samples_per_frame
 
         # --- Context Window (Target-aligned, time-based) ---
-        self.context_samples = int(round(self.context_time * self.sr))
+        self.context_samples = int(round(self.context_seconds * self.sr))
 
         if self.context_samples <= self.atoms_samples:
             self.context_atoms_required = 1
@@ -186,47 +189,14 @@ class AtomSequenceDataset(Dataset):
                 math.ceil((self.context_samples - self.atoms_samples) / self.hop_samples)
             ) + 1
 
-        self.total_length = max(self.memory_buffer_atoms + 1, self.memory_buffer_atoms + self.context_atoms_required)
-
-        context_time_str = f"{self.context_time:.3f}".rstrip("0").rstrip(".")
-        if context_time_str == "":
-            context_time_str = "0"
-
-        self.config = {
-            # "dataset": {"sr": self.sr, "frame_rate": self.frame_rate},
-            "atoms": {
-                "frames": self.atoms_frames,
-                "hop_frames": self.atoms_hop_frames,
-                "crossfade_frames": self.crossfade_frames,
-            },
-            "dataset": {
-                "memory_buffer_atoms": self.memory_buffer_atoms,
-                "hop_atoms": self.hop_atoms,
-            },
-            "semantic": {
-                "context_seconds": self.context_time,
-                "random_extension": self.semantic_random_extension,
-            },
-            "structure": {
-                "features": self.structure_feature_names,
-                "stft": {
-                    "n_fft": self.structure_n_fft,
-                    "hop_length": self.structure_hop_length,
-                },
-            },
-            "splits": {
-                "train_split": self.train_split_key,
-                "val_split": self.val_split_key,
-                "val_split_ratio": self.val_split_ratio,
-            },
-            "seed": self.seed,
-            "device": self.device,
-        }
+        self.total_length = max(
+            self.memory_buffer_atoms + 1,
+            self.memory_buffer_atoms + self.context_atoms_required
+        )
 
         self.filenames = sorted(list(self.manifest.keys()))
         self.all_indices = self._build_mapping(self.filenames)
 
-        # Pre-compute Overlap-Add Window (Now Asymmetric!)
         self.window = self._build_ola_window()
 
         self.file_id_lookup = {fname: i for i, fname in enumerate(self.filenames)}
@@ -260,11 +230,11 @@ class AtomSequenceDataset(Dataset):
         if not has_split:
             print("    No complete split found in manifest.json.")
             return False
-            
+
         train_count = sum(1 for f in self.filenames if self.manifest[f]["validation"] is False)
         val_count = sum(1 for f in self.filenames if self.manifest[f]["validation"] is True)
         partial_count = sum(1 for f in self.filenames if self.manifest[f]["validation"] == "partial")
-        
+
         if partial_count > 0:
             print(f"    Manifest has a chronological split: {partial_count} files split across train/val.")
         else:
@@ -272,10 +242,6 @@ class AtomSequenceDataset(Dataset):
         return True
 
     def get_splits(self):
-        """
-        Builds (train_subset, val_subset) based on the 'validation' field
-        stored in manifest.json. Supports both full-file and partial-file splits.
-        """
         if not all("validation" in self.manifest[f] for f in self.filenames):
             warnings.warn(
                 "No split found in manifest.json. "
@@ -288,19 +254,16 @@ class AtomSequenceDataset(Dataset):
 
         for i, (f, start) in enumerate(self.all_indices):
             val_flag = self.manifest[f].get("validation")
-            
-            # Handle the new intra-file splitting
+
             if val_flag == "partial":
                 if start in self.manifest[f].get("val_starts", []):
                     val_indices.append(i)
                 else:
                     train_indices.append(i)
-                    
-            # Handle old full-file validation
+
             elif val_flag is True:
                 val_indices.append(i)
-                
-            # Handle old full-file training
+
             else:
                 train_indices.append(i)
 
@@ -312,7 +275,7 @@ class AtomSequenceDataset(Dataset):
 
         return train_subset, val_subset
 
-    def check_annotations_exist(self): 
+    def check_annotations_exist(self):
         if self.annotations_dir is None:
             return False
 
@@ -339,21 +302,16 @@ class AtomSequenceDataset(Dataset):
         return any_found
 
     def _build_ola_window(self):
-        """
-        Builds an asymmetric window for Prefix Padding geometry:
-        [ Zeros (discard redundant past) | Hann Fade In | Ones (new audio) | Hann Fade Out ]
-        """
         zeros_frames = self.macro_overlap_frames - self.crossfade_frames
         zeros = torch.zeros(zeros_frames * self.samples_per_frame)
-        
+
         hann_window = torch.hann_window(self.crossfade_samples * 2)
         left_hann = hann_window[:self.crossfade_samples]
         right_hann = hann_window[self.crossfade_samples:]
-        
+
         ones_frames = self.atoms_hop_frames - self.crossfade_frames
         ones = torch.ones(ones_frames * self.samples_per_frame)
-        
-        # Final window is exactly `atoms_samples` long
+
         window = torch.cat([zeros, left_hann, ones, right_hann])
         return window
 
@@ -372,13 +330,13 @@ class AtomSequenceDataset(Dataset):
         parts = list(original_path.parts)
         try:
             raw_idx = parts.index("raw")
-            relative_parent = Path(*parts[raw_idx + 1 : -1])
+            relative_parent = Path(*parts[raw_idx + 1: -1])
         except ValueError:
             relative_parent = Path("")
 
         atom_filename = f"{stem}_atom_{atom_index}.pt"
         return self.dataset_path / "atoms" / relative_parent / stem / atom_filename
-        
+
     def _get_part_indices(self, start_idx, part):
         if part == "past":
             return start_idx, self.memory_buffer_atoms
@@ -444,7 +402,7 @@ class AtomSequenceDataset(Dataset):
             atom_count = 1
         else:
             atom_start_idx, atom_count = self._get_part_indices(seq_start_idx, part)
-        
+
         total_samples = (atom_count - 1) * self.hop_samples + self.atoms_samples
         out_audio = torch.zeros((1, 2, total_samples), device=processor.device)
         window = self.window.to(processor.device).view(1, 1, -1)
@@ -452,28 +410,37 @@ class AtomSequenceDataset(Dataset):
         for i in range(atom_count):
             atom_path = self._get_atom_path(filename, atom_start_idx + i)
             atom = torch.load(atom_path, weights_only=True, map_location=processor.device)
-            
+
             latent_cont = atom["latent"].float()
             length = latent_cont.shape[-1]
             metadata = {
                 "audio_scales": [atom["scale"].float()],
-                "padding_mask": torch.ones((1, length * self.samples_per_frame), 
-                                         dtype=torch.bool, device=processor.device)
+                "padding_mask": torch.ones((1, length * self.samples_per_frame),
+                                           dtype=torch.bool, device=processor.device)
             }
-            
+
             with torch.no_grad():
                 decoded_chunk = processor.decode_latents_audio(latent_cont, metadata=metadata)
-            
+
             start_s = i * self.hop_samples
             end_s = start_s + self.atoms_samples
-            
-            # Apply the asymmetric prefix-padding mask
+
             out_audio[:, :, start_s:end_s] += decoded_chunk[:, :, :self.atoms_samples] * window
-        
+
         if part in ["context", "target_context"]:
             out_audio = out_audio[:, :, :self.context_samples]
 
         return out_audio.squeeze(0)
+
+    def _save_manifest(self):
+        path = self.atoms_manifest_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        full = {
+            "config_version": self.manifest_config_version,
+            "files": self.manifest,
+        }
+        with open(path, "w") as f:
+            json.dump(full, f, indent=4)
 
     def make_split(self, val_split=None, seed=None, overwrite=False):
         if seed is None:
@@ -484,15 +451,9 @@ class AtomSequenceDataset(Dataset):
         if val_split is None:
             val_split = self.val_split_ratio
         if val_split == "dataprep":
-            val_split = None  # This will trigger the directory-based split logic
+            val_split = None
 
-        json_path = self.dataset_path / "config" / "manifest.json"
-
-        # ------------------------------------------------
-        # SPLIT FROM DIRECTORY STRUCTURE
-        # ------------------------------------------------
         if self.train_split_key or self.val_split_key:
-
             if val_split is not None:
                 raise ValueError(
                     "val_split was provided but config defines train_split/val_split directories."
@@ -512,7 +473,6 @@ class AtomSequenceDataset(Dataset):
             val_files = []
 
             for fname in self.filenames:
-
                 entry = self.manifest[fname]
                 path = Path(entry["path"])
 
@@ -532,8 +492,7 @@ class AtomSequenceDataset(Dataset):
                         f"{self.train_split_key} or {self.val_split_key}"
                     )
 
-            with open(json_path, "w") as f:
-                json.dump(self.manifest, f, indent=4)
+            self._save_manifest()
 
             print(
                 f"Split created from directory structure: "
@@ -541,10 +500,6 @@ class AtomSequenceDataset(Dataset):
             )
 
             return
-
-        # ------------------------------------------------
-        # PER-FILE CHRONOLOGICAL SPLIT (Texture Setup)
-        # ------------------------------------------------
 
         if val_split is None:
             raise ValueError(
@@ -564,24 +519,20 @@ class AtomSequenceDataset(Dataset):
         total_val_seqs = 0
 
         for f in self.filenames:
-            # Figure out all valid start indices for this specific file
             count = self.manifest[f]["atoms_count"]
             starts = list(range(0, count - self.total_length + 1, self.hop_atoms))
-            
-            # Chronological split to prevent overlap leakage!
+
             split_idx = int(len(starts) * (1 - val_split))
-            
+
             val_starts = starts[split_idx:]
-            
-            # Mark the file as 'partial' to tell get_splits to look at the exact indices
-            self.manifest[f]["validation"] = "partial" 
+
+            self.manifest[f]["validation"] = "partial"
             self.manifest[f]["val_starts"] = val_starts
-            
+
             total_train_seqs += split_idx
             total_val_seqs += len(val_starts)
 
-        with open(json_path, "w") as f:
-            json.dump(self.manifest, f, indent=4)
+        self._save_manifest()
 
         print(
             f"Per-file chronological split created: {total_train_seqs} train sequences, "
@@ -604,20 +555,18 @@ class AtomSequenceDataset(Dataset):
         filename, start_idx = self.all_indices[idx]
         batch_dict = {
             "index": idx,
-            "label": filename  # This is the unique file key from the manifest
+            "label": filename
         }
         req = self.requested_keys
 
-        # --- 1. Load Memory Buffer (Past) ---
         if any(k in req for k in ["memory_buffer_latent", "memory_buffer_scale", "target_latent", "target_scale"]):
             past_latents, past_scales = self._load_atom_sequence(filename, start_idx, self.memory_buffer_atoms)
-            
+
             if "memory_buffer_latent" in req:
                 batch_dict["memory_buffer_latent"] = past_latents.to(self.device)
             if "memory_buffer_scale" in req:
                 batch_dict["memory_buffer_scale"] = past_scales.to(self.device)
-                
-            # Present is defined as the single atom immediately following the segment
+
             if "target_latent" in req or "target_scale" in req:
                 present_path = self._get_atom_path(filename, start_idx + self.memory_buffer_atoms)
                 present_atom = torch.load(present_path, weights_only=True, map_location='cpu')
@@ -626,7 +575,6 @@ class AtomSequenceDataset(Dataset):
                 if "target_scale" in req:
                     batch_dict["target_scale"] = present_atom["scale"].squeeze(0).float().to(self.device)
 
-        # --- 2. Raw Target Audio Windows ---
         if "target_audio" in req or "target_context_audio" in req:
             audio_path = self.manifest[filename]["path"]
             audio_input = self._load_raw_audio_file(audio_path)
@@ -637,7 +585,6 @@ class AtomSequenceDataset(Dataset):
             if "target_context_audio" in req:
                 batch_dict["target_context_audio"] = self._slice_audio(audio_input, target_start, self.context_samples)
 
-        # --- 3. Pre-computed Annotations ---
         if self.annotations_dir is not None:
             semantic_dir = self.annotations_dir / "semantic"
             structure_dir = self.annotations_dir / "structure"

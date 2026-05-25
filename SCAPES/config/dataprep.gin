@@ -1,10 +1,6 @@
 # SCAPES config.gin template
 # Copy to <dataset>/config/config.gin and edit as needed.
 
-# Codec parameters (fixed by EnCodec)
-dataset.sr = 48000
-dataset.frame_rate = 150
-
 # Atom geometry
 atoms.frames = 48
 atoms.hop_frames = 15
@@ -23,14 +19,18 @@ structure.features = [
   "spectral_entropy",
   "transient_density"
 ]
-structure.rolloff_pct = 0.85
-structure.stft.n_fft = "auto"
-structure.stft.hop_length = "auto"
+
+# Precomputation (CLAP + structure)
+precompute.batch_size = 128
 
 # Split controls (optional)
 splits.train_split = None
 splits.val_split = None
 splits.val_split_ratio = 0.1
+
+# Dataset sliding window
+dataset.memory_buffer_atoms = 3
+dataset.hop_atoms = 1
 
 # Misc
 seed = 42

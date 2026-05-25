@@ -3,12 +3,17 @@ import librosa
 import torch
 import torch.nn as nn
 import math
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 from IPython.display import Audio, display
 from pathlib import Path
 import matplotlib.pyplot as plt
 
+from SCAPES.data.config_loader import parse_gin_config, _get_nested, _SIZE_TABLE, _resolve_size_table, TrainingConfig
+from SCAPES.models.flow.FlowModel import FlowModel
+from SCAPES.models.factorization.LocalEncoder import LocalEncoder
+from SCAPES.auxiliar.encodec_wrapper import EncodecProcessor
+from SCAPES.auxiliar.clap_wrapper import CLAPWrapper
 from SCAPES.data.dataprep.structure import _compute_structure_features
 
 # ==========================================
@@ -24,7 +29,7 @@ def load_and_encode(engine, audio_path, max_duration=None):
     atoms = engine.encode_audio_to_atoms(audio_tensor)
     
     print(f"--- Computing context for audio: {audio_path}")
-    contexts = engine.compute_context_track(atoms)
+    contexts = engine.compute_context_track(audio_tensor)
     
     structures = None
     if engine.use_structure:
@@ -259,59 +264,149 @@ def run_interpolation_pipeline(
 class FlowInference:
     def __init__(
         self,
-        model: nn.Module,              
-        local_encoder: nn.Module,      
-        processor,                     
-        context_model: nn.Module,      
-        segment_length: int = 5,       
-        context_length: int = 10,      
-        atoms_frames: int = 39,        
-        atoms_hop_frames: int = 18,    
-        crossfade_frames: int = 3,     
-        sr: int = 48000,               
-        frame_rate: int = 150,    
-        structure_feature_names: List[str] = None, # <--- NEW     
-        device: str = "cuda",
-        verbose = False
+        model_dir: str,
+        device: Optional[str] = None,
+        verbose: bool = False,
+        checkpoint: str = "best",
     ):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
         self.verbose = verbose
 
-        self.structure_feature_names = structure_feature_names
+        model_dir = Path(model_dir)
+        gin_path = model_dir / "checkpoints" / "inference.gin"
+        if not gin_path.exists():
+            raise FileNotFoundError(
+                f"Expected inference config at {gin_path}. "
+                "Run training first to generate this file."
+            )
 
-        self.model = model.to(self.device).eval()
-        self.local_encoder = local_encoder.to(self.device).eval()
-        self.processor = processor 
-        
-        # Detect if model uses structure (either as direct attribute or via transformer)
-        self.use_structure = getattr(self.model, "use_structure", False) or getattr(self.model.transformer, "use_structure", False)
+        config = parse_gin_config(gin_path)
 
-        self.context_model_type = getattr(context_model, "name", "Unknown") 
-        if self.context_model_type == "GlobalEncoder":
-            self.context_model = context_model.to(self.device).eval()
-        else:
-            self.context_model = context_model 
-        
-        self.segment_length = segment_length
-        self.context_length = context_length
-        self.context_shift = segment_length
-        
-        self.atoms_frames = atoms_frames
-        self.atoms_hop_frames = atoms_hop_frames
-        self.crossfade_frames = crossfade_frames
-        self.macro_overlap_frames = self.atoms_frames - self.atoms_hop_frames
-        
+        # ─── Data geometry ───
+        frame_dim = 129
+        context_vector_dim = 1024
+        sr = 48000
+        frame_rate = 150
+
+        self.atoms_frames = int(_get_nested(config, ["atoms", "frames"], 48))
+        self.atoms_hop_frames = int(_get_nested(config, ["atoms", "hop_frames"], 15))
+        self.crossfade_frames = int(_get_nested(config, ["atoms", "crossfade_frames"], 3))
+        self.memory_buffer_atoms = int(_get_nested(config, ["dataset", "memory_buffer_atoms"], 3))
+
+        self.context_seconds = float(_get_nested(config, ["dataset", "context_seconds"], 1.0))
+        self.semantic_random_extension = _get_nested(config, ["dataset", "semantic_random_extension"], True)
+        self.structure_feature_names = _get_nested(config, ["structure", "features"], None)
+
+        # ─── Model architecture ───
+        raw_size = _get_nested(config, ["model", "size"], None)
+        raw_d_model = _get_nested(config, ["model", "d_model"], None)
+        raw_nhead = _get_nested(config, ["model", "nhead"], None)
+        raw_num_layers = _get_nested(config, ["model", "num_layers"], None)
+        raw_dim_feedforward = _get_nested(config, ["model", "dim_feedforward"], None)
+
+        pseudo_config = TrainingConfig(
+            size=raw_size,
+            d_model=raw_d_model,
+            nhead=raw_nhead,
+            num_layers=raw_num_layers,
+            dim_feedforward=raw_dim_feedforward,
+            local_encoder_hidden_dim=int(_get_nested(config, ["local_encoder", "hidden_dim"], 256)),
+            local_encoder_time_entanglement=_get_nested(config, ["local_encoder", "time_entanglement"], True),
+            local_encoder_temporal_compression=int(_get_nested(config, ["local_encoder", "temporal_compression"], 1)),
+            cfg_scale=float(_get_nested(config, ["inference", "cfg_scale"], 3.0)),
+        )
+        pseudo_config = _resolve_size_table(pseudo_config)
+        self.training_config = pseudo_config
+
+        structure_dim = len(self.structure_feature_names) if self.structure_feature_names else 0
+
+        # ─── Build models ───
+        self.local_encoder = LocalEncoder(
+            in_channels=frame_dim,
+            hidden_dim=pseudo_config.local_encoder_hidden_dim,
+            out_channels=pseudo_config.d_model,
+            time_entanglement=pseudo_config.local_encoder_time_entanglement,
+            temporal_compression=pseudo_config.local_encoder_temporal_compression,
+        ).to(self.device).eval()
+
+        self.model = FlowModel(
+            frame_dim=frame_dim,
+            context_vector_dim=context_vector_dim,
+            num_past_atoms=self.memory_buffer_atoms,
+            frames_per_atom=self.atoms_frames,
+            d_model=pseudo_config.d_model,
+            nhead=pseudo_config.nhead,
+            num_layers=pseudo_config.num_layers,
+            dim_feedforward=pseudo_config.dim_feedforward,
+            structure_dim=structure_dim,
+            device=self.device,
+        ).to(self.device).eval()
+
+        # ─── Load checkpoint weights ───
+        flow_name, local_name = self._resolve_checkpoint_names(checkpoint, model_dir)
+
+        flow_ckpt = model_dir / "checkpoints" / flow_name
+        local_ckpt = model_dir / "checkpoints" / local_name
+
+        for ckpt_path, target_model, label in [
+            (flow_ckpt, self.model, "flow model"),
+            (local_ckpt, self.local_encoder, "local encoder"),
+        ]:
+            if not ckpt_path.exists():
+                raise FileNotFoundError(
+                    f"Checkpoint not found at {ckpt_path}. "
+                    f"Train a model first or point model_dir to a valid checkpoint directory."
+                )
+            state = torch.load(ckpt_path, map_location=self.device, weights_only=True)
+            if isinstance(state, dict) and 'model_state_dict' in state:
+                target_model.load_state_dict(state['model_state_dict'])
+            else:
+                target_model.load_state_dict(state)
+            if self.verbose:
+                print(f"  Loaded {label} from {ckpt_path.name}")
+
+        if self.verbose:
+            for m in [self.local_encoder, self.model]:
+                n = sum(p.numel() for p in m.parameters() if p.requires_grad)
+                print(f"  {m.__class__.__name__}: {n:,} params")
+
+        # ─── Set up components ───
+        self.processor = EncodecProcessor(sr=sr, streamable=True, device=self.device)
+        self.context_model = CLAPWrapper(version="2023", use_cuda=(self.device == "cuda"))
+
+        self.use_structure = structure_dim > 0
+        self.segment_length = self.memory_buffer_atoms
+
         self.sr = sr
         self.frame_rate = frame_rate
         self.samples_per_frame = sr // frame_rate
-        
+        self.macro_overlap_frames = self.atoms_frames - self.atoms_hop_frames
+
         self.segment_samples = self.atoms_frames * self.samples_per_frame
         self.hop_samples = self.atoms_hop_frames * self.samples_per_frame
         self.crossfade_samples = self.crossfade_frames * self.samples_per_frame
         self.macro_overlap_samples = self.macro_overlap_frames * self.samples_per_frame
-        
+
+        # Context window: time-based (same logic as dataset.py)
+        self.context_samples = int(round(self.context_seconds * self.sr))
+
         self.ola_window = self._build_ola_window().to(self.device)
         self.timeline: List[Dict[str, Any]] = []
+
+    @staticmethod
+    def _resolve_checkpoint_names(checkpoint, model_dir):
+        if checkpoint == "best":
+            return "best_flow_model.pt", "best_local_encoder.pt"
+        elif checkpoint == "last":
+            return "last_flow_model.pt", "last_local_encoder.pt"
+        elif isinstance(checkpoint, int):
+            return f"epoch_{checkpoint}_flow_model.pt", f"epoch_{checkpoint}_local_encoder.pt"
+        elif isinstance(checkpoint, str) and checkpoint.isdigit():
+            return f"epoch_{checkpoint}_flow_model.pt", f"epoch_{checkpoint}_local_encoder.pt"
+        else:
+            raise ValueError(f"checkpoint must be 'best', 'last', or an int (epoch number), got {checkpoint}")
 
     def _build_ola_window(self):
         zeros_frames = self.macro_overlap_frames - self.crossfade_frames
@@ -368,53 +463,41 @@ class FlowInference:
         return atoms_129D
     
     @torch.no_grad()
-    def compute_context_track(self, atoms_129D: List[torch.Tensor]) -> List[torch.Tensor]:
+    def compute_context_track(self, audio_tensor: torch.Tensor) -> List[torch.Tensor]:
         context_embeddings = []
-        total_atoms = len(atoms_129D)
+        total_samples = audio_tensor.shape[-1]
         last_valid_emb = None
-        ola_window_local = self.ola_window.view(1, 1, -1)
-        
+
+        total_atoms = 0
+        for start in range(0, total_samples, self.hop_samples):
+            end = start + self.segment_samples
+            if end <= total_samples:
+                total_atoms += 1
+            else:
+                break
+
         for t in range(total_atoms):
-            start_idx = t + self.context_shift 
-            end_idx = start_idx + self.context_length
-            
-            if end_idx <= total_atoms:
-                window_atoms = atoms_129D[start_idx:end_idx]
-                
-                if self.context_model_type == "GlobalEncoder":
-                    chunk_129D = torch.cat(window_atoms, dim=0).unsqueeze(0) 
-                    latent = chunk_129D[:, :, :128, :] 
-                    scale = chunk_129D[:, :, 128, 0:1] 
-                    emb = self.context_model(latent, scale).squeeze(0) 
-                    
-                else:
-                    N = len(window_atoms)
-                    total_samples = (N - 1) * self.hop_samples + self.segment_samples
-                    window_audio = torch.zeros(1, 2, total_samples, device=self.device)
-                    
-                    for i, atom in enumerate(window_atoms):
-                        atom_audio = self._decode_single_atom(atom).to(self.device)
-                        atom_audio = atom_audio * ola_window_local
-                        
-                        start_sample = i * self.hop_samples
-                        end_sample = start_sample + self.segment_samples
-                        window_audio[:, :, start_sample:end_sample] += atom_audio
-                        
-                    emb = self.context_model.compute_embedding(
-                        window_audio, 
-                        og_sr=self.sr, 
-                        random_extension=True
-                    ).squeeze(0) 
+            start_sample = t * self.hop_samples
+            end_sample = start_sample + self.context_samples
+
+            if end_sample <= total_samples:
+                window_audio = audio_tensor[:, :, start_sample:end_sample]
+
+                emb = self.context_model.compute_embedding(
+                    window_audio,
+                    og_sr=self.sr,
+                    random_extension=self.semantic_random_extension,
+                ).squeeze(0)
 
                 context_embeddings.append(emb)
-                last_valid_emb = emb 
-                
+                last_valid_emb = emb
+
             else:
                 if last_valid_emb is not None:
                     context_embeddings.append(last_valid_emb)
                 else:
                     raise ValueError("Audio file is too short to compute even one context window!")
-                    
+
         return context_embeddings
 
     @torch.no_grad()

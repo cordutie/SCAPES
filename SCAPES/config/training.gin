@@ -1,0 +1,37 @@
+# SCAPES training config template
+# Copy to <dataset>/config/training.gin and edit as needed.
+
+# Architecture — either 'model.size' (picks from preset table) OR explicit params:
+model.size = "large"
+# model.d_model = 1024
+# model.nhead = 16
+# model.num_layers = 12
+# model.dim_feedforward = 2048
+
+# LocalEncoder (in_channels=129 is implicit — same as frame_dim, a codec constant)
+local_encoder.hidden_dim = 256
+local_encoder.time_entanglement = True
+local_encoder.temporal_compression = 1
+
+# Training hyperparameters
+training.epochs = 75
+training.batch_size = 128
+training.learning_rate = 1e-4
+training.past_dropout = 0.25
+training.conditioning_dropout = 0.2
+training.audio_val_freq = 15
+training.val_nfe = 16
+training.context_source = "clap"
+
+# Checkpointing (0 = only best/last, no epoch checkpoints)
+training.checkpoint_freq = 15
+# training.save_resume_states = True   # saves optimizer states too (for resuming)
+
+# Validation audio — filenames, "all", or "random=N":
+# training.val_files = ["file1.wav", "file2.wav"]
+# training.val_files = ["all"]
+# training.val_files = ["random=3"]
+# training.val_duration = 5.0
+
+# Inference defaults
+inference.cfg_scale = 3.0
