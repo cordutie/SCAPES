@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+import torch.nn as nn
 import torchaudio
 import soundfile as sf
 from tqdm import tqdm
@@ -8,8 +9,9 @@ from pathlib import Path
 import math
 import matplotlib.pyplot as plt
 
-from SCAPES.auxiliar.losses_flow import flow_matching_loss
+from SCAPES.auxiliar.losses_flow import flow_matching_loss, time_phase_regularizer, fft_phase_regularizer
 from SCAPES.data.config_loader import TrainingConfig
+from SCAPES.models.factorization.AtomDiscriminator import AtomDiscriminator
 
 
 class FlowTrainer:
@@ -64,6 +66,7 @@ class FlowTrainer:
             "num_layers": config.num_layers,
             "dim_feedforward": config.dim_feedforward,
             "structure_dim": self.structure_dim,
+            "cfg_scale": config.cfg_scale,
         }
         self.encoder_config = {
             "in_channels": self.frame_dim,
@@ -80,6 +83,15 @@ class FlowTrainer:
 
         if self.use_structure:
             self.model_config["structure_feature_names"] = getattr(self.dataset, "structure_feature_names", None)
+
+        # ─── Adversarial discriminator (optional, 2-stage) ───
+        self.use_discriminator = config.use_discriminator
+        self.disc_epochs = config.disc_epochs
+        self.stage2_epochs = config.stage2_epochs
+        self.regularizers_and_weights = config.regularizers_and_weights
+        self.x_hat_buffer = []          # buffer of (X_hat_latent, s) pairs for discriminator
+        self.adv_buffer_max = 5000      # max samples in buffer
+        self.adv_loss_fn = nn.BCEWithLogitsLoss(reduction='none')
 
         self.checkpoint_freq = config.checkpoint_freq
         self.save_resume_states = config.save_resume_states
@@ -233,7 +245,7 @@ class FlowTrainer:
         lines.extend([
             "",
             "# ─── Inference defaults ───",
-            "inference.cfg_scale = 3.0",
+            f"inference.cfg_scale = {self.model_config['cfg_scale']}",
         ])
 
         gin_path = self.ckpt_dir / "inference.gin"
@@ -322,12 +334,28 @@ class FlowTrainer:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
-    def train_epoch(self):
+    def train_epoch(self, discriminator=None, collect_adv=False):
         self.model.train()
         self.local_encoder.train()
         total_loss = 0
         total_lat_loss = 0
         total_scale_loss = 0
+        total_adv_loss = 0
+        total_reg_loss = 0
+
+        # Build regularizer list once
+        active_regularizers = []
+        if self.regularizers_and_weights:
+            REG_MAP = {
+                "time_phase": time_phase_regularizer,
+                "fft_phase": fft_phase_regularizer,
+            }
+            for name, weight in self.regularizers_and_weights:
+                fn = REG_MAP.get(name)
+                if fn is None:
+                    print(f"⚠️ Unknown regularizer '{name}', skipping.")
+                else:
+                    active_regularizers.append((fn, weight))
 
         pbar = tqdm(self.train_loader, desc="Training")
         for batch in pbar:
@@ -343,47 +371,71 @@ class FlowTrainer:
 
             if self.past_dropout > 0.0:
                 B, N_past, T_frames, d_model = encoded_past.shape
-
                 mask = torch.zeros((B, N_past, 1, 1), dtype=torch.bool, device=self.device)
-
                 for b in range(B):
                     if torch.rand(1).item() < self.past_dropout:
                         num_drop = torch.randint(1, N_past + 1, (1,)).item()
                         mask[b, :num_drop] = True
-
                 encoded_past = torch.where(mask, self.model.null_past_embed, encoded_past)
 
             noise = torch.randn_like(present_target)
-            loss, l_lat, l_scale = flow_matching_loss(
-                self.model,
-                noise,
-                present_target,
-                context,
-                encoded_past,
-                structure_vector=structure,
-                scale_weight=1.0
+            loss, l_lat, l_scale, X_hat, s = flow_matching_loss(
+                self.model, noise, present_target, context, encoded_past,
+                structure_vector=structure, scale_weight=1.0
             )
 
-            loss.backward()
+            # Regularizers (additional loss terms on the final-atom estimate)
+            reg_loss = torch.tensor(0.0, device=self.device)
+            for fn, weight in active_regularizers:
+                reg_loss += weight * fn(X_hat, present_target, s)
+
+            combined_loss = loss + reg_loss
+
+            if discriminator is not None:
+                X_hat_latent = X_hat[:, :, :128].transpose(1, 2).contiguous()
+                logits = discriminator(X_hat_latent).squeeze(-1)
+                adv_loss = self.adv_loss_fn(logits, torch.zeros_like(logits)).mean()
+                combined_loss = combined_loss + adv_loss
+                total_adv_loss += adv_loss.item()
+            else:
+                adv_loss = None
+
+            combined_loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                list(self.model.parameters()) +
-                list(self.local_encoder.parameters()),
-                1.0
+                list(self.model.parameters()) + list(self.local_encoder.parameters()), 1.0
             )
             self.optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += combined_loss.item()
             total_lat_loss += l_lat.item()
             total_scale_loss += l_scale.item()
+            total_reg_loss += reg_loss.item()
 
-            pbar.set_postfix({
-                "L": f"{loss.item():.4f}",
+            # Collect adversarial data for next discriminator round
+            if collect_adv:
+                remaining = self.adv_buffer_max - len(self.x_hat_buffer)
+                if remaining > 0:
+                    X_hat_latent = X_hat[:, :, :128].transpose(1, 2).contiguous()
+                    B_curr = X_hat_latent.shape[0]
+                    take = min(remaining, B_curr)
+                    self.x_hat_buffer.append((
+                        X_hat_latent[:take].detach().cpu(),
+                        s[:take].detach().cpu().reshape(take, 1)
+                    ))
+
+            postfix = {
+                "L": f"{combined_loss.item():.4f}",
                 "Lat": f"{l_lat.item():.4f}",
-                "Sca": f"{l_scale.item():.4f}"
-            })
+                "Sca": f"{l_scale.item():.4f}",
+            }
+            if reg_loss.item() > 0:
+                postfix["Reg"] = f"{reg_loss.item():.4f}"
+            if adv_loss is not None:
+                postfix["Adv"] = f"{adv_loss.item():.4f}"
+            pbar.set_postfix(postfix)
 
         n = len(self.train_loader)
-        return total_loss / n, total_lat_loss / n, total_scale_loss / n
+        return total_loss / n, total_lat_loss / n, total_scale_loss / n, total_adv_loss / n, total_reg_loss / n
 
     @torch.no_grad()
     def val_epoch(self):
@@ -401,7 +453,7 @@ class FlowTrainer:
             encoded_past = self.local_encoder(past_memory)
             noise = torch.randn_like(present_target)
 
-            loss, l_lat, l_scale = flow_matching_loss(
+            loss, l_lat, l_scale, _, _ = flow_matching_loss(
                 self.model,
                 noise,
                 present_target,
@@ -487,7 +539,8 @@ class FlowTrainer:
                     enc_tf,
                     context,
                     structure_vector=structure,
-                    max_nfe=NFE
+                    max_nfe=NFE,
+                    cfg_scale=self.model_config['cfg_scale']
                 ).transpose(1, 2)
 
                 tf_pred_smooth = tf_pred.clone()
@@ -521,70 +574,261 @@ class FlowTrainer:
 
         print(f"✅ Validation audio for epoch {epoch} saved!")
 
-    def train(self, epochs, audio_val_freq=5, val_nfe=32):
-        for epoch in range(self.start_epoch, epochs + 1):
-            print(f"\n=== Epoch {epoch}/{epochs} ===")
+    # ==========================================
+    # DISCRIMINATOR TRAINING
+    # ==========================================
 
-            avg_t_total, avg_t_lat, avg_t_scale = self.train_epoch()
+    @torch.no_grad()
+    def _collect_real_atoms(self, count):
+        """Collect `count` real atoms randomly from the dataset. Returns [N, 128, T_frames]."""
+        n = min(count, len(self.dataset))
+        indices = torch.randperm(len(self.dataset))[:n].tolist()
+        atoms = []
+        for idx in indices:
+            raw = self.dataset[idx]
+            atoms.append(raw["target_latent"].unsqueeze(0).cpu())
+        return torch.cat(atoms, dim=0)
+
+    def _train_discriminator(self, max_epochs, lr=1e-4):
+        """Train AtomDiscriminator from scratch using the X_hat buffer vs real atoms.
+
+        Real → 0, Fake → 1 (discriminator outputs a "fakeness" score).
+        Fake samples are weighted by (1 + (2s-1)**3) to focus on late-flow artifacts.
+        The generator minimizes this fakeness score.
+        """
+        if len(self.x_hat_buffer) == 0:
+            raise RuntimeError("Cannot train discriminator: X_hat buffer is empty")
+
+        all_fake = torch.cat([x for x, _ in self.x_hat_buffer], dim=0).to(self.device)
+        all_s = torch.cat([s for _, s in self.x_hat_buffer], dim=0).to(self.device)
+        n_fake = all_fake.shape[0]
+
+        n_real = min(n_fake, len(self.dataset))
+        real_atoms = self._collect_real_atoms(n_real).to(self.device)
+        n_total = min(n_fake, n_real)
+
+        all_fake = all_fake[:n_total]
+        all_s = all_s[:n_total]
+        real_atoms = real_atoms[:n_total]
+
+        disc = AtomDiscriminator().to(self.device)
+        opt = torch.optim.AdamW(disc.parameters(), lr=lr)
+        loss_fn = nn.BCEWithLogitsLoss(reduction='none')
+        fake_weight = (1.0 + (2.0 * all_s.squeeze(-1) - 1.0) ** 3)
+        batch_size = min(128, n_total)
+
+        for ep in range(max_epochs):
+            disc.train()
+            total_d_loss = 0
+            n_batches = 0
+            perm = torch.randperm(n_total, device=self.device)
+            pbar = tqdm(range(0, n_total, batch_size), desc=f"  Disc ep {ep+1}/{max_epochs}", leave=False)
+            for i in pbar:
+                idx = perm[i:i + batch_size]
+                real_batch = real_atoms[idx]
+                fake_batch = all_fake[idx]
+                w_batch = fake_weight[idx]
+
+                opt.zero_grad()
+                logits_real = disc(real_batch)
+                logits_fake = disc(fake_batch)
+
+                loss_real = loss_fn(logits_real, torch.zeros_like(logits_real)).mean()
+                loss_fake = (loss_fn(logits_fake, torch.ones_like(logits_fake)).squeeze(-1) * w_batch).mean()
+                d_loss = loss_real + loss_fake
+
+                d_loss.backward()
+                opt.step()
+                total_d_loss += d_loss.item()
+                n_batches += 1
+                pbar.set_postfix({"L": f"{total_d_loss / n_batches:.4f}"})
+
+        disc = disc.eval()
+        del real_atoms, all_fake, all_s
+        torch.cuda.empty_cache()
+        return disc
+
+    # ==========================================
+    # MAIN TRAINING LOOP (2-stage)
+    # ==========================================
+
+    def _epoch_bookkeeping(self, global_epoch, current_metric, audio_val_freq, val_nfe):
+        """Shared checkpoint/save/log logic after each epoch."""
+        trainer_state = None
+        if self.save_resume_states:
+            trainer_state = {
+                'epoch': global_epoch,
+                'best_metric': min(current_metric, self.best_metric),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'train_losses': self.train_losses,
+                'val_losses': self.val_losses
+            }
+
+        if current_metric < self.best_metric:
+            self.best_metric = current_metric
+            torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "best_flow_model.pt")
+            torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "best_local_encoder.pt")
+            if self.save_resume_states:
+                torch.save(trainer_state, self.ckpt_dir / "best_trainer_state.pt")
+            print("🌟 Saved new best models!")
+
+        ckpt_freq = self.checkpoint_freq
+        if ckpt_freq > 0 and global_epoch % ckpt_freq == 0:
+            torch.save({'model_state_dict': self.model.state_dict()},
+                       self.ckpt_dir / f"epoch_{global_epoch}_flow_model.pt")
+            torch.save({'model_state_dict': self.local_encoder.state_dict()},
+                       self.ckpt_dir / f"epoch_{global_epoch}_local_encoder.pt")
+            if self.save_resume_states:
+                torch.save(trainer_state, self.ckpt_dir / f"epoch_{global_epoch}_trainer_state.pt")
+
+        if (global_epoch) % audio_val_freq == 0:
+            self.generate_validation_audio(global_epoch, NFE=val_nfe)
+
+        torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "last_flow_model.pt")
+        torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "last_local_encoder.pt")
+        if self.save_resume_states:
+            torch.save(trainer_state, self.ckpt_dir / "last_trainer_state.pt")
+
+        history_path = self.loss_dir / "loss_history.json"
+        with open(history_path, "w") as f:
+            json.dump({
+                "train": self.train_losses,
+                "val": self.val_losses if self.val_loader else {}
+            }, f, indent=4)
+
+        self._plot_and_save_losses(global_epoch)
+
+    def train(self, epochs, audio_val_freq=5, val_nfe=32, patience=10):
+        # ─── Stage 1: Standard Flow Matching ───
+        print(f"\n{'='*60}")
+        print(f"🔥 Stage 1 — Standard Flow Matching ({epochs} epochs, patience={patience})")
+        print(f"{'='*60}")
+
+        self.x_hat_buffer = []
+        epochs_no_improve = 0
+
+        for epoch in range(1, epochs + 1):
+            global_epoch = self.start_epoch
+            print(f"\n=== Stage 1 — Epoch {global_epoch} ===")
+
+            collect_adv = self.use_discriminator and (epoch == epochs)
+            avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = self.train_epoch(
+                collect_adv=collect_adv
+            )
 
             self.train_losses["total"].append(avg_t_total)
             self.train_losses["latent"].append(avg_t_lat)
             self.train_losses["scale"].append(avg_t_scale)
+            self.train_losses.setdefault("adv", []).append(avg_t_adv)
+            self.train_losses.setdefault("reg", []).append(avg_t_reg)
 
-            print(f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f})")
+            parts = [f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}"]
+            if avg_t_reg > 0:
+                parts.append(f"Reg: {avg_t_reg:.6f}")
+            if avg_t_adv > 0:
+                parts.append(f"Adv: {avg_t_adv:.6f}")
+            print(", ".join(parts) + ")")
 
             if self.val_loader is not None:
                 avg_v_total, avg_v_lat, avg_v_scale = self.val_epoch()
-
                 self.val_losses["total"].append(avg_v_total)
                 self.val_losses["latent"].append(avg_v_lat)
                 self.val_losses["scale"].append(avg_v_scale)
-
                 print(f"Val   | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
                 current_metric = avg_v_total
             else:
                 current_metric = avg_t_total
 
-            trainer_state = None
-            if self.save_resume_states:
-                trainer_state = {
-                    'epoch': epoch,
-                    'best_metric': min(current_metric, self.best_metric),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
-                    'train_losses': self.train_losses,
-                    'val_losses': self.val_losses
-                }
+            old_best = self.best_metric
+            self._epoch_bookkeeping(global_epoch, current_metric, audio_val_freq, val_nfe)
+            self.start_epoch += 1
 
-            if current_metric < self.best_metric:
-                self.best_metric = current_metric
-                torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "best_flow_model.pt")
-                torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "best_local_encoder.pt")
+            if self.best_metric < old_best:
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f"  Early stopping at epoch {global_epoch} (no improvement for {patience} epochs)")
+                    break
 
-                if self.save_resume_states:
-                    torch.save(trainer_state, self.ckpt_dir / "best_trainer_state.pt")
+        if not self.use_discriminator:
+            print(f"\n✅ Training complete!")
+            return
 
-                print("🌟 Saved new best models!")
+        if len(self.x_hat_buffer) == 0:
+            raise RuntimeError(
+                "Buffer is empty but use_discriminator=True. "
+                "This means Stage 1 completed without collecting adversarial data."
+            )
 
-            if self.checkpoint_freq > 0 and epoch % self.checkpoint_freq == 0:
-                torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / f"epoch_{epoch}_flow_model.pt")
-                torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / f"epoch_{epoch}_local_encoder.pt")
+        # Freeze LocalEncoder for Stage 2
+        self.local_encoder.eval()
+        for p in self.local_encoder.parameters():
+            p.requires_grad_(False)
 
-                if self.save_resume_states:
-                    torch.save(trainer_state, self.ckpt_dir / f"epoch_{epoch}_trainer_state.pt")
+        print(f"\n{'='*60}")
+        print(f"🔥 Stage 2 — Adversarial Fine-tuning ({self.stage2_epochs} epochs, patience={patience})")
+        print(f"   Buffer has {sum(x.shape[0] for x, _ in self.x_hat_buffer)} fake samples")
+        print(f"{'='*60}")
 
-            if epoch % audio_val_freq == 0:
-                self.generate_validation_audio(epoch, NFE=val_nfe)
+        best_stage2 = float('inf')
+        epochs_no_improve = 0
 
-            torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "last_flow_model.pt")
-            torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "last_local_encoder.pt")
-            if self.save_resume_states:
-                torch.save(trainer_state, self.ckpt_dir / "last_trainer_state.pt")
+        for epoch in range(1, self.stage2_epochs + 1):
+            global_epoch = self.start_epoch
+            print(f"\n=== Stage 2 — Epoch {global_epoch} ===")
+            print(f"  ─── Part A: Train discriminator ───")
 
-            history_path = self.loss_dir / "loss_history.json"
-            with open(history_path, "w") as f:
-                json.dump({
-                    "train": self.train_losses,
-                    "val": self.val_losses if self.val_loader else {}
-                }, f, indent=4)
+            disc = self._train_discriminator(max_epochs=self.disc_epochs, lr=1e-4)
 
-            self._plot_and_save_losses(epoch)
+            print(f"  ─── Part B: Train generator (adversarial) ───")
+
+            self.x_hat_buffer = []
+            avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = self.train_epoch(
+                discriminator=disc, collect_adv=True
+            )
+
+            self.train_losses["total"].append(avg_t_total)
+            self.train_losses["latent"].append(avg_t_lat)
+            self.train_losses["scale"].append(avg_t_scale)
+            self.train_losses.setdefault("adv", []).append(avg_t_adv)
+            self.train_losses.setdefault("reg", []).append(avg_t_reg)
+
+            print(f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}, Adv: {avg_t_adv:.6f}, Reg: {avg_t_reg:.6f})")
+
+            if self.val_loader is not None:
+                avg_v_total, avg_v_lat, avg_v_scale = self.val_epoch()
+                self.val_losses["total"].append(avg_v_total)
+                self.val_losses["latent"].append(avg_v_lat)
+                self.val_losses["scale"].append(avg_v_scale)
+                print(f"Val   | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
+                current_metric = avg_v_total
+            else:
+                current_metric = avg_t_total
+
+            self._epoch_bookkeeping(global_epoch, current_metric, audio_val_freq, val_nfe)
+            self.start_epoch += 1
+
+            # Patience (stage 2 uses its own tracking — loss landscape differs from stage 1)
+            if current_metric < best_stage2:
+                best_stage2 = current_metric
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f"  Early stopping at epoch {global_epoch} (no improvement for {patience} epochs)")
+                    del disc
+                    torch.cuda.empty_cache()
+                    break
+
+            # Clean up discriminator
+            del disc
+            torch.cuda.empty_cache()
+
+        # Unfreeze LocalEncoder for any downstream use
+        self.local_encoder.train()
+        for p in self.local_encoder.parameters():
+            p.requires_grad_(True)
+
+        self.x_hat_buffer = []
+        print(f"\n✅ Training complete!")

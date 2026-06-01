@@ -23,7 +23,7 @@ from SCAPES.data.dataprep.structure import _compute_structure_features
 def load_and_encode(engine, audio_path, max_duration=None):
     audio_tensor = engine.load_audio_to_tensor(audio_path)
     if max_duration != None and audio_tensor.shape[-1] > engine.sr * max_duration:
-        audio_tensor = audio_tensor[:,:,:48000*max_duration]
+        audio_tensor = audio_tensor[:,:,:engine.sr*max_duration]
         
     print(f"--- Encoding audio: {audio_path}")
     atoms = engine.encode_audio_to_atoms(audio_tensor)
@@ -41,7 +41,7 @@ def load_and_encode(engine, audio_path, max_duration=None):
 def run_resynthesis_pipeline(
     engine,
     audio_path,
-    duration=60,
+    duration=None,
     play=True,
     save_path=None,
     TF=False, 
@@ -90,6 +90,69 @@ def run_resynthesis_pipeline(
         sf.write(save_path, sf_audio, engine.sr)
         print(f"✅ Resynthesized audio saved to: {save_path}")
     return final_wav
+
+def run_batch_resynthesis_pipeline(
+    engine,
+    input_dir,
+    output_dir="reconstructed",
+    duration=None,
+    NFE=32,
+    cfg_scale=3.0,
+    TF=False,
+    decode_method="ola_smooth",
+    extensions=(".wav", ".flac", ".mp3"),
+):
+    input_path = Path(input_dir)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    audio_files = []
+    for ext in extensions:
+        audio_files.extend(sorted(input_path.rglob(f"*{ext}")))
+    audio_files.sort(key=lambda p: p.name)
+
+    if not audio_files:
+        print(f"No audio files found in {input_dir} with extensions {extensions}")
+        return []
+
+    print(f"Found {len(audio_files)} audio file(s) in {input_dir}")
+    saved_paths = []
+
+    for audio_path in tqdm(audio_files, desc="Batch Resynthesis"):
+        save_path = output_path / f"{audio_path.stem}_reconstructed.wav"
+        atoms_src, contexts_src, structures_src = load_and_encode(engine, str(audio_path), max_duration=duration)
+
+        atoms = atoms_src
+        contexts = contexts_src
+        structures = structures_src
+
+        cold_start = True
+        if TF is not True and TF is not False:
+            cold_start = False
+            tf_actual = False
+        else:
+            tf_actual = TF
+
+        timeline = engine.build_base_timeline(
+            atoms_129D=atoms,
+            context_embeddings=contexts,
+            structure_embeddings=structures,
+            default_TF=tf_actual
+        )
+
+        if not cold_start:
+            for t in range(0, 5):
+                timeline[t]["TF"] = True
+
+        completed_timeline = engine.generate(timeline, NFE=NFE, cfg_scale=cfg_scale)
+        final_wav = engine.decode_timeline(completed_timeline, output_path=None, method=decode_method)
+
+        sf_audio = final_wav.transpose(0, 1).numpy()
+        sf.write(str(save_path), sf_audio, engine.sr)
+        saved_paths.append(str(save_path))
+
+    print(f"\n✅ Batch resynthesis complete — {len(saved_paths)} file(s) saved to {output_dir}/")
+    return saved_paths
 
 def sticky_curve_torch(n_points=100, stickiness=1.0):
     if stickiness <= 0:

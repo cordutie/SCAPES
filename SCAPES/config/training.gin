@@ -33,5 +33,12 @@ training.checkpoint_freq = 15
 # training.val_files = ["random=3"]
 # training.val_duration = 5.0
 
+# Adversarial discriminator (True = 2-stage: standard FM + adversarial fine-tuning)
+# training.use_discriminator = True
+# training.stage2_epochs = 10
+
+# Regularizers: list of [name, weight] pairs (e.g. [["time_phase", 0.1], ["fft_phase", 0.05]])
+training.regularizers_and_weights = [["time_phase", 1], ["fft_phase", 0.1]]
+
 # Inference defaults
 inference.cfg_scale = 3.0

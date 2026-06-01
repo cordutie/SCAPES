@@ -241,7 +241,7 @@ class FlowModel(nn.Module):
         return v_uncond + cfg_scale * (v_cond - v_uncond)
 
     @torch.no_grad()
-    def generate(self, x0, encoded_past, clap_context, structure_vector=None, max_nfe=16, cfg_scale=3.0):
+    def generate(self, x0, encoded_past, clap_context, structure_vector=None, max_nfe=16, cfg_scale=1.0):
         memory = self.prepare_memory(encoded_past)
 
         context_dict = {

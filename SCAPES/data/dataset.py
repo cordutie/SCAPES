@@ -356,9 +356,8 @@ class AtomSequenceDataset(Dataset):
         if audio_input.dim() == 1:
             audio_input = audio_input.unsqueeze(0)
 
-        if audio_input.dim() == 2:
-            if audio_input.shape[0] == 1:
-                audio_input = audio_input.repeat(2, 1)
+        if audio_input.shape[0] == 1:
+            audio_input = audio_input.repeat(2, 1)
         elif audio_input.shape[0] > 2:
             audio_input = audio_input[:2, :]
 

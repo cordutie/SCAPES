@@ -242,6 +242,15 @@ class TrainingConfig:
     # Inference defaults
     cfg_scale: float = 3.0
 
+    # Adversarial discriminator (True = enable 2-stage training)
+    use_discriminator: bool = False
+    disc_epochs: int = 10
+    stage2_epochs: int = 10
+
+    # Regularizers: list of [name, weight] pairs, e.g. [["time_phase", 0.1], ["fft_phase", 0.05]]
+    regularizers_and_weights: Optional[list] = None
+
+
 _TRAINING_GIN_MAP = [
     (["model", "size"], "size"),
     (["model", "d_model"], "d_model"),
@@ -264,6 +273,9 @@ _TRAINING_GIN_MAP = [
     (["training", "val_files"], "val_files"),
     (["training", "val_duration"], "val_duration"),
     (["inference", "cfg_scale"], "cfg_scale"),
+    (["training", "use_discriminator"], "use_discriminator"),
+    (["training", "stage2_epochs"], "stage2_epochs"),
+    (["training", "regularizers_and_weights"], "regularizers_and_weights"),
 ]
 
 
