@@ -45,7 +45,7 @@ def Dt_psi_conditioned(s, X0, X1, sigma_min=0.01, sigma_max=1.0):
     """
     return (sigma_max - sigma_min) * (X1 - X0)
 
-def flow_matching_loss(model, x0, x1, context, encoded_past, structure_vector=None, scale_weight=1.0, sigma_min=0.01, sigma_max=1.0):
+def flow_matching_loss(model, x0, x1, context, encoded_past, structure_vector=None, scale_weight=3.0, sigma_min=0.01, sigma_max=1.0):
     """
     x0, x1: (B, 21, 129)
     scale_weight: Hyperparameter to boost the importance of the 129th channel.

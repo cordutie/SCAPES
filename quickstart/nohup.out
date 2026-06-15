@@ -1,0 +1,42 @@
+Initializing EnCodec processor on device: cuda
+Streamable mode: True
+  → Enabling streamable mode (disabling chunking)
+✓ EnCodec 48kHz model loaded (HuggingFace) - streamable
+✓ Sample rate: 48000 Hz
+✓ Frame rate: 150 Hz
+Found 16 audio file(s) in /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw
+Batch Resynthesis:   0%|          | 0/16 [00:00<?, ?it/s]Batch Resynthesis:   6%|▋         | 1/16 [01:31<22:49, 91.27s/it]Batch Resynthesis:  12%|█▎        | 2/16 [03:03<21:25, 91.81s/it]Batch Resynthesis:  19%|█▉        | 3/16 [04:36<20:02, 92.47s/it]Batch Resynthesis:  25%|██▌       | 4/16 [06:07<18:21, 91.82s/it]Batch Resynthesis:  31%|███▏      | 5/16 [07:38<16:48, 91.66s/it]Batch Resynthesis:  38%|███▊      | 6/16 [09:10<15:15, 91.51s/it]Batch Resynthesis:  44%|████▍     | 7/16 [10:41<13:43, 91.53s/it]Batch Resynthesis:  50%|█████     | 8/16 [12:13<12:13, 91.69s/it]Batch Resynthesis:  56%|█████▋    | 9/16 [13:45<10:41, 91.63s/it]Batch Resynthesis:  62%|██████▎   | 10/16 [15:17<09:11, 91.87s/it]Batch Resynthesis:  69%|██████▉   | 11/16 [16:50<07:40, 92.19s/it]Batch Resynthesis:  75%|███████▌  | 12/16 [18:21<06:07, 91.88s/it]Batch Resynthesis:  81%|████████▏ | 13/16 [19:53<04:35, 91.73s/it]Batch Resynthesis:  88%|████████▊ | 14/16 [21:24<03:03, 91.58s/it]Batch Resynthesis:  94%|█████████▍| 15/16 [22:56<01:31, 91.88s/it]Batch Resynthesis: 100%|██████████| 16/16 [24:28<00:00, 91.70s/it]Batch Resynthesis: 100%|██████████| 16/16 [24:28<00:00, 91.76s/it]
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/applause.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/applause.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/boiling.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/boiling.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/bonfire.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/bonfire.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/bubbles.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/bubbles.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/creek.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/creek.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/drainage.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/drainage.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/forest.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/forest.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/helicopter.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/helicopter.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/keyboard.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/keyboard.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/orchestra.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/orchestra.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/park.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/park.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/rain.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/rain.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/river.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/river.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/thunderstorm.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/thunderstorm.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/tokio.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/tokio.wav
+--- Encoding audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/wind.wav
+--- Computing context for audio: /home/esteban/Documents/projects/dev_SCAPES/datasets/microtex/raw/wind.wav
+
+✅ Batch resynthesis complete — 16 file(s) saved to semantic_reconstructed/

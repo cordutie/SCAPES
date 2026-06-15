@@ -3,6 +3,8 @@ tests/
 slowstart/
 dev/
 0. introduction.ipynb
+*.sh
+*.log
 
 # Ignore audio files and results
 *.wav

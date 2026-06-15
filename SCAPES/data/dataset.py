@@ -127,6 +127,7 @@ class AtomSequenceDataset(Dataset):
             "memory_buffer_latent", "target_latent",
             "memory_buffer_scale", "target_scale",
             "target_semantic", "target_structure",
+            "target_noise",
             "target_audio", "target_context_audio",
             "index"
         }
@@ -336,6 +337,19 @@ class AtomSequenceDataset(Dataset):
 
         atom_filename = f"{stem}_atom_{atom_index}.pt"
         return self.dataset_path / "atoms" / relative_parent / stem / atom_filename
+
+    def _get_noise_path(self, original_filename, atom_index):
+        original_path = Path(self.manifest[original_filename]["path"])
+        stem = original_path.stem
+        parts = list(original_path.parts)
+        try:
+            raw_idx = parts.index("raw")
+            relative_parent = Path(*parts[raw_idx + 1: -1])
+        except ValueError:
+            relative_parent = Path("")
+
+        noise_filename = f"{stem}_atom_{atom_index}.pt"
+        return self.dataset_path / "noise" / relative_parent / stem / noise_filename
 
     def _get_part_indices(self, start_idx, part):
         if part == "past":
@@ -583,6 +597,11 @@ class AtomSequenceDataset(Dataset):
                 batch_dict["target_audio"] = self._slice_audio(audio_input, target_start, self.atoms_samples)
             if "target_context_audio" in req:
                 batch_dict["target_context_audio"] = self._slice_audio(audio_input, target_start, self.context_samples)
+
+        if "target_noise" in req:
+            noise_path = self._get_noise_path(filename, start_idx + self.memory_buffer_atoms)
+            noise = torch.load(noise_path, weights_only=True, map_location='cpu')
+            batch_dict["target_noise"] = noise.float()
 
         if self.annotations_dir is not None:
             semantic_dir = self.annotations_dir / "semantic"

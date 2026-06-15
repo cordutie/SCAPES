@@ -381,7 +381,7 @@ class FlowTrainer:
             noise = torch.randn_like(present_target)
             loss, l_lat, l_scale, X_hat, s = flow_matching_loss(
                 self.model, noise, present_target, context, encoded_past,
-                structure_vector=structure, scale_weight=1.0
+                structure_vector=structure
             )
 
             # Regularizers (additional loss terms on the final-atom estimate)
@@ -459,8 +459,7 @@ class FlowTrainer:
                 present_target,
                 context,
                 encoded_past,
-                structure_vector=structure,
-                scale_weight=1.0
+                structure_vector=structure
             )
 
             total_loss += loss.item()
@@ -529,7 +528,8 @@ class FlowTrainer:
                     if isinstance(raw_batch[k], torch.Tensor):
                         raw_batch[k] = raw_batch[k].unsqueeze(0)
 
-                gt_past, _, context, structure = self._prepare_batch(raw_batch)
+                _prepared = self._prepare_batch(raw_batch)
+                gt_past, _, context, structure = _prepared[:4]
 
                 x0 = torch.randn(1, self.atom_frames, 129, device=self.device)
 
