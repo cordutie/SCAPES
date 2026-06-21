@@ -250,6 +250,10 @@ class TrainingConfig:
     # Regularizers: list of [name, weight] pairs, e.g. [["time_phase", 0.1], ["fft_phase", 0.05]]
     regularizers_and_weights: Optional[list] = None
 
+    # Spectral representation: if True, latents are transformed to log-mag / cos / sin
+    # in the frequency domain before flow matching, and iFFT'd back at inference time.
+    spectral_representation: bool = False
+
 
 _TRAINING_GIN_MAP = [
     (["model", "size"], "size"),
@@ -276,6 +280,7 @@ _TRAINING_GIN_MAP = [
     (["training", "use_discriminator"], "use_discriminator"),
     (["training", "stage2_epochs"], "stage2_epochs"),
     (["training", "regularizers_and_weights"], "regularizers_and_weights"),
+    (["training", "spectral_representation"], "spectral_representation"),
 ]
 
 

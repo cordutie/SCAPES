@@ -15,6 +15,7 @@ from SCAPES.models.factorization.LocalEncoder import LocalEncoder
 from SCAPES.auxiliar.encodec_wrapper import EncodecProcessor
 from SCAPES.auxiliar.clap_wrapper import CLAPWrapper
 from SCAPES.data.dataprep.structure import _compute_structure_features
+from SCAPES.auxiliar.losses_flow import time_to_spectral, spectral_to_time
 
 # ==========================================
 # PIPELINE HELPER FUNCTIONS
@@ -348,7 +349,14 @@ class FlowInference:
         config = parse_gin_config(gin_path)
 
         # ─── Data geometry ───
-        frame_dim = 129
+        self.spectral_mode = _get_nested(config, ["training", "spectral_representation"], False)
+        if self.spectral_mode:
+            frame_dim = 385  # 128*3 + 1
+            self.spectral_frames = int(_get_nested(config, ["atoms", "spectral_frames"],
+                                                    _get_nested(config, ["atoms", "frames"], 48) // 2 + 1))
+        else:
+            frame_dim = 129
+            self.spectral_frames = None
         context_vector_dim = 1024
         sr = 48000
         frame_rate = 150
@@ -386,6 +394,8 @@ class FlowInference:
         structure_dim = len(self.structure_feature_names) if self.structure_feature_names else 0
 
         # ─── Build models ───
+        model_frames_per_atom = self.spectral_frames if self.spectral_mode else self.atoms_frames
+
         self.local_encoder = LocalEncoder(
             in_channels=frame_dim,
             hidden_dim=pseudo_config.local_encoder_hidden_dim,
@@ -398,7 +408,7 @@ class FlowInference:
             frame_dim=frame_dim,
             context_vector_dim=context_vector_dim,
             num_past_atoms=self.memory_buffer_atoms,
-            frames_per_atom=self.atoms_frames,
+            frames_per_atom=model_frames_per_atom,
             d_model=pseudo_config.d_model,
             nhead=pseudo_config.nhead,
             num_layers=pseudo_config.num_layers,
@@ -612,6 +622,33 @@ class FlowInference:
         self.timeline = timeline 
         return timeline
     
+    def generate_soundscape(
+        self,
+        clap_embeddings: List[torch.Tensor],
+        nfe: int = 32,
+        cfg_scale: float = 3.0,
+        output_path: Optional[str] = None,
+    ) -> torch.Tensor:
+        """
+        Generate audio from a sequence of precomputed CLAP embeddings,
+        without requiring an input audio file.
+
+        Each entry in clap_embeddings corresponds to one atom step.
+        Past context is autoregressively filled from generated atoms
+        (dummy zeros for the first memory_buffer_atoms steps).
+
+        Returns:
+            audio tensor [2, T] at 48kHz
+        """
+        timeline = self.build_base_timeline(
+            atoms_129D=[None] * len(clap_embeddings),
+            context_embeddings=clap_embeddings,
+            structure_embeddings=None,
+            default_TF=False,
+        )
+        timeline = self.generate(timeline, NFE=nfe, cfg_scale=cfg_scale)
+        return self.decode_timeline(timeline, output_path=output_path)
+
     @torch.no_grad()
     def generate(self, timeline: List[Dict[str, Any]], NFE: int = 32, cfg_scale: float = 3.0) -> List[Dict[str, Any]]:
         self.model.eval()
@@ -640,7 +677,19 @@ class FlowInference:
                     else:
                         past_atoms.append(step_dict["atom_generated"].to(self.device))
                         
-            past_buffer = torch.cat(past_atoms, dim=0).unsqueeze(0) 
+            past_buffer = torch.cat(past_atoms, dim=0).unsqueeze(0)
+
+            if self.spectral_mode:
+                B_past, N_past, C_past, T_past = past_buffer.shape
+                past_lat = past_buffer[:, :, :128, :]
+                past_scl = past_buffer[:, :, 128:, :]
+                past_lat_flat = past_lat.reshape(-1, 128, T_past).transpose(1, 2)
+                past_spec_flat = time_to_spectral(past_lat_flat)
+                past_spec = past_spec_flat.reshape(B_past, N_past, self.spectral_frames, 384).transpose(2, 3)
+                past_scl_val = past_scl.mean(dim=-1, keepdim=True)
+                past_scl_exp = past_scl_val.expand(-1, -1, -1, self.spectral_frames)
+                past_buffer = torch.cat([past_spec, past_scl_exp], dim=2)
+
             encoded_past = self.local_encoder(past_buffer) 
             
             num_nulls = max(0, M - t)
@@ -657,18 +706,30 @@ class FlowInference:
                 if structure.dim() == 1:
                     structure = structure.unsqueeze(0)
                 
-            x0 = torch.randn(1, self.atoms_frames, 129, device=self.device)
-            
+            if self.spectral_mode:
+                x0 = torch.randn(1, self.spectral_frames, 385, device=self.device)
+            else:
+                x0 = torch.randn(1, self.atoms_frames, 129, device=self.device)
+
             pred = self.model.generate(
-                x0=x0, 
-                encoded_past=encoded_past, 
-                clap_context=context, 
+                x0=x0,
+                encoded_past=encoded_past,
+                clap_context=context,
                 structure_vector=structure,
                 max_nfe=NFE,
                 cfg_scale=cfg_scale
-            ) 
-            
-            timeline[t]["atom_generated"] = pred.transpose(1, 2)
+            )
+
+            if self.spectral_mode:
+                latent_spec = pred[:, :, :384]
+                latent_time = spectral_to_time(latent_spec, self.atoms_frames).to(self.device)
+                scale_spec = pred[:, :, 384:]
+                scale_val = scale_spec.mean(dim=1, keepdim=True)
+                scale_time = scale_val.expand(-1, self.atoms_frames, -1)
+                pred_time = torch.cat([latent_time, scale_time], dim=-1)
+                timeline[t]["atom_generated"] = pred_time.transpose(1, 2)
+            else:
+                timeline[t]["atom_generated"] = pred.transpose(1, 2)
 
         if self.verbose:
             print("✅ Generation Complete!")

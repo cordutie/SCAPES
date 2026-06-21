@@ -1,0 +1,6 @@
+filename,start_sec,end_sec,flag
+rain.wav,0,6,gentle_rain
+river.wav,2,10,flowing_river
+bonfire.wav,0,8,campfire_crackle
+forest.wav,5,15,deep_forest
+keyboard.wav,0,4,typing_sound

@@ -5,6 +5,9 @@ dev/
 0. introduction.ipynb
 *.sh
 *.log
+demo/
+demo_gradio/
+demo_streamlit/
 
 # Ignore audio files and results
 *.wav

@@ -9,7 +9,11 @@ from pathlib import Path
 import math
 import matplotlib.pyplot as plt
 
-from SCAPES.auxiliar.losses_flow import flow_matching_loss, time_phase_regularizer, fft_phase_regularizer
+from SCAPES.auxiliar.losses_flow import (
+    flow_matching_loss, spectral_flow_matching_loss,
+    time_phase_regularizer, fft_phase_regularizer,
+    time_to_spectral, spectral_to_time,
+)
 from SCAPES.data.config_loader import TrainingConfig
 from SCAPES.models.factorization.AtomDiscriminator import AtomDiscriminator
 
@@ -43,7 +47,13 @@ class FlowTrainer:
         self.conditioning_dropout = config.conditioning_dropout
 
         # Data-derived params (read from the dataset, not from gin)
-        self.frame_dim = 129
+        self.spectral_mode = config.spectral_representation
+        if self.spectral_mode:
+            self.spectral_frames = dataset.atoms_frames // 2 + 1
+            self.frame_dim = 385  # 128*3 + 1
+        else:
+            self.spectral_frames = dataset.atoms_frames
+            self.frame_dim = 129
         self.context_vector_dim = 1024
         self.num_past_atoms = dataset.memory_buffer_atoms
         self.atom_frames = dataset.atoms_frames
@@ -84,11 +94,19 @@ class FlowTrainer:
         if self.use_structure:
             self.model_config["structure_feature_names"] = getattr(self.dataset, "structure_feature_names", None)
 
+        # ─── Regularizers — incompatible with spectral representation ───
+        self.regularizers_and_weights = config.regularizers_and_weights
+        if self.spectral_mode and self.regularizers_and_weights:
+            raise ValueError(
+                "Regularizers (time_phase, fft_phase) are incompatible with spectral_representation=True. "
+                "Phase is learned explicitly in the spectral domain. "
+                "Set training.regularizers_and_weights = [] or remove them from training.gin."
+            )
+
         # ─── Adversarial discriminator (optional, 2-stage) ───
         self.use_discriminator = config.use_discriminator
         self.disc_epochs = config.disc_epochs
         self.stage2_epochs = config.stage2_epochs
-        self.regularizers_and_weights = config.regularizers_and_weights
         self.x_hat_buffer = []          # buffer of (X_hat_latent, s) pairs for discriminator
         self.adv_buffer_max = 5000      # max samples in buffer
         self.adv_loss_fn = nn.BCEWithLogitsLoss(reduction='none')
@@ -140,8 +158,12 @@ class FlowTrainer:
 
         self._save_inference_gin()
 
-        self.train_losses = {"total": [], "latent": [], "scale": []}
-        self.val_losses   = {"total": [], "latent": [], "scale": []}
+        if self.spectral_mode:
+            self.train_losses = {"total": [], "mag": [], "cos": [], "sin": [], "scale": []}
+            self.val_losses   = {"total": [], "mag": [], "cos": [], "sin": [], "scale": []}
+        else:
+            self.train_losses = {"total": [], "latent": [], "scale": []}
+            self.val_losses   = {"total": [], "latent": [], "scale": []}
 
         if resume_from is not None and resume_from is not False:
             resolved_path = self._resolve_resume_path(resume_from)
@@ -242,6 +264,14 @@ class FlowTrainer:
             lines.append("# ─── Structure features ───")
             lines.append(f"structure.features = {struct_names}")
 
+        if self.spectral_mode:
+            lines.extend([
+                "",
+                "# ─── Spectral representation ───",
+                "training.spectral_representation = True",
+                f"atoms.spectral_frames = {self.spectral_frames}",
+            ])
+
         lines.extend([
             "",
             "# ─── Inference defaults ───",
@@ -256,14 +286,27 @@ class FlowTrainer:
         past_latent = batch["memory_buffer_latent"].to(self.device)
         past_scale = batch["memory_buffer_scale"].to(self.device)
 
-        past_scale_exp = past_scale.unsqueeze(-1).expand(
-            -1, -1, -1, self.atom_frames
-        )
+        if self.spectral_mode:
+            # Transform past latents to spectral domain
+            B, N = past_latent.shape[:2]
+            past_latent_flat = past_latent.reshape(B * N, 128, self.atom_frames).transpose(1, 2)
+            past_spec_flat = time_to_spectral(past_latent_flat)
+            past_spec = past_spec_flat.reshape(B, N, self.spectral_frames, 384).transpose(2, 3)
 
-        past_memory = torch.cat(
-            [past_latent, past_scale_exp],
-            dim=2
-        )
+            past_scale_exp = past_scale.unsqueeze(-1).expand(
+                -1, -1, -1, self.spectral_frames
+            )
+
+            past_memory = torch.cat([past_spec, past_scale_exp], dim=2)
+        else:
+            past_scale_exp = past_scale.unsqueeze(-1).expand(
+                -1, -1, -1, self.atom_frames
+            )
+
+            past_memory = torch.cat(
+                [past_latent, past_scale_exp],
+                dim=2
+            )
 
         present_latent = batch["target_latent"].to(self.device)
         present_scale = batch["target_scale"].to(self.device)
@@ -296,8 +339,23 @@ class FlowTrainer:
     def _plot_and_save_losses(self, current_epoch):
         has_val = self.val_loader is not None
 
+        if self.spectral_mode:
+            loss_types = [
+                ("total", "Total Loss", "tab:purple"),
+                ("mag", "Magnitude Loss", "tab:blue"),
+                ("cos", "Cos-Phase Loss", "tab:orange"),
+                ("sin", "Sin-Phase Loss", "tab:red"),
+                ("scale", "Scale Loss", "tab:green"),
+            ]
+        else:
+            loss_types = [
+                ("total", "Total Loss", "tab:purple"),
+                ("latent", "Latent Loss", "tab:blue"),
+                ("scale", "Scale Loss", "tab:green"),
+            ]
+
+        cols = len(loss_types)
         rows = 2 if has_val else 1
-        cols = 3
 
         fig, axes = plt.subplots(rows, cols, figsize=(cols * 5, rows * 4))
 
@@ -305,12 +363,6 @@ class FlowTrainer:
             axes = axes.reshape(1, -1)
 
         epochs_x = range(1, current_epoch + 1)
-
-        loss_types = [
-            ("total", "Total Loss", "tab:purple"),
-            ("latent", "Latent Loss", "tab:blue"),
-            ("scale", "Scale Loss", "tab:green")
-        ]
 
         for col_idx, (key, title, color) in enumerate(loss_types):
             axes[0, col_idx].plot(epochs_x, self.train_losses[key], label=f"Train {title}", color=color, linewidth=2)
@@ -339,6 +391,8 @@ class FlowTrainer:
         self.local_encoder.train()
         total_loss = 0
         total_lat_loss = 0
+        total_cos_loss = 0
+        total_sin_loss = 0
         total_scale_loss = 0
         total_adv_loss = 0
         total_reg_loss = 0
@@ -378,13 +432,21 @@ class FlowTrainer:
                         mask[b, :num_drop] = True
                 encoded_past = torch.where(mask, self.model.null_past_embed, encoded_past)
 
-            noise = torch.randn_like(present_target)
-            loss, l_lat, l_scale, X_hat, s = flow_matching_loss(
-                self.model, noise, present_target, context, encoded_past,
-                structure_vector=structure
-            )
+            if self.spectral_mode:
+                noise = torch.randn(present_target.size(0), self.spectral_frames, self.frame_dim,
+                                    device=self.device)
+                loss, l_mag, l_cos, l_sin, l_scale, X_hat, s = spectral_flow_matching_loss(
+                    self.model, noise, present_target, context, encoded_past,
+                    structure_vector=structure
+                )
+            else:
+                noise = torch.randn_like(present_target)
+                loss, l_lat, l_scale, X_hat, s = flow_matching_loss(
+                    self.model, noise, present_target, context, encoded_past,
+                    structure_vector=structure
+                )
 
-            # Regularizers (additional loss terms on the final-atom estimate)
+            # Regularizers (only used in non-spectral mode; blocked by validation in __init__)
             reg_loss = torch.tensor(0.0, device=self.device)
             for fn, weight in active_regularizers:
                 reg_loss += weight * fn(X_hat, present_target, s)
@@ -407,8 +469,14 @@ class FlowTrainer:
             self.optimizer.step()
 
             total_loss += combined_loss.item()
-            total_lat_loss += l_lat.item()
-            total_scale_loss += l_scale.item()
+            if self.spectral_mode:
+                total_lat_loss += l_mag.item()
+                total_cos_loss += l_cos.item()
+                total_sin_loss += l_sin.item()
+                total_scale_loss += l_scale.item()
+            else:
+                total_lat_loss += l_lat.item()
+                total_scale_loss += l_scale.item()
             total_reg_loss += reg_loss.item()
 
             # Collect adversarial data for next discriminator round
@@ -423,11 +491,20 @@ class FlowTrainer:
                         s[:take].detach().cpu().reshape(take, 1)
                     ))
 
-            postfix = {
-                "L": f"{combined_loss.item():.4f}",
-                "Lat": f"{l_lat.item():.4f}",
-                "Sca": f"{l_scale.item():.4f}",
-            }
+            if self.spectral_mode:
+                postfix = {
+                    "L": f"{combined_loss.item():.4f}",
+                    "Mag": f"{l_mag.item():.4f}",
+                    "Cos": f"{l_cos.item():.4f}",
+                    "Sin": f"{l_sin.item():.4f}",
+                    "Sca": f"{l_scale.item():.4f}",
+                }
+            else:
+                postfix = {
+                    "L": f"{combined_loss.item():.4f}",
+                    "Lat": f"{l_lat.item():.4f}",
+                    "Sca": f"{l_scale.item():.4f}",
+                }
             if reg_loss.item() > 0:
                 postfix["Reg"] = f"{reg_loss.item():.4f}"
             if adv_loss is not None:
@@ -435,7 +512,11 @@ class FlowTrainer:
             pbar.set_postfix(postfix)
 
         n = len(self.train_loader)
-        return total_loss / n, total_lat_loss / n, total_scale_loss / n, total_adv_loss / n, total_reg_loss / n
+        if self.spectral_mode:
+            return (total_loss / n, total_lat_loss / n, total_cos_loss / n,
+                    total_sin_loss / n, total_scale_loss / n, total_adv_loss / n, total_reg_loss / n)
+        else:
+            return total_loss / n, total_lat_loss / n, total_scale_loss / n, total_adv_loss / n, total_reg_loss / n
 
     @torch.no_grad()
     def val_epoch(self):
@@ -446,31 +527,42 @@ class FlowTrainer:
         self.local_encoder.eval()
         total_loss = 0
         total_lat = 0
+        total_cos = 0
+        total_sin = 0
         total_scale = 0
 
         for batch in self.val_loader:
             past_memory, present_target, context, structure = self._prepare_batch(batch)
             encoded_past = self.local_encoder(past_memory)
-            noise = torch.randn_like(present_target)
 
-            loss, l_lat, l_scale, _, _ = flow_matching_loss(
-                self.model,
-                noise,
-                present_target,
-                context,
-                encoded_past,
-                structure_vector=structure
-            )
+            if self.spectral_mode:
+                noise = torch.randn(present_target.size(0), self.spectral_frames, self.frame_dim,
+                                    device=self.device)
+                _, l_mag, l_cos, l_sin, l_scale, _, _ = spectral_flow_matching_loss(
+                    self.model, noise, present_target, context, encoded_past,
+                    structure_vector=structure
+                )
+                loss = l_mag + l_cos + l_sin + l_scale
+                total_loss += loss.item()
+                total_lat += l_mag.item()
+                total_cos += l_cos.item()
+                total_sin += l_sin.item()
+                total_scale += l_scale.item()
+            else:
+                noise = torch.randn_like(present_target)
+                loss, l_lat, l_scale, _, _ = flow_matching_loss(
+                    self.model, noise, present_target, context, encoded_past,
+                    structure_vector=structure
+                )
+                total_loss += loss.item()
+                total_lat += l_lat.item()
+                total_scale += l_scale.item()
 
-            total_loss += loss.item()
-            total_lat += l_lat.item()
-            total_scale += l_scale.item()
-
-        return (
-            total_loss / len(self.val_loader),
-            total_lat / len(self.val_loader),
-            total_scale / len(self.val_loader)
-        )
+        n = len(self.val_loader)
+        if self.spectral_mode:
+            return total_loss / n, total_lat / n, total_cos / n, total_sin / n, total_scale / n
+        else:
+            return total_loss / n, total_lat / n, total_scale / n
 
     @torch.no_grad()
     def generate_validation_audio(self, epoch, NFE=32):
@@ -531,17 +623,31 @@ class FlowTrainer:
                 _prepared = self._prepare_batch(raw_batch)
                 gt_past, _, context, structure = _prepared[:4]
 
-                x0 = torch.randn(1, self.atom_frames, 129, device=self.device)
+                if self.spectral_mode:
+                    x0 = torch.randn(1, self.spectral_frames, self.frame_dim, device=self.device)
+                else:
+                    x0 = torch.randn(1, self.atom_frames, 129, device=self.device)
 
                 enc_tf = self.local_encoder(gt_past)
-                tf_pred = self.model.generate(
+                tf_pred_raw = self.model.generate(
                     x0,
                     enc_tf,
                     context,
                     structure_vector=structure,
                     max_nfe=NFE,
                     cfg_scale=self.model_config['cfg_scale']
-                ).transpose(1, 2)
+                )
+
+                if self.spectral_mode:
+                    # Convert spectral output to time domain
+                    latent_spec = tf_pred_raw[:, :, :384]
+                    latent_time = spectral_to_time(latent_spec, self.atom_frames)
+                    scale_spec = tf_pred_raw[:, :, 384:]
+                    scale_val = scale_spec.mean(dim=1, keepdim=True)
+                    scale_time = scale_val.expand(-1, self.atom_frames, -1)
+                    tf_pred = torch.cat([latent_time, scale_time], dim=-1).transpose(1, 2)
+                else:
+                    tf_pred = tf_pred_raw.transpose(1, 2)
 
                 tf_pred_smooth = tf_pred.clone()
                 raw_scale = torch.abs(tf_pred[:, 128, :]).mean(dim=-1, keepdim=True)
@@ -712,17 +818,28 @@ class FlowTrainer:
             print(f"\n=== Stage 1 — Epoch {global_epoch} ===")
 
             collect_adv = self.use_discriminator and (epoch == epochs)
-            avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = self.train_epoch(
-                collect_adv=collect_adv
-            )
+            train_out = self.train_epoch(collect_adv=collect_adv)
 
-            self.train_losses["total"].append(avg_t_total)
-            self.train_losses["latent"].append(avg_t_lat)
-            self.train_losses["scale"].append(avg_t_scale)
-            self.train_losses.setdefault("adv", []).append(avg_t_adv)
-            self.train_losses.setdefault("reg", []).append(avg_t_reg)
+            if self.spectral_mode:
+                (avg_t_total, avg_t_mag, avg_t_cos, avg_t_sin,
+                 avg_t_scale, avg_t_adv, avg_t_reg) = train_out
+                self.train_losses["total"].append(avg_t_total)
+                self.train_losses["mag"].append(avg_t_mag)
+                self.train_losses["cos"].append(avg_t_cos)
+                self.train_losses["sin"].append(avg_t_sin)
+                self.train_losses["scale"].append(avg_t_scale)
+                self.train_losses.setdefault("adv", []).append(avg_t_adv)
+                self.train_losses.setdefault("reg", []).append(avg_t_reg)
+                parts = [f"Train | Total: {avg_t_total:.4f} (Mag: {avg_t_mag:.4f}, Cos: {avg_t_cos:.4f}, Sin: {avg_t_sin:.4f}, Sca: {avg_t_scale:.4f}"]
+            else:
+                avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = train_out
+                self.train_losses["total"].append(avg_t_total)
+                self.train_losses["latent"].append(avg_t_lat)
+                self.train_losses["scale"].append(avg_t_scale)
+                self.train_losses.setdefault("adv", []).append(avg_t_adv)
+                self.train_losses.setdefault("reg", []).append(avg_t_reg)
+                parts = [f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}"]
 
-            parts = [f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}"]
             if avg_t_reg > 0:
                 parts.append(f"Reg: {avg_t_reg:.6f}")
             if avg_t_adv > 0:
@@ -730,11 +847,21 @@ class FlowTrainer:
             print(", ".join(parts) + ")")
 
             if self.val_loader is not None:
-                avg_v_total, avg_v_lat, avg_v_scale = self.val_epoch()
-                self.val_losses["total"].append(avg_v_total)
-                self.val_losses["latent"].append(avg_v_lat)
-                self.val_losses["scale"].append(avg_v_scale)
-                print(f"Val   | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
+                val_out = self.val_epoch()
+                if self.spectral_mode:
+                    avg_v_total, avg_v_mag, avg_v_cos, avg_v_sin, avg_v_scale = val_out
+                    self.val_losses["total"].append(avg_v_total)
+                    self.val_losses["mag"].append(avg_v_mag)
+                    self.val_losses["cos"].append(avg_v_cos)
+                    self.val_losses["sin"].append(avg_v_sin)
+                    self.val_losses["scale"].append(avg_v_scale)
+                    print(f"Val   | Total: {avg_v_total:.4f} (Mag: {avg_v_mag:.4f}, Cos: {avg_v_cos:.4f}, Sin: {avg_v_sin:.4f}, Sca: {avg_v_scale:.4f})")
+                else:
+                    avg_v_total, avg_v_lat, avg_v_scale = val_out
+                    self.val_losses["total"].append(avg_v_total)
+                    self.val_losses["latent"].append(avg_v_lat)
+                    self.val_losses["scale"].append(avg_v_scale)
+                    print(f"Val   | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
                 current_metric = avg_v_total
             else:
                 current_metric = avg_t_total
@@ -784,24 +911,44 @@ class FlowTrainer:
             print(f"  ─── Part B: Train generator (adversarial) ───")
 
             self.x_hat_buffer = []
-            avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = self.train_epoch(
-                discriminator=disc, collect_adv=True
-            )
+            train_out = self.train_epoch(discriminator=disc, collect_adv=True)
 
-            self.train_losses["total"].append(avg_t_total)
-            self.train_losses["latent"].append(avg_t_lat)
-            self.train_losses["scale"].append(avg_t_scale)
-            self.train_losses.setdefault("adv", []).append(avg_t_adv)
-            self.train_losses.setdefault("reg", []).append(avg_t_reg)
-
-            print(f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}, Adv: {avg_t_adv:.6f}, Reg: {avg_t_reg:.6f})")
+            if self.spectral_mode:
+                (avg_t_total, avg_t_mag, avg_t_cos, avg_t_sin,
+                 avg_t_scale, avg_t_adv, avg_t_reg) = train_out
+                self.train_losses["total"].append(avg_t_total)
+                self.train_losses["mag"].append(avg_t_mag)
+                self.train_losses["cos"].append(avg_t_cos)
+                self.train_losses["sin"].append(avg_t_sin)
+                self.train_losses["scale"].append(avg_t_scale)
+                self.train_losses.setdefault("adv", []).append(avg_t_adv)
+                self.train_losses.setdefault("reg", []).append(avg_t_reg)
+                print(f"Train | Total: {avg_t_total:.4f} (Mag: {avg_t_mag:.4f}, Cos: {avg_t_cos:.4f}, Sin: {avg_t_sin:.4f}, Sca: {avg_t_scale:.4f}, Adv: {avg_t_adv:.6f}, Reg: {avg_t_reg:.6f})")
+            else:
+                avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = train_out
+                self.train_losses["total"].append(avg_t_total)
+                self.train_losses["latent"].append(avg_t_lat)
+                self.train_losses["scale"].append(avg_t_scale)
+                self.train_losses.setdefault("adv", []).append(avg_t_adv)
+                self.train_losses.setdefault("reg", []).append(avg_t_reg)
+                print(f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}, Adv: {avg_t_adv:.6f}, Reg: {avg_t_reg:.6f})")
 
             if self.val_loader is not None:
-                avg_v_total, avg_v_lat, avg_v_scale = self.val_epoch()
-                self.val_losses["total"].append(avg_v_total)
-                self.val_losses["latent"].append(avg_v_lat)
-                self.val_losses["scale"].append(avg_v_scale)
-                print(f"Val   | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
+                val_out = self.val_epoch()
+                if self.spectral_mode:
+                    avg_v_total, avg_v_mag, avg_v_cos, avg_v_sin, avg_v_scale = val_out
+                    self.val_losses["total"].append(avg_v_total)
+                    self.val_losses["mag"].append(avg_v_mag)
+                    self.val_losses["cos"].append(avg_v_cos)
+                    self.val_losses["sin"].append(avg_v_sin)
+                    self.val_losses["scale"].append(avg_v_scale)
+                    print(f"Val   | Total: {avg_v_total:.4f} (Mag: {avg_v_mag:.4f}, Cos: {avg_v_cos:.4f}, Sin: {avg_v_sin:.4f}, Sca: {avg_v_scale:.4f})")
+                else:
+                    avg_v_total, avg_v_lat, avg_v_scale = val_out
+                    self.val_losses["total"].append(avg_v_total)
+                    self.val_losses["latent"].append(avg_v_lat)
+                    self.val_losses["scale"].append(avg_v_scale)
+                    print(f"Val   | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
                 current_metric = avg_v_total
             else:
                 current_metric = avg_t_total

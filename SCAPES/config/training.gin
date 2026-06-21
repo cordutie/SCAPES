@@ -40,5 +40,11 @@ training.checkpoint_freq = 15
 # Regularizers: list of [name, weight] pairs (e.g. [["time_phase", 0.1], ["fft_phase", 0.05]])
 training.regularizers_and_weights = [["time_phase", 1], ["fft_phase", 0.1]]
 
+# Spectral representation (experimental):
+# When True, latents are transformed via rFFT → log-mag / cos / sin in the frequency domain,
+# and the model learns the spectral velocity field directly. At inference, iFFT reconstructs
+# the time-domain atoms. Incompatible with regularizers (phase is learned explicitly).
+# training.spectral_representation = True
+
 # Inference defaults
 inference.cfg_scale = 3.0

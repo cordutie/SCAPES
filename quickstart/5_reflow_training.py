@@ -22,6 +22,7 @@ sys.path.insert(0, str(repo_root))
 
 from SCAPES.data.dataset import AtomSequenceDataset
 from SCAPES.data.config_loader import load_dataprep_config, load_training_config
+from SCAPES.data.dataprep.semantic import build_semantics_folder
 from SCAPES.auxiliar.encodec_wrapper import EncodecProcessor
 from SCAPES.models.factorization import LocalEncoder
 from SCAPES.models.flow import FlowModel
@@ -74,6 +75,16 @@ def main():
 
     if val_loader is None:
         print("No validation split — training without validation.")
+
+    # Build semantics folder from cherry-picking CSV (for the demo)
+    cherry_csv = pathlib.Path(args.path) / "config" / "cherry_picking.csv"
+    if cherry_csv.exists():
+        build_semantics_folder(
+            csv_path=cherry_csv,
+            semantic_dir=pathlib.Path(args.path) / "annotations" / "semantic",
+            output_dir=pathlib.Path(args.save_path) / "semantics",
+            dataset=dataset,
+        )
 
     frame_dim = 129
     context_vector_dim = 1024
