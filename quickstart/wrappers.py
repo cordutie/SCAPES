@@ -173,8 +173,10 @@ def training_loop(DATASET_PATH, MODEL_PATH):
 
     # Save the final model
 
+    import subprocess
+
     zip_path = f"{MODEL_PATH.rstrip('/')}.zip"
     # zip the file
-    !zip -r "{zip_path}" "{MODEL_PATH}"
+    subprocess.run(["zip", "-r", zip_path, MODEL_PATH],check=True)
     print(f"Created: {zip_path}")
 
