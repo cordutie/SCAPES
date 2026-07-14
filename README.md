@@ -1,86 +1,88 @@
 # SCAPES
 
-**SCAPES** (Semantically Conditioned Auto-Regressive Prior for Environmental Sounds) is a lightweight generative audio framework for high-fidelity environmental texture synthesis with **semantic control**.
+**SCAPES** (Semantically Conditioned Auto-Regressive Prior for Environmental Sounds) is a generative audio framework for high-fidelity environmental texture synthesis with semantic control.
 
-It combines:
-- continuous EnCodec latent representations,
-- CLAP-based semantic conditioning,
-- a Transformer-parameterized Continuous Normalizing Flow (CNF),
-- and segment-level autoregressive generation with overlap-aware decoding.
+## Features
 
-This repository includes the core library, quickstart scripts, experiment notebooks, and model/data organization used in the paper workflow.
+- **Semantic control** with CLAP-based conditioning (no manual labels)
+- **Continuous latent generation** (no token quantization bottleneck)
+- **Efficient training** on consumer GPUs
+- **Long-term texture stability** in autoregressive generation
+- **Smooth semantic interpolation** between environmental classes
 
----
+## Demo
 
-## Why SCAPES?
+[![HuggingFace Spaces](https://img.shields.io/badge/%F0%9F%A4%97-HuggingFace%20Spaces-yellow)](https://huggingface.co/spaces/cordutie/SCAPES-demo)
 
-SCAPES is built for open, small-scale, reproducible generative audio research:
+Try the online demo to generate environmental sounds with semantic control.
 
-- **Semantic control with no manual labels** (CLAP-based conditioning).
-- **Continuous latent generation** (no token quantization bottleneck).
-- **Efficient training** on consumer GPUs.
-- **Strong long-term texture stability** in autoregressive generation.
-- **Smooth semantic interpolation** between environmental classes.
+## Quick Start
 
----
+### Simplified Tutorial
 
-## TLDR Method
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cordutie/SCAPES/blob/main/quickstart/tutorial_simplified.ipynb) 
 
-1. **Audio → atoms**: audio is segmented into overlapping windows and encoded with EnCodec into latent representations (+ scale). We call this an atom.
-2. **Semantic context**: CLAP embeddings are precomputed to be used as conditioning semantic context.
-3. **Flow training**: a conditional CNF (Flow Matching objective) learns to generate the next atom from past atoms + semantic context.
-4. **Autoregressive synthesis**: atoms are generated iteratively and stitched using overlap-and-add with crossfade masking.
+Train with default parameters and generate sounds quickly.
 
----
+
+### Full Tutorial
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cordutie/SCAPES/blob/main/quickstart/tutorial_full.ipynb) 
+
+Dive deep into the code and customize the training loop.
 
 ## Installation
 
-### 1) Create/activate environment
-
-Use your preferred environment manager. Example with `venv`:
-
 ```bash
-cd /path/to/SCAPES
+# Create environment
 python -m venv .venv
-source .venv/bin/activate
-```
+source .venv/bin/activate  # Linux/Mac
+# .venv\Scripts\activate   # Windows
 
-### 2) Install dependencies
-
-```bash
+# Install dependencies
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Current `requirements.txt` includes:
-- `torch`, `torchaudio`, `torchdiffeq`
-- `librosa`, `soundfile`, `numpy`, `matplotlib`, `tqdm`
-- `transformers`
+> **Note**: You may need to install a CUDA-specific PyTorch build first depending on your setup.
 
-> Note: depending on your CUDA/driver setup, you may want to install a CUDA-specific PyTorch build first.
+## Pipeline
 
----
+1. **Audio → Atoms**: Segment audio into overlapping windows and encode with EnCodec
+2. **Semantic Context**: Precompute CLAP embeddings for conditioning
 
-## Quickstart pipeline notebooks
+<p align="center">
+  <img src="SCAPES/auxiliar/figures/dataprep.svg" width="100%" alt="Data Preparation Pipeline">
+</p>
 
-You can quickly prepare your data and train a model using the quickstart notebook. Use the quickstart notebooks in this exact order:
+3. **Flow Training**: Train conditional CNF (Flow Matching) to generate atoms from context
+4. **Autoregressive Synthesis**: Generate atoms iteratively with overlap-and-add crossfade
 
-1. `quickstart/1. dataprep.ipynb`  
-	Build atoms, splits, and annotations.
-2. `quickstart/2. training.ipynb`  
-	Train the flow model.
-3. `quickstart/3. inference.ipynb`  
-	Run generation/resynthesis and inspect outputs.
+<p align="center">
+  <img src="SCAPES/auxiliar/figures/architecture.svg" width="100%" alt="SCAPES Architecture">
+</p>
 
----
+## Future Work
+
+Potential areas for collaboration:
+
+- **New Audio Codecs**: Explore alternatives to EnCodec
+- **Perceptual Losses**: Train surrogate losses beyond MSE for latent comparison
+- **Alternative Conditioning**: Experiment with features beyond CLAP
 
 ## Acknowledgments
 
-SCAPES builds on a rich ecosystem including EnCodec, CLAP, Neural ODE/CNF methods, flow matching and Freesound.
+This work has been supported by the project "IA y Música: Cá-tedra en Inteligencia Artificial y Música (TSI-100929-2023-1)", funded by the "Secretaría de Estado de Digitalización e Inteligencia Artificial and the Unión Europea-Next Generation EU". We also acknowledge support from NVIDIA Corporation and Meta through academic grant programs. Additionally, we would like to express our sincere gratitude to Daniela Quimis, Clara Charbonnier, Jan Pol Obrador, Marcel Manzano, Omar Hamze, Jordi Fabregat, Eduard Herrera, and Eric Mas, for their valuable insights into extending the model to diverse audio sources, exploring alternative training techniques, and helping shape the design of an intuitive demonstration of SCAPES.
 
-## Future work
+## Citation
 
-There is a lot of future work to be done in SCAPES in case anyone wants to collaborate in extending the capacities of the model. The following is a list of options:
-1. New Neural Audio Codecs appear every year. Maybe EnCodec is not the best one suited for the job anymore?
-2. Currently SCAPES uses a MSE loss to compare EnCodec latents, however this loss has proven to be not enough in some scenarios. Maybe one could train a surrogate loss that learns how to replicate other perceptual audio losses between audio latents.
-3. Currently SCAPES is conditioned on CLAP. A lot of exploration could be made by trying other conditioning features.
+If you use SCAPES in your research, please cite:
+
+```bibtex
+@inproceedings{scapes,
+  title     = {Semantically Conditioned Autoregresive Prior for Environmental Sounds},
+  author    = {Esteban Gutiérrez and Lonce Wyse and Frederic Font and Xavier Serra},
+  booktitle = {Proceedings of the International Conference on Digital Audio Effects (DAFx)},
+  year      = {2026},
+  address   = {Cambridge, USA}
+}
+```
