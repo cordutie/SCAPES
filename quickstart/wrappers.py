@@ -5,7 +5,7 @@ from SCAPES.data.config_loader import load_dataprep_config
 from SCAPES.data.dataprep import atoms_maker, precompute_semantic_annotations, precompute_structure_annotations
 from SCAPES.data.dataset import AtomSequenceDataset
 
-def dataprep(DATASET_PATH):
+def data_preparation(DATASET_PATH):
     dataset_path = pathlib.Path(DATASET_PATH).resolve()
     config = load_dataprep_config(dataset_path / "config" / "dataprep.gin")
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -69,7 +69,7 @@ from SCAPES.training.FlowModel_trainer import FlowTrainer
 from SCAPES.models.factorization import LocalEncoder
 from SCAPES.models.flow import FlowModel
 
-def train(DATASET_PATH, MODEL_PATH):
+def training_loop(DATASET_PATH, MODEL_PATH):
     # DATASET INITIALIZATION ---------------------------------------------------------------------------
 
     resume_from = None  # or "latest", "best"
