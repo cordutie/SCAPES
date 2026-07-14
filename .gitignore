@@ -8,6 +8,8 @@ dev/
 demo/
 demo_gradio/
 demo_streamlit/
+build_semantics.py
+lorea/
 
 # Ignore audio files and results
 *.wav
