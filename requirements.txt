@@ -1,10 +1,24 @@
-torchdiffeq
-torch
-torchaudio
-librosa
-numpy
-matplotlib
-soundfile
-transformers
+# Self-consistent requirements for using SCAPES as a library.
+#
+# numpy is capped below 2.0 on purpose: msclap requires numpy<2.0, and
+# numba/scipy/matplotlib are compiled against the numpy 1.x extension layout, so
+# letting a bare `numpy` float to 2.x breaks imports of this package.
+#
+# msclap is pinned to 1.3.4 because 1.3.1-1.3.3 depend on numba<0.59, which
+# cannot be satisfied alongside a modern numba.
+#
+# The HF Spaces demo (../SCAPES-demo) deliberately deviates: it needs
+# transformers>=5, so it installs msclap with --no-deps at runtime and pins the
+# numerical stack in constraints.txt. See backend/__init__.py there.
+torchdiffeq==0.2.5
+torch>=2.1
+torchaudio>=2.1
+librosa>=0.10.2
+numpy>=1.23,<2.0
+scipy>=1.2
+matplotlib>=3.5
+soundfile>=0.12.1
+pandas>=2.0.0,<3.0.0
+transformers>=4.34,<5
 tqdm
-msclap
+msclap==1.3.4
