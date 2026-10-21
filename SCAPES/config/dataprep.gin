@@ -1,10 +1,11 @@
-# SCAPES config.gin template
-# Copy to <dataset>/config/config.gin and edit as needed.
-
-# Atom geometry
-atoms.frames = 48
-atoms.hop_frames = 15
-atoms.crossfade_frames = 3
+# SCAPES dataprep template (V2)
+# Copy to <dataset>/config/dataprep.gin and edit as needed. The codec, the generation mode and the geometry come from
+# a snippet in config/codecs/ (append its lines, or let pipeline.build_run_config do it). All durations are in seconds;
+# frame counts are not accepted (they mean different times for different codecs).
+#
+# The snippet sets: codec.name, generation.mode and
+#   atoms mode:  atoms.seconds, atoms.hop_seconds, atoms.crossfade_seconds, dataset.memory_buffer_atoms
+#   AR mode:     ar.block_seconds, ar.memory_seconds, (optional) ar.stride_seconds, ar.prefix_seconds
 
 # Semantic conditioning
 semantic.context_seconds = 1.0
@@ -23,13 +24,11 @@ structure.features = [
 # Precomputation (CLAP + structure)
 precompute.batch_size = 128
 
-# Split controls (optional)
-splits.train_split = None
-splits.val_split = None
+# Time split per file: train [0, 1 - val - reserve), val, reserve (the last part, never used for training or selection)
 splits.val_split_ratio = 0.1
+splits.reserve_ratio = 0.1
 
-# Dataset sliding window
-dataset.memory_buffer_atoms = 3
+# Dataset sliding window (atoms mode: distance between targets in atoms)
 dataset.hop_atoms = 1
 
 # Misc

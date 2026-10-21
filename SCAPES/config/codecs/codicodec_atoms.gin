@@ -1,0 +1,10 @@
+# CoDiCodec, atoms mode: whole chunks (0.743 s); 1.0 s -> 2 chunks, 0.1 s -> 1 chunk
+codec.name = "codicodec"
+generation.mode = "atoms"
+atoms.seconds = 1.0
+atoms.hop_seconds = 0.10
+atoms.crossfade_seconds = 0.05
+dataset.memory_buffer_atoms = 1
+# training
+training.standardize_latents = True
+training.past_noise = 0.0

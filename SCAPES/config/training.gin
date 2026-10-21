@@ -8,12 +8,16 @@ model.size = "large"
 # model.num_layers = 12
 # model.dim_feedforward = 2048
 
-# LocalEncoder (in_channels=129 is implicit — same as frame_dim, a codec constant)
+# LocalEncoder (in_channels is implicit: frame_dim, a codec constant)
 local_encoder.hidden_dim = 256
 local_encoder.time_entanglement = True
 local_encoder.temporal_compression = 1
 
 # Training hyperparameters
+# The codec snippet sets training.standardize_latents and training.past_noise.
+# training.max_steps = 2000    # step budget; without it the run uses epochs (with V1 patience)
+# training.log_every = 50
+# training.seed = 0
 training.epochs = 75
 training.batch_size = 128
 training.learning_rate = 1e-4

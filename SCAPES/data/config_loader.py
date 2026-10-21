@@ -4,33 +4,71 @@ from pathlib import Path
 from typing import Optional
 
 
+class ConfigError(ValueError):
+    """A gin file is missing a required line, has an invalid value or uses a rejected key."""
+
+
+MODES = ("atoms", "autoregressive")
+
+# V1 frame counts per second and the keys that replaced them (150 Hz, 320 samples per frame at 48 kHz).
+_V1_RATE = 150.0
+_REJECTED_FRAME_KEYS = {
+    ("atoms", "frames"): "atoms.seconds",
+    ("atoms", "hop_frames"): "atoms.hop_seconds",
+    ("atoms", "crossfade_frames"): "atoms.crossfade_seconds",
+}
+
+
+def frames_to_seconds_text(frames) -> str:
+    """V1 frames -> seconds at 150 Hz, up to 6 decimals, no trailing zeros (48 -> 0.32, 15 -> 0.1)."""
+    text = f"{float(frames) / _V1_RATE:.6f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
 @dataclass
 class DataprepConfig:
-    atoms_frames: int = 48
-    atoms_hop_frames: int = 15
-    atoms_crossfade_frames: int = 3
+    # Codec and generation mode (required)
+    codec_name: Optional[str] = None
+    generation_mode: Optional[str] = None
+    # Atoms mode geometry, in seconds
+    atoms_seconds: Optional[float] = None
+    atoms_hop_seconds: Optional[float] = None
+    atoms_crossfade_seconds: Optional[float] = None
+    memory_buffer_atoms: Optional[int] = None
+    # Autoregressive mode geometry, in seconds (one past window and the present block)
+    ar_block_seconds: Optional[float] = None
+    ar_memory_seconds: Optional[float] = None
+    ar_stride_seconds: Optional[float] = None
+    ar_prefix_seconds: float = 0.0
     semantic_context_seconds: float = 1.0
     semantic_random_extension: bool = True
     structure_features: list = field(default_factory=list)
     precompute_batch_size: int = 128
     val_split_ratio: float = 0.1
+    reserve_split_ratio: float = 0.1
     train_split: Optional[str] = None
     val_split: Optional[str] = None
-    memory_buffer_atoms: int = 3
     hop_atoms: int = 1
     seed: int = 42
     device: str = "auto"
 
 
 _GIN_MAP = [
-    (["atoms", "frames"], "atoms_frames"),
-    (["atoms", "hop_frames"], "atoms_hop_frames"),
-    (["atoms", "crossfade_frames"], "atoms_crossfade_frames"),
+    (["codec", "name"], "codec_name"),
+    (["generation", "mode"], "generation_mode"),
+    (["atoms", "seconds"], "atoms_seconds"),
+    (["atoms", "hop_seconds"], "atoms_hop_seconds"),
+    (["atoms", "crossfade_seconds"], "atoms_crossfade_seconds"),
+    (["ar", "block_seconds"], "ar_block_seconds"),
+    (["ar", "memory_seconds"], "ar_memory_seconds"),
+    (["ar", "stride_seconds"], "ar_stride_seconds"),
+    (["ar", "prefix_seconds"], "ar_prefix_seconds"),
     (["semantic", "context_seconds"], "semantic_context_seconds"),
     (["semantic", "random_extension"], "semantic_random_extension"),
     (["structure", "features"], "structure_features"),
     (["precompute", "batch_size"], "precompute_batch_size"),
     (["splits", "val_split_ratio"], "val_split_ratio"),
+    (["splits", "reserve_ratio"], "reserve_split_ratio"),
     (["splits", "train_split"], "train_split"),
     (["splits", "val_split"], "val_split"),
     (["dataset", "memory_buffer_atoms"], "memory_buffer_atoms"),
@@ -174,12 +212,57 @@ def load_dataprep_config(gin_path: Path) -> DataprepConfig:
         raise FileNotFoundError(f"Gin config not found: {path}")
 
     raw = parse_gin_config(path)
+    _check_rejected_keys(raw, path)
     cfg = DataprepConfig()
     for keys, attr in _GIN_MAP:
         val = _get_nested(raw, keys, None)
         if val is not None:
             setattr(cfg, attr, val)
+    _check_required(cfg, path)
     return cfg
+
+
+# Frame lines and the old AR key are not accepted in user gin files; the message gives the seconds equivalent.
+def _check_rejected_keys(raw, path):
+    for keys, new_key in _REJECTED_FRAME_KEYS.items():
+        val = _get_nested(raw, list(keys), None)
+        if val is not None:
+            old_key = ".".join(keys)
+            raise ConfigError(
+                f"{path}: '{old_key}' is not accepted any more (durations are in seconds, so they do not depend on the "
+                f"codec). At V1's 150 Hz it is: {new_key} = {frames_to_seconds_text(val)}. "
+                f"scripts/migrate_v1_gin.py converts a whole file."
+            )
+    if _get_nested(raw, ["ar", "context_seconds"], None) is not None:
+        raise ConfigError(f"{path}: 'ar.context_seconds' was renamed ar.memory_seconds (one past window).")
+
+
+def _check_required(cfg, path):
+    from audio_codec_wrappers import list_codecs
+
+    if cfg.codec_name is None:
+        raise ConfigError(f"{path}: 'codec.name' is required, one of {list_codecs()}")
+    if cfg.generation_mode is None:
+        raise ConfigError(f"{path}: 'generation.mode' is required, one of {list(MODES)}")
+    if cfg.generation_mode not in MODES:
+        raise ConfigError(f"{path}: generation.mode = {cfg.generation_mode!r} is invalid, choose from {list(MODES)}")
+    if cfg.generation_mode == "atoms":
+        missing = [k for k, v in [("atoms.seconds", cfg.atoms_seconds), ("atoms.hop_seconds", cfg.atoms_hop_seconds),
+                                  ("dataset.memory_buffer_atoms", cfg.memory_buffer_atoms)] if v is None]
+        if missing:
+            raise ConfigError(f"{path}: atoms mode requires {missing}")
+        if cfg.atoms_crossfade_seconds is None:
+            cfg.atoms_crossfade_seconds = 0.0
+    else:
+        missing = [k for k, v in [("ar.block_seconds", cfg.ar_block_seconds), ("ar.memory_seconds", cfg.ar_memory_seconds)]
+                   if v is None]
+        if missing:
+            raise ConfigError(f"{path}: autoregressive mode requires {missing}")
+        if cfg.memory_buffer_atoms is not None:
+            raise ConfigError(
+                f"{path}: dataset.memory_buffer_atoms has no meaning in autoregressive mode (one past window, no atom "
+                f"count); remove it and set ar.memory_seconds."
+            )
 
 
 def _get_nested(config, keys, default=None):
@@ -254,6 +337,13 @@ class TrainingConfig:
     # in the frequency domain before flow matching, and iFFT'd back at inference time.
     spectral_representation: bool = False
 
+    # V2: per-channel standardisation of the latents, noise on the past (gamma), step budget, logging, seed
+    standardize_latents: bool = False
+    past_noise: float = 0.0
+    max_steps: Optional[int] = None   # None -> epochs with V1 patience
+    log_every: int = 50
+    seed: Optional[int] = None
+
 
 _TRAINING_GIN_MAP = [
     (["model", "size"], "size"),
@@ -281,6 +371,11 @@ _TRAINING_GIN_MAP = [
     (["training", "stage2_epochs"], "stage2_epochs"),
     (["training", "regularizers_and_weights"], "regularizers_and_weights"),
     (["training", "spectral_representation"], "spectral_representation"),
+    (["training", "standardize_latents"], "standardize_latents"),
+    (["training", "past_noise"], "past_noise"),
+    (["training", "max_steps"], "max_steps"),
+    (["training", "log_every"], "log_every"),
+    (["training", "seed"], "seed"),
 ]
 
 
