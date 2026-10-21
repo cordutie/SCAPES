@@ -120,7 +120,7 @@ def test_ola_equals_v1(tmp_path):
 
 def test_frame_dim_and_key(tmp_path):
     from SCAPES.data.geometry import representation_key
-    for stem, (*_, fd, scale, key) in DEFAULTS.items():
+    for stem, (*_, fd, scale, _dec, key) in DEFAULTS.items():
         g = _template_geom(tmp_path, stem)
         assert g.frame_dim == fd
         assert g.frame_dim == g.latent_dim + int(g.has_scale)
