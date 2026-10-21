@@ -4,88 +4,63 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from SCAPES.auxiliar.clap_wrapper import CLAPWrapper
+from SCAPES.data.representations import grid_starts_48k
+from audio_codec_wrappers.audio import adapt_audio, load_audio
+
+CLAP_VERSION = "2023"
 
 
-def precompute_semantic_annotations(
-    dataset,
-    model=None,
-    batch_size: int = 32,
-    device: str = "auto",
-):
+# Raw audio of a file as stereo float32 [2, N] at 48 kHz
+def load_audio_48k(path) -> torch.Tensor:
+    x, sr = load_audio(path)
+    return adapt_audio(x, sr, 48000, 2)[0]
+
+
+# Default embedder: the CLAP wrapper, [B, 2, n] at 48 kHz -> [B, 1024]
+def make_clap_embedder(device="cuda", random_extension=True):
+    from SCAPES.auxiliar.clap_wrapper import CLAPWrapper
+    model = CLAPWrapper(version=CLAP_VERSION, use_cuda=str(device).startswith("cuda"))
+
+    def embed(audio, sr):
+        return model.compute_embedding(audio, og_sr=sr, random_extension=random_extension)
+
+    return embed
+
+
+def precompute_semantic_annotations(dataset, embedder=None, batch_size: int = 128, device: str = "auto"):
     """
-    Computes CLAP embeddings from target_context_audio and saves them to:
-    annotations/semantic/semantic_<idx>.pt
+    CLAP embedding of the context window that starts at every grid start g * stride_frames of every file.
+    One [G, 1024] float32 array per file, stored under clap/<clap_key>/ of the representation.
+    embedder: Callable[[Tensor[B, 2, n] at 48 kHz, int], Tensor[B, 1024]].
     """
-    if dataset.annotations_dir is None:
-        raise ValueError("Dataset annotations_dir is not set.")
-
-    save_dir = dataset.annotations_dir / "semantic"
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    print("\n--- Starting Semantic Pre-computation ---")
-    print(f"Save Path: {save_dir}")
-
-    if device in [None, "auto"]:
-        device = getattr(dataset, "device", "cpu")
-
-    if model is None:
-        use_cuda = device == "cuda"
-        model = CLAPWrapper(version="2023", use_cuda=use_cuda)
-
+    if device in (None, "auto"):
+        device = dataset.device
+    if embedder is None:
+        embedder = make_clap_embedder(device, dataset.semantic_random_extension)
+    store, geom, key = dataset.store, dataset.geom, dataset.clap_key
+    window = dataset.context_samples
+    print(f"\n--- CLAP pre-computation ({key}) ---")
     with torch.no_grad():
-        for i in tqdm(range(0, len(dataset), batch_size), desc="Processing semantic"):
-            batch_inputs = []
-            indices_to_compute = []
-
-            for j in range(batch_size):
-                idx = i + j
-                if idx >= len(dataset):
-                    break
-
-                save_path = save_dir / f"semantic_{idx}.pt"
-                if save_path.exists():
-                    continue
-
-                indices_to_compute.append(idx)
-                raw_audio = dataset.get_raw_audio(idx, part="context")
-                batch_inputs.append(raw_audio)
-
-            if not indices_to_compute:
+        for fname in tqdm(dataset.filenames, desc="CLAP"):
+            path = dataset.audio_path(fname)
+            if store.has_grid_array("clap", key, path):
                 continue
-
-            batched_audio = torch.stack(batch_inputs).to(device)
-            random_extension = getattr(dataset, "semantic_random_extension", True)
-            embedding = model.compute_embedding(
-                batched_audio,
-                og_sr=dataset.sr,
-                random_extension=random_extension,
-            )
-
-            embedding = embedding.detach().cpu()
-
-            for k, idx in enumerate(indices_to_compute):
-                save_path = save_dir / f"semantic_{idx}.pt"
-                torch.save(embedding[k], save_path)
-
-    print("✅ Semantic annotations saved.")
+            audio = load_audio_48k(path)
+            starts = grid_starts_48k(audio.shape[-1], geom, window)
+            out = []
+            for i in range(0, len(starts), batch_size):
+                batch = torch.stack([audio[:, int(s): int(s) + window] for s in starts[i: i + batch_size]]).to(device)
+                out.append(embedder(batch, 48000).detach().float().cpu())
+            arr = torch.cat(out) if out else torch.zeros(0, 1024)
+            store.save_grid_array("clap", key, path, arr)
+    print("CLAP embeddings saved.")
 
 
-def build_semantics_folder(
-    csv_path,
-    semantic_dir,
-    output_dir,
-    dataset,
-    overwrite: bool = False,
-) -> int:
+def build_semantics_folder(csv_path, output_dir, dataset, overwrite: bool = False) -> int:
     """
-    Reads config/cherry_picking.csv and extracts precomputed CLAP embeddings
-    for the specified (file, time_range) segments, saving each as a stacked
-    tensor [N, 1024] to output_dir/{flag}.pt, plus semantics.csv.
-
-    CSV columns: filename, start_sec, end_sec, flag, icon, description
-
-    Returns number of flags created.
+    Reads the cherry-picking CSV (columns filename, start_sec, end_sec, flag, icon, description) and writes, for each
+    row, the stored CLAP vectors of the grid starts g * stride_frames / frame_rate in [start_sec, end_sec) as a
+    [N, 1024] tensor to output_dir/{flag}.pt, plus semantics.csv. Returns the number of flags created.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -94,30 +69,19 @@ def build_semantics_folder(
         print(f"  Cherry-picking CSV not found: {csv_path}; skipping.")
         return 0
 
-    semantic_dir = Path(semantic_dir)
-
-    # Build filename lookup (handle both "file.wav" and "file")
-    fname_to_manifest = {}
+    # filename lookup (handles both "file.wav" and "file")
+    lookup = {}
     for fname in dataset.filenames:
-        fname_to_manifest[fname] = fname
-        fname_to_manifest[Path(fname).stem] = fname
+        lookup[fname] = fname
+        lookup[Path(fname).stem] = fname
 
-    # Build per-filename reverse lookup: filename → [(index, start_atom), ...]
-    idx_to_entry = {idx: entry for idx, entry in enumerate(dataset.all_indices)}
-    file_to_indices: dict[str, list[tuple[int, int]]] = {}
-    for idx, (fname, start) in idx_to_entry.items():
-        file_to_indices.setdefault(fname, []).append((idx, start))
-
-    hop_sec = dataset.atoms_hop_frames / dataset.frame_rate
-
+    store, geom, key = dataset.store, dataset.geom, dataset.clap_key
     print(f"\n--- Building semantics folder ---")
     print(f"  CSV:     {csv_path}")
     print(f"  Output:  {output_dir}")
 
     with open(csv_path, "r") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-
+        rows = list(csv.DictReader(f))
     if not rows:
         print("  CSV is empty; nothing to do.")
         return 0
@@ -125,34 +89,28 @@ def build_semantics_folder(
     csv_rows_out = []
     created = 0
     skipped = 0
-
     for row in rows:
         raw_name = row.get("filename", "").strip()
         if not raw_name:
             skipped += 1
             continue
-
-        manifest_name = fname_to_manifest.get(raw_name) or fname_to_manifest.get(
-            raw_name + ".wav"
-        )
-        if manifest_name is None:
-            print(f"  ⚠️  File '{raw_name}' not found in manifest; skipping.")
+        name = lookup.get(raw_name) or lookup.get(raw_name + ".wav")
+        if name is None:
+            print(f"  File '{raw_name}' not found in the index; skipping.")
             skipped += 1
             continue
-
         try:
             start_sec = float(row["start_sec"])
             end_sec = float(row["end_sec"])
         except (KeyError, ValueError):
-            print(f"  ⚠️  Invalid start_sec/end_sec for '{raw_name}'; skipping.")
+            print(f"  Invalid start_sec/end_sec for '{raw_name}'; skipping.")
             skipped += 1
             continue
 
         flag = row.get("flag", "").strip()
         if not flag:
             flag = f"{Path(raw_name).stem}_{start_sec}_{end_sec}"
-            print(f"  ⚠️  No flag for '{raw_name}' [{start_sec}, {end_sec}]; using '{flag}'")
-
+            print(f"  No flag for '{raw_name}' [{start_sec}, {end_sec}]; using '{flag}'")
         icon = row.get("icon", "").strip()
         description = row.get("description", "").strip()
 
@@ -160,70 +118,30 @@ def build_semantics_folder(
         if out_path.exists() and not overwrite:
             skipped += 1
             continue
-
         if end_sec <= start_sec:
-            print(f"  ⚠️  Empty range [{start_sec}, {end_sec}] for '{raw_name}'; skipping.")
+            print(f"  Empty range [{start_sec}, {end_sec}] for '{raw_name}'; skipping.")
             skipped += 1
             continue
 
-        # Compute atom range
-        start_atom = int(start_sec / hop_sec)
-        end_atom = int(end_sec / hop_sec)
-
-        # Collect matching indices
-        matching_indices: list[int] = []
-        entries = file_to_indices.get(manifest_name, [])
-        for idx, atom_pos in entries:
-            if start_atom <= atom_pos < end_atom:
-                matching_indices.append(idx)
-
-        if not matching_indices:
-            print(
-                f"  ⚠️  No semantic embeddings for '{raw_name}' "
-                f"[{start_sec}, {end_sec}]s; skipping."
-            )
+        # grid vectors whose start time lies in [start_sec, end_sec)
+        arr = store.load_grid_array("clap", key, dataset.audio_path(name))
+        times = torch.arange(arr.shape[0], dtype=torch.float64) * geom.stride_frames / geom.frame_rate
+        chosen = (times >= start_sec) & (times < end_sec)
+        if not bool(chosen.any()):
+            print(f"  No semantic embeddings for '{raw_name}' [{start_sec}, {end_sec}]s; skipping.")
             skipped += 1
             continue
 
-        # Load and stack embeddings
-        embeddings = []
-        for idx in matching_indices:
-            emb_path = semantic_dir / f"semantic_{idx}.pt"
-            if not emb_path.exists():
-                continue
-            embeddings.append(torch.load(emb_path, map_location="cpu", weights_only=True))
-
-        if not embeddings:
-            print(f"  ⚠️  No valid embeddings for '{raw_name}' [{start_sec}, {end_sec}]; skipping.")
-            skipped += 1
-            continue
-
-        stacked = torch.stack(embeddings)
-        torch.save(stacked, out_path)
+        torch.save(arr[chosen].contiguous().clone(), out_path)
         csv_rows_out.append({"name": flag, "icon": icon, "description": description})
         created += 1
-        print(f"  ✓ {flag}.pt — {len(embeddings)} embeddings")
+        print(f"  {flag}.pt: {int(chosen.sum())} embeddings")
 
-    # Write semantics.csv (overwrite always — it's a derived artifact)
-    csv_out_path = output_dir / "semantics.csv"
-    with open(csv_out_path, "w", newline="") as f:
+    # semantics.csv is a derived artifact, always rewritten
+    with open(output_dir / "semantics.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["name", "icon", "description"])
         writer.writeheader()
         writer.writerows(csv_rows_out)
 
-    print(f"✅ Semantics folder done: {created} created, {skipped} skipped.")
+    print(f"Semantics folder done: {created} created, {skipped} skipped.")
     return created
-
-
-def precompute_gui_annotations(dataset):
-    """Deprecated: use build_semantics_folder instead."""
-    csv_path = Path(dataset.dataset_path) / "config" / "cherry_picking.csv"
-    if not csv_path.exists():
-        return
-    save_dir = dataset.annotations_dir / "GUI"
-    build_semantics_folder(
-        csv_path=csv_path,
-        semantic_dir=dataset.annotations_dir / "semantic",
-        output_dir=save_dir,
-        dataset=dataset,
-    )

@@ -5,6 +5,9 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from SCAPES.data.dataprep.semantic import load_audio_48k
+from SCAPES.data.representations import frames_to_samples_48k, grid_starts_48k
+
 
 def _ensure_mono(audio: torch.Tensor) -> torch.Tensor:
     if audio.dim() == 1:
@@ -189,58 +192,43 @@ def _compute_structure_features(
         return (stacked.mean(dim=-1)) # [features]
     return stacked
 
-def precompute_structure_annotations(
-    dataset,
-    batch_size: int = 1,
-    device: str = "auto",
-    n_fft: Optional[int] = None,
-    hop_length: Optional[int] = None,
-    feature_names: Optional[List[str]] = None,
-):
+def structure_key(features, geom) -> str:
+    return f"{'+'.join(features)}__u{geom.unit_frames}__stride{geom.stride_frames}"
+
+
+def precompute_structure_annotations(dataset, batch_size: int = 1, device: str = "auto", feature_names=None):
     """
-    Computes placeholder DSP features from target_audio and saves them to:
-    annotations/structure/structure_<idx>.pt
+    DSP features of the target audio (unit_frames long) that starts at every grid start g * stride_frames, averaged over
+    the unit. One [G, n_feat] float32 array per file, stored under structure/<key>/ of the representation. G counts the
+    grid starts whose target audio fits in the file. Does nothing when no features are configured.
     """
-    mean_pooling = dataset.structure_mean_pooling
-
-    if dataset.annotations_dir is None:
-        raise ValueError("Dataset annotations_dir is not set.")
-
-    if device in [None, "auto"]:
-        device = getattr(dataset, "device", "cpu")
-
-    if n_fft is None:
-        n_fft = getattr(dataset, "structure_n_fft", max(256, dataset.samples_per_frame * 4))
-    if hop_length is None:
-        hop_length = getattr(dataset, "structure_hop_length", dataset.samples_per_frame)
     if feature_names is None:
-        feature_names = getattr(dataset, "structure_feature_names", None)
-    save_dir = dataset.annotations_dir / "structure"
-    save_dir.mkdir(parents=True, exist_ok=True)
+        feature_names = dataset.structure_feature_names
+    if not feature_names:
+        print("\nSkipping structure annotations (no features configured).")
+        return
+    if device in (None, "auto"):
+        device = dataset.device
+    store, geom = dataset.store, dataset.geom
+    key = structure_key(feature_names, geom)
+    # V1 analysis settings, with the frame length of the codec at 48 kHz
+    hop48 = int(round(geom.hop_length * 48000 / geom.sample_rate))
+    n_fft = max(256, hop48 * 4)
+    window = int(frames_to_samples_48k(geom.unit_frames, geom))
 
-    print("\n--- Starting Structure Pre-computation ---")
-    print(f"Save Path: {save_dir}")
-
-    for i in tqdm(range(0, len(dataset), batch_size), desc="Processing structure"):
-        for j in range(batch_size):
-            idx = i + j
-            if idx >= len(dataset):
-                break
-
-            save_path = save_dir / f"structure_{idx}.pt"
-            if save_path.exists():
-                continue
-
-            raw_audio = dataset.get_raw_audio(idx, part="target").to(device)
-            features = _compute_structure_features(
-                raw_audio,
-                sr=dataset.sr,
-                atoms_frames=dataset.atoms_frames,
-                n_fft=n_fft,
-                hop_length=hop_length,
-                feature_names=feature_names,
-                mean_pooling=mean_pooling,
-            )
-            torch.save(features.detach().cpu(), save_path)
-
-    print("✅ Structure annotations saved.")
+    print(f"\n--- Structure pre-computation ({key}) ---")
+    for fname in tqdm(dataset.filenames, desc="Processing structure"):
+        path = dataset.audio_path(fname)
+        if store.has_grid_array("structure", key, path):
+            continue
+        audio = load_audio_48k(path)
+        starts = grid_starts_48k(audio.shape[-1], geom, window)
+        rows = []
+        for s in starts:
+            seg = audio[:, int(s): int(s) + window].to(device)
+            feats = _compute_structure_features(seg, sr=48000, atoms_frames=geom.unit_frames, n_fft=n_fft,
+                                                hop_length=hop48, feature_names=list(feature_names), mean_pooling=True)
+            rows.append(feats.detach().float().cpu().reshape(-1))
+        arr = torch.stack(rows) if rows else torch.zeros(0, len(feature_names))
+        store.save_grid_array("structure", key, path, arr)
+    print("Structure annotations saved.")
