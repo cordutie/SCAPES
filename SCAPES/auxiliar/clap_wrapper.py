@@ -17,6 +17,9 @@ class CLAPWrapper(CLAPWrapper):
         if audio.dim() != 3:
             raise ValueError(f"Expected audio tensor to have 3 dimensions (Batch, Channels, Time), but got {audio.shape}")
         clap_sr = self.args.sampling_rate
+        # The model sits on the GPU when use_cuda: move CPU input there (no-op for CUDA input)
+        if self.use_cuda and torch.cuda.is_available():
+            audio = audio.cuda()
         # Resampling + mono if needed
         audio = resample_and_mono_audio(audio, og_sr, clap_sr, mono=True)
         # Extend/trim to 8 seconds
