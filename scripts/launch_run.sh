@@ -9,10 +9,10 @@ run=$(realpath "$2")
 repo=$(cd "$(dirname "$0")/.." && pwd)
 python="$repo/../venv_SCAPES/bin/python"
 
-cmd="cd $repo && setsid nohup $python -c \"from SCAPES.pipeline import run_training; run_training('$dataset', '$run/model', config_dir='$run/config')\" > $run/train.log 2>&1 < /dev/null &"
+cmd="cd $repo && setsid nohup $python -u -c \"from SCAPES.pipeline import run_training; run_training('$dataset', '$run/model', config_dir='$run/config')\" > $run/train.log 2>&1 < /dev/null &"
 echo "$cmd" > "$run/command.txt"
 cd "$repo"
-setsid nohup "$python" -c "from SCAPES.pipeline import run_training; run_training('$dataset', '$run/model', config_dir='$run/config')" \
+setsid nohup "$python" -u -c "from SCAPES.pipeline import run_training; run_training('$dataset', '$run/model', config_dir='$run/config')" \
     > "$run/train.log" 2>&1 < /dev/null &
 echo $! > "$run/pid"
 echo "started pid $(cat "$run/pid"), log $run/train.log"
