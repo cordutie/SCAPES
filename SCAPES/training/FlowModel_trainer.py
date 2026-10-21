@@ -88,6 +88,9 @@ class FlowTrainer:
         self._last_val_per_file = {}
         self._patience = None        # (best_ref, patience) of the running stage, set by _run_epoch
         self._stop_requested = False  # set by _validate when patience ran out (val_every_steps mode)
+        self._val_count = 0           # validations run so far (val_every_steps mode saves "last" only after one)
+        self.nonfinite_steps = 0      # optimizer steps skipped because the loss or grad norm was not finite
+        self.max_consecutive_nonfinite = 5
 
         # Geometry and dimensions come from the dataset, not from gin
         self.geom = geom = dataset.geom
@@ -525,6 +528,7 @@ class FlowTrainer:
         ep = {k: zero.clone() for k in keys}
         win = {k: zero.clone() for k in keys}
         n_steps = n_win = 0
+        consecutive_bad = 0
 
         # Validation inside the epoch: every val_every_steps steps if set, else (only with max_steps) every 500 steps
         # in epochs longer than 500 steps
@@ -595,6 +599,17 @@ class FlowTrainer:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 list(self.model.parameters()) + list(self.local_encoder.parameters()), 1.0
             )
+            # Non-finite loss or grad norm: skip the step (the weights stay clean), count it, abort after a streak
+            if not bool((torch.isfinite(grad_norm) & torch.isfinite(combined_loss.detach())).item()):
+                self.nonfinite_steps += 1
+                consecutive_bad += 1
+                print(f"⚠️ non-finite loss or grad norm at step {self.global_step + 1}: optimizer step skipped "
+                      f"({consecutive_bad} in a row, {self.nonfinite_steps} in total)")
+                if consecutive_bad >= self.max_consecutive_nonfinite:
+                    raise RuntimeError(f"Training aborted: {consecutive_bad} consecutive non-finite steps "
+                                       f"(loss or grad norm is NaN/inf) at step {self.global_step + 1}")
+                continue
+            consecutive_bad = 0
             self.optimizer.step()
 
             # Accumulate detached values; they are read only at the log points
@@ -914,6 +929,7 @@ class FlowTrainer:
             self.logger.log_val(self.global_step, self._last_val_per_file)
 
         self._last_val_metric = avg_v_total
+        self._val_count += 1
         # val_every_steps mode: patience counts validations (not epochs); off when max_steps is set, as before
         if self.val_every_steps is not None and self._patience is not None and self.max_steps is None:
             best_ref, patience = self._patience
@@ -961,8 +977,9 @@ class FlowTrainer:
     def _max_steps_reached(self):
         return self.max_steps is not None and self.global_step >= self.max_steps
 
-    def _epoch_bookkeeping(self, global_epoch, audio_val_freq, val_nfe):
-        """Shared checkpoint/save/log logic after each epoch (the best checkpoint is saved in _validate)."""
+    def _epoch_bookkeeping(self, global_epoch, audio_val_freq, val_nfe, save_last=True):
+        """Shared checkpoint/save/log logic after each epoch (the best checkpoint is saved in _validate).
+        save_last=False skips the last_* files (val_every_steps mode, epochs without a validation)."""
         trainer_state = self._trainer_state(global_epoch) if self.save_resume_states else None
 
         ckpt_freq = self.checkpoint_freq
@@ -977,10 +994,11 @@ class FlowTrainer:
         if (global_epoch) % audio_val_freq == 0:
             self.generate_validation_audio(global_epoch, NFE=val_nfe)
 
-        torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "last_flow_model.pt")
-        torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "last_local_encoder.pt")
-        if self.save_resume_states:
-            torch.save(trainer_state, self.ckpt_dir / "last_trainer_state.pt")
+        if save_last:
+            torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "last_flow_model.pt")
+            torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "last_local_encoder.pt")
+            if self.save_resume_states:
+                torch.save(trainer_state, self.ckpt_dir / "last_trainer_state.pt")
 
         history_path = self.loss_dir / "loss_history.json"
         with open(history_path, "w") as f:
@@ -995,6 +1013,7 @@ class FlowTrainer:
     # Returns True if training must stop (max_steps reached, or patience exhausted).
     def _run_epoch(self, global_epoch, audio_val_freq, val_nfe, patience, best_ref, discriminator=None, collect_adv=False):
         self._patience = (best_ref, patience)
+        val_count_before = self._val_count
         train_out = self.train_epoch(discriminator=discriminator, collect_adv=collect_adv)
         self._record_train(train_out)
         if self.val_every_steps is None:
@@ -1002,7 +1021,9 @@ class FlowTrainer:
         else:
             # validations happen every val_every_steps inside train_epoch; one more at the end only when max_steps stops the run
             metric = self._validate() if self._max_steps_reached() else None
-        self._epoch_bookkeeping(global_epoch, audio_val_freq, val_nfe)
+        # val_every_steps mode: "last" (weights and resume state) only in epochs where a validation ran
+        save_last = self.val_every_steps is None or self.val_loader is None or self._val_count > val_count_before
+        self._epoch_bookkeeping(global_epoch, audio_val_freq, val_nfe, save_last=save_last)
         self.start_epoch += 1
 
         if self.val_every_steps is not None and self._stop_requested:
