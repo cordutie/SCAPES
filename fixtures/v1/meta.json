@@ -1,0 +1,9 @@
+{
+  "git_head": "5304260145f0bcdd2f6542528415c659eaa3e745",
+  "git_main": "5304260145f0bcdd2f6542528415c659eaa3e745",
+  "pip_freeze": "requirements.pre_v2.lock",
+  "torch": "2.10.0+cu128",
+  "numpy": "1.26.4",
+  "cudnn": 91002,
+  "gpu": "NVIDIA GeForce RTX 4090"
+}

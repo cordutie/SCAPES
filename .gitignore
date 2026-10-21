@@ -1,5 +1,4 @@
 # Non-publishable code
-tests/
 slowstart/
 dev/
 0. introduction.ipynb
@@ -22,6 +21,7 @@ datasets/
 
 # But do NOT ignore .pt files in weights/ and its subfolders
 !SCAPES/**/*.pt
+!fixtures/v1/*.pt
 
 # Ignore Python cache files
 __pycache__/
