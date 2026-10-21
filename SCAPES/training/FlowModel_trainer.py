@@ -1,13 +1,12 @@
 import os
 import json
+import math
 import torch
 import torch.nn as nn
-import torchaudio
-import soundfile as sf
 from tqdm import tqdm
 from pathlib import Path
-import math
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
 
 from SCAPES.auxiliar.losses_flow import (
     flow_matching_loss, spectral_flow_matching_loss,
@@ -16,6 +15,39 @@ from SCAPES.auxiliar.losses_flow import (
 )
 from SCAPES.data.config_loader import TrainingConfig
 from SCAPES.models.factorization.AtomDiscriminator import AtomDiscriminator
+from SCAPES.training.run_logging import RunLogger
+
+# Deterministic validation (design D17): four stratified flow times per validation sample
+VAL_S_VALUES = (0.125, 0.375, 0.625, 0.875)
+
+
+# ==========================================
+# PAST DROPOUT AND PAST NOISE
+# ==========================================
+
+# Atoms: with probability p the oldest j ~ U{1..M} past units are masked (V1 rule). bool [batch, M], a prefix from index 0.
+def past_dropout_mask(batch_size: int, M: int, p: float, device="cpu") -> torch.Tensor:
+    rows = torch.rand(batch_size, device=device) < p
+    j = torch.randint(1, M + 1, (batch_size,), device=device)
+    return rows[:, None] & (torch.arange(M, device=device)[None, :] < j[:, None])
+
+
+# AR (one window of W frames, blocks of B): with probability p the oldest W - k*B frames are masked, k ~ U{0..ceil(W/B)-1}.
+# These are the histories that exist at generation start. bool [batch, W], a prefix from the oldest frame.
+def past_dropout_frame_mask(batch_size: int, W: int, B: int, p: float, device="cpu") -> torch.Tensor:
+    rows = torch.rand(batch_size, device=device) < p
+    k = torch.randint(0, math.ceil(W / B), (batch_size,), device=device)
+    length = W - k * B
+    return rows[:, None] & (torch.arange(W, device=device)[None, :] < length[:, None])
+
+
+# Exposure-bias noise on the past: past + alpha * xi, alpha ~ U[0, gamma] per sample, xi ~ N(0, I). Never in place.
+def apply_past_noise(past: torch.Tensor, gamma: float) -> torch.Tensor:
+    if gamma == 0:
+        return past
+    alpha = torch.rand(past.size(0), device=past.device, dtype=past.dtype) * gamma
+    alpha = alpha.view(-1, *([1] * (past.dim() - 1)))
+    return past + alpha * torch.randn_like(past)
 
 
 class FlowTrainer:
@@ -45,31 +77,49 @@ class FlowTrainer:
         self.context_source = config.context_source
         self.past_dropout = config.past_dropout
         self.conditioning_dropout = config.conditioning_dropout
+        self.past_noise = config.past_noise
+        self.max_steps = config.max_steps
+        self.log_every = config.log_every
+        self.batch_size = config.batch_size
+        self.global_step = 0
+        self._last_val_step = None
+        self._last_val_metric = None
+        self._last_val_per_file = {}
 
-        # Data-derived params (read from the dataset, not from gin)
+        # Geometry and dimensions come from the dataset, not from gin
+        self.geom = geom = dataset.geom
+        self.mode = geom.mode
+        self.n_latent = geom.latent_dim
+        self.has_scale = geom.has_scale
+        self.unit_frames = geom.unit_frames          # F (atoms) | B (AR)
+        self.prefix_frames = geom.prefix_frames      # o (AR clean-prefix fallback)
+        self.num_past_atoms = geom.memory_units      # M (atoms) | 1 (AR)
+        self.memory_frames = geom.memory_frames      # F (atoms) | W (AR)
+        self.atom_frames = geom.unit_frames
+        self.context_vector_dim = 1024
+        self.structure_dim = len(dataset.structure_feature_names)
+
         self.spectral_mode = config.spectral_representation
         if self.spectral_mode:
-            self.spectral_frames = dataset.atoms_frames // 2 + 1
+            if geom.codec != "encodec48k":
+                raise NotImplementedError("spectral_representation is only available for encodec48k (D13)")
+            self.spectral_frames = self.unit_frames // 2 + 1
             self.frame_dim = 385  # 128*3 + 1
+            model_frames = self.spectral_frames
         else:
-            self.spectral_frames = dataset.atoms_frames
-            self.frame_dim = 129
-        self.context_vector_dim = 1024
-        self.num_past_atoms = dataset.memory_buffer_atoms
-        self.atom_frames = dataset.atoms_frames
-        self.atoms_hop_frames = dataset.atoms_hop_frames
-        self.crossfade_frames = dataset.crossfade_frames
-        self.structure_dim = dataset.structure_feature_dimension
+            self.spectral_frames = self.unit_frames
+            self.frame_dim = geom.frame_dim
+            model_frames = self.unit_frames + self.prefix_frames
+        if config.use_discriminator and geom.codec != "encodec48k":
+            raise NotImplementedError("use_discriminator is only available for encodec48k (D13)")
 
         # Build config dicts for JSON serialization
         self.model_config = {
             "frame_dim": self.frame_dim,
             "context_vector_dim": self.context_vector_dim,
             "num_past_atoms": self.num_past_atoms,
-            "frames_per_atom": self.atom_frames,
-            "atoms_hop_frames": self.atoms_hop_frames,
-            "crossfade_frames": self.crossfade_frames,
-            "context_seconds": dataset.context_seconds,
+            "frames_per_atom": model_frames,
+            "memory_frames": self.memory_frames,
             "semantic_random_extension": dataset.semantic_random_extension,
             "d_model": config.d_model,
             "nhead": config.nhead,
@@ -85,8 +135,11 @@ class FlowTrainer:
             "time_entanglement": config.local_encoder_time_entanglement,
             "temporal_compression": config.local_encoder_temporal_compression,
         }
+        if self.mode == "autoregressive" and config.local_encoder_temporal_compression != 1:
+            raise NotImplementedError("autoregressive mode needs local_encoder.temporal_compression = 1 "
+                                      "(one encoded frame per latent frame)")
 
-        self.use_structure = dataset.structure_feature_dimension > 0
+        self.use_structure = self.structure_dim > 0
 
         if self.use_structure and "target_structure" not in self.dataset.requested_keys:
             raise ValueError("Model expects structure but dataset does not request it")
@@ -156,7 +209,21 @@ class FlowTrainer:
                 "or set `resume_from='latest'` (or a specific epoch number) to continue training."
             )
 
+        # Per-channel standardisation of the latents: statistics of the train region, saved with the checkpoints
+        self.standardize = config.standardize_latents
+        self.mu = self.std = None
+        if self.standardize:
+            stats_path = self.ckpt_dir / "latent_stats.pt"
+            if resume_from and stats_path.exists():
+                stats = torch.load(stats_path, map_location="cpu", weights_only=True)
+            else:
+                mu, std = dataset.latent_stats(dataset.get_splits()[0])
+                stats = {"mu": mu, "std": std}
+                torch.save(stats, stats_path)
+            self.mu, self.std = stats["mu"].to(device), stats["std"].to(device)
+
         self._save_inference_gin()
+        self.logger = RunLogger(self.model_path / "logs", self.log_every)
 
         if self.spectral_mode:
             self.train_losses = {"total": [], "mag": [], "cos": [], "sin": [], "scale": []}
@@ -226,6 +293,7 @@ class FlowTrainer:
             print(f"⚠️ Could not load optimizer state: {e}")
 
         self.start_epoch = state['epoch'] + 1
+        self.global_step = state.get('global_step', 0)
         self.best_metric = state['best_metric']
 
         self.train_losses = state.get('train_losses', self.train_losses)
@@ -234,6 +302,7 @@ class FlowTrainer:
         print(f"✅ Successfully resumed! Starting at Epoch {self.start_epoch} (Best Metric so far: {self.best_metric:.4f})")
 
     def _save_inference_gin(self):
+        g = self.geom
         lines = [
             "# inference.gin — generated by SCAPES training",
             "# Load this file with FlowInference(model_dir=...) to reconstruct models and run inference.",
@@ -249,13 +318,19 @@ class FlowTrainer:
             f"local_encoder.time_entanglement = {str(self.encoder_config['time_entanglement'])}",
             f"local_encoder.temporal_compression = {self.encoder_config['temporal_compression']}",
             "",
-            "# ─── Atom geometry (from dataprep) ───",
-            f"atoms.frames = {self.model_config['frames_per_atom']}",
-            f"atoms.hop_frames = {self.model_config['atoms_hop_frames']}",
-            f"atoms.crossfade_frames = {self.model_config['crossfade_frames']}",
-            f"dataset.memory_buffer_atoms = {self.model_config['num_past_atoms']}",
-            f"dataset.context_seconds = {self.model_config['context_seconds']}",
+            "# ─── Codec and generation geometry (frames, machine-written; effective seconds in the comments) ───",
+        ]
+        lines += g.to_gin_lines()
+        f = g.frame_rate
+        if g.mode == "atoms":
+            lines += [f"# atoms.seconds = {g.unit_frames / f:.6g}", f"# atoms.hop_seconds = {g.unit_hop_frames / f:.6g}",
+                      f"# atoms.crossfade_seconds = {g.crossfade_samples / g.sample_rate:.6g}"]
+        else:
+            lines += [f"# ar.block_seconds = {g.unit_frames / f:.6g}", f"# ar.memory_seconds = {g.memory_frames / f:.6g}",
+                      f"# ar.stride_seconds = {g.stride_frames / f:.6g}", f"# ar.prefix_seconds = {g.prefix_frames / f:.6g}"]
+        lines += [
             f"dataset.semantic_random_extension = {self.model_config['semantic_random_extension']}",
+            f"training.standardize_latents = {self.standardize}",
         ]
 
         struct_names = self.model_config.get("structure_feature_names")
@@ -282,9 +357,21 @@ class FlowTrainer:
         with open(gin_path, "w") as f:
             f.write("\n".join(lines) + "\n")
 
+    # Batch -> (past [B, M, C, T], target [B, U, C], context, structure) on the device, latents standardised if asked.
+    # C = frame_dim (latents + scale channel). Deterministic: noise and dropout are applied in _encode_past.
     def _prepare_batch(self, batch):
         past_latent = batch["memory_buffer_latent"].to(self.device)
-        past_scale = batch["memory_buffer_scale"].to(self.device)
+        present_latent = batch["target_latent"].to(self.device)
+        if self.standardize:
+            d = self.n_latent
+            past_latent = (past_latent - self.mu.view(1, 1, d, 1)) / self.std.view(1, 1, d, 1)
+            present_latent = (present_latent - self.mu.view(1, d, 1)) / self.std.view(1, d, 1)
+
+        if self.has_scale:
+            past_scale = batch["memory_buffer_scale"].to(self.device)
+            present_scale = batch["target_scale"].to(self.device)
+        else:
+            past_scale = present_scale = None
 
         if self.spectral_mode:
             # Transform past latents to spectral domain
@@ -298,27 +385,25 @@ class FlowTrainer:
             )
 
             past_memory = torch.cat([past_spec, past_scale_exp], dim=2)
-        else:
+        elif self.has_scale:
             past_scale_exp = past_scale.unsqueeze(-1).expand(
-                -1, -1, -1, self.atom_frames
+                -1, -1, -1, past_latent.size(-1)
             )
 
             past_memory = torch.cat(
                 [past_latent, past_scale_exp],
                 dim=2
             )
+        else:
+            past_memory = past_latent
 
-        present_latent = batch["target_latent"].to(self.device)
-        present_scale = batch["target_scale"].to(self.device)
-
-        present_scale_exp = present_scale.unsqueeze(-1).expand(
-            -1, -1, self.atom_frames
-        )
-
-        present_target = torch.cat(
-            [present_latent, present_scale_exp],
-            dim=1
-        ).transpose(1, 2)
+        if self.has_scale:
+            present_scale_exp = present_scale.unsqueeze(-1).expand(
+                -1, -1, self.unit_frames
+            )
+            present_target = torch.cat([present_latent, present_scale_exp], dim=1).transpose(1, 2)
+        else:
+            present_target = present_latent.transpose(1, 2)
 
         if self.context_source not in ["clap", None]:
             raise ValueError(
@@ -335,6 +420,41 @@ class FlowTrainer:
             raise ValueError("Model expects structure_vector but dataset did not provide it")
 
         return past_memory, present_target, context, structure
+
+    # Past -> (encoded past [B, M, T', d_model], prefix [B, o, C] or None).
+    # train=True: past noise (latent channels), then past dropout (AR: frames zeroed before LocalEncoder; atoms: V1 rule),
+    # and the masked units/frames of the encoded past are replaced by the null embedding. The AR prefix is the last o frames
+    # of the past after noise and masking (zeros where masked), never the null embedding (R2-C5).
+    # null_past=True: every unit/frame is the null embedding and the prefix is zero (B8 falsifier).
+    def _encode_past(self, past_memory, train=False, null_past=False):
+        pm = past_memory
+        B, N, C, T = pm.shape
+        ar = self.mode == "autoregressive"
+
+        if train and self.past_noise > 0:
+            n_noisy = C - int(self.has_scale)
+            pm = torch.cat([apply_past_noise(pm[:, :, :n_noisy], self.past_noise), pm[:, :, n_noisy:]], dim=2)
+
+        mask = None
+        if null_past:
+            mask = torch.ones(B, T if ar else N, dtype=torch.bool, device=pm.device)
+        elif train and self.past_dropout > 0:
+            if ar:
+                mask = past_dropout_frame_mask(B, T, self.unit_frames, self.past_dropout, device=pm.device)
+            else:
+                mask = past_dropout_mask(B, N, self.past_dropout, device=pm.device)
+        if ar and mask is not None:
+            pm = pm * (~mask)[:, None, None, :].to(pm.dtype)
+
+        prefix = None
+        if self.prefix_frames > 0:
+            prefix = pm[:, -1, :, -self.prefix_frames:].transpose(1, 2).contiguous()
+
+        encoded_past = self.local_encoder(pm)
+        if mask is not None:
+            m = mask[:, None, :, None] if ar else mask[:, :, None, None]
+            encoded_past = torch.where(m, self.model.null_past_embed[:, :, :encoded_past.size(2)], encoded_past)
+        return encoded_past, prefix
 
     def _plot_and_save_losses(self, current_epoch):
         has_val = self.val_loader is not None
@@ -362,10 +482,8 @@ class FlowTrainer:
         if rows == 1:
             axes = axes.reshape(1, -1)
 
-        epochs_x = range(1, current_epoch + 1)
-
         for col_idx, (key, title, color) in enumerate(loss_types):
-            axes[0, col_idx].plot(epochs_x, self.train_losses[key], label=f"Train {title}", color=color, linewidth=2)
+            axes[0, col_idx].plot(range(1, len(self.train_losses[key]) + 1), self.train_losses[key], label=f"Train {title}", color=color, linewidth=2)
             axes[0, col_idx].set_title(f"Train {title}")
             axes[0, col_idx].set_xlabel("Epoch")
             axes[0, col_idx].set_ylabel("Loss")
@@ -373,9 +491,9 @@ class FlowTrainer:
             axes[0, col_idx].legend()
 
             if has_val:
-                axes[1, col_idx].plot(epochs_x, self.val_losses[key], label=f"Val {title}", color=color, linewidth=2, linestyle="--")
+                axes[1, col_idx].plot(range(1, len(self.val_losses[key]) + 1), self.val_losses[key], label=f"Val {title}", color=color, linewidth=2, linestyle="--")
                 axes[1, col_idx].set_title(f"Val {title}")
-                axes[1, col_idx].set_xlabel("Epoch")
+                axes[1, col_idx].set_xlabel("Validation")
                 axes[1, col_idx].set_ylabel("Loss")
                 axes[1, col_idx].grid(True, linestyle='--', alpha=0.6)
                 axes[1, col_idx].legend()
@@ -386,16 +504,20 @@ class FlowTrainer:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
+
     def train_epoch(self, discriminator=None, collect_adv=False):
         self.model.train()
         self.local_encoder.train()
-        total_loss = 0
-        total_lat_loss = 0
-        total_cos_loss = 0
-        total_sin_loss = 0
-        total_scale_loss = 0
-        total_adv_loss = 0
-        total_reg_loss = 0
+        zero = torch.zeros((), device=self.device)
+        # epoch sums (tensors on the device, no sync per step) and sums since the last log line
+        keys = ("total", "lat", "cos", "sin", "scale", "adv", "reg", "grad")
+        ep = {k: zero.clone() for k in keys}
+        win = {k: zero.clone() for k in keys}
+        n_steps = n_win = 0
+
+        # Validation inside long epochs (only with max_steps): every 500 steps
+        val_every = 500 if (self.max_steps is not None and self.val_loader is not None
+                            and len(self.train_loader) > 500) else None
 
         # Build regularizer list once
         active_regularizers = []
@@ -421,16 +543,7 @@ class FlowTrainer:
 
             self.optimizer.zero_grad()
 
-            encoded_past = self.local_encoder(past_memory)
-
-            if self.past_dropout > 0.0:
-                B, N_past, T_frames, d_model = encoded_past.shape
-                mask = torch.zeros((B, N_past, 1, 1), dtype=torch.bool, device=self.device)
-                for b in range(B):
-                    if torch.rand(1).item() < self.past_dropout:
-                        num_drop = torch.randint(1, N_past + 1, (1,)).item()
-                        mask[b, :num_drop] = True
-                encoded_past = torch.where(mask, self.model.null_past_embed, encoded_past)
+            encoded_past, prefix = self._encode_past(past_memory, train=True)
 
             if self.spectral_mode:
                 noise = torch.randn(present_target.size(0), self.spectral_frames, self.frame_dim,
@@ -439,51 +552,49 @@ class FlowTrainer:
                     self.model, noise, present_target, context, encoded_past,
                     structure_vector=structure
                 )
+                parts = {"lat": l_mag, "cos": l_cos, "sin": l_sin, "scale": l_scale}
             else:
                 noise = torch.randn_like(present_target)
                 loss, l_lat, l_scale, X_hat, s = flow_matching_loss(
                     self.model, noise, present_target, context, encoded_past,
-                    structure_vector=structure
+                    structure_vector=structure, n_latent=self.n_latent, has_scale=self.has_scale, prefix=prefix
                 )
+                parts = {"lat": l_lat, "scale": l_scale}
 
             # Regularizers (only used in non-spectral mode; blocked by validation in __init__)
             reg_loss = torch.tensor(0.0, device=self.device)
             for fn, weight in active_regularizers:
-                reg_loss += weight * fn(X_hat, present_target, s)
+                reg_loss += weight * fn(X_hat, present_target, s, self.n_latent)
 
             combined_loss = loss + reg_loss
 
             if discriminator is not None:
-                X_hat_latent = X_hat[:, :, :128].transpose(1, 2).contiguous()
+                X_hat_latent = X_hat[:, :, :self.n_latent].transpose(1, 2).contiguous()
                 logits = discriminator(X_hat_latent).squeeze(-1)
                 adv_loss = self.adv_loss_fn(logits, torch.zeros_like(logits)).mean()
                 combined_loss = combined_loss + adv_loss
-                total_adv_loss += adv_loss.item()
-            else:
-                adv_loss = None
+                parts["adv"] = adv_loss
 
             combined_loss.backward()
-            torch.nn.utils.clip_grad_norm_(
+            grad_norm = torch.nn.utils.clip_grad_norm_(
                 list(self.model.parameters()) + list(self.local_encoder.parameters()), 1.0
             )
             self.optimizer.step()
 
-            total_loss += combined_loss.item()
-            if self.spectral_mode:
-                total_lat_loss += l_mag.item()
-                total_cos_loss += l_cos.item()
-                total_sin_loss += l_sin.item()
-                total_scale_loss += l_scale.item()
-            else:
-                total_lat_loss += l_lat.item()
-                total_scale_loss += l_scale.item()
-            total_reg_loss += reg_loss.item()
+            # Accumulate detached values; they are read only at the log points
+            parts.update({"total": combined_loss, "reg": reg_loss, "grad": grad_norm})
+            for k, v in parts.items():
+                ep[k] += v.detach()
+                win[k] += v.detach()
+            n_steps += 1
+            n_win += 1
+            self.global_step += 1
 
             # Collect adversarial data for next discriminator round
             if collect_adv:
                 remaining = self.adv_buffer_max - len(self.x_hat_buffer)
                 if remaining > 0:
-                    X_hat_latent = X_hat[:, :, :128].transpose(1, 2).contiguous()
+                    X_hat_latent = X_hat[:, :, :self.n_latent].transpose(1, 2).contiguous()
                     B_curr = X_hat_latent.shape[0]
                     take = min(remaining, B_curr)
                     self.x_hat_buffer.append((
@@ -491,194 +602,120 @@ class FlowTrainer:
                         s[:take].detach().cpu().reshape(take, 1)
                     ))
 
-            if self.spectral_mode:
-                postfix = {
-                    "L": f"{combined_loss.item():.4f}",
-                    "Mag": f"{l_mag.item():.4f}",
-                    "Cos": f"{l_cos.item():.4f}",
-                    "Sin": f"{l_sin.item():.4f}",
-                    "Sca": f"{l_scale.item():.4f}",
-                }
-            else:
-                postfix = {
-                    "L": f"{combined_loss.item():.4f}",
-                    "Lat": f"{l_lat.item():.4f}",
-                    "Sca": f"{l_scale.item():.4f}",
-                }
-            if reg_loss.item() > 0:
-                postfix["Reg"] = f"{reg_loss.item():.4f}"
-            if adv_loss is not None:
-                postfix["Adv"] = f"{adv_loss.item():.4f}"
-            pbar.set_postfix(postfix)
+            if self.global_step % self.log_every == 0:
+                m = {k: v.item() / n_win for k, v in win.items()}
+                self.logger.log_step(self.global_step, m["total"], m["lat"], m["scale"], m["grad"],
+                                     self.optimizer.param_groups[0]["lr"])
+                pbar.set_postfix({"step": self.global_step, "L": f"{m['total']:.4f}", "Lat": f"{m['lat']:.4f}",
+                                  "Sca": f"{m['scale']:.4f}"})
+                win = {k: zero.clone() for k in keys}
+                n_win = 0
 
-        n = len(self.train_loader)
+            if self.max_steps is not None and self.global_step >= self.max_steps:
+                break
+
+            if val_every is not None and self.global_step % val_every == 0:
+                self._validate()
+                self.model.train()
+                self.local_encoder.train()
+
+        n = max(n_steps, 1)
+        e = {k: v.item() / n for k, v in ep.items()}
         if self.spectral_mode:
-            return (total_loss / n, total_lat_loss / n, total_cos_loss / n,
-                    total_sin_loss / n, total_scale_loss / n, total_adv_loss / n, total_reg_loss / n)
+            return e["total"], e["lat"], e["cos"], e["sin"], e["scale"], e["adv"], e["reg"]
         else:
-            return total_loss / n, total_lat_loss / n, total_scale_loss / n, total_adv_loss / n, total_reg_loss / n
+            return e["total"], e["lat"], e["scale"], e["adv"], e["reg"]
 
+    # Deterministic validation loss (design D17). Sample i gets x0 from a generator seeded with its dataset index and is
+    # evaluated at 4 stratified s values; the loss is the mean over samples and s. Returns
+    # (total, latent, scale, per_file), per_file = {filename: total loss over the samples of that file}.
+    # null_past=True replaces the whole past by the null embedding (past-usage test). CPU and CUDA RNG are left unchanged.
     @torch.no_grad()
+    def _eval_loss(self, loader, null_past=False):
+        self.model.eval()
+        self.local_encoder.eval()
+        zero = torch.zeros((), device=self.device)
+        tot, lat, sca, n = zero.clone(), zero.clone(), zero.clone(), 0
+        file_sum, file_n = {}, {}
+
+        with torch.random.fork_rng():
+            for batch in loader:
+                past_memory, present_target, context, structure = self._prepare_batch(batch)
+                encoded_past, prefix = self._encode_past(past_memory, train=False, null_past=null_past)
+
+                # x0 per sample, from its own seed
+                U, P = present_target.shape[1:]
+                x0 = torch.stack([
+                    torch.randn(U, P, generator=torch.Generator().manual_seed(int(i))) for i in batch["index"].tolist()
+                ]).to(self.device)
+
+                # Samples grouped by file so that the per-file loss is exact
+                groups = {}
+                for pos, label in enumerate(batch["label"]):
+                    groups.setdefault(label, []).append(pos)
+                for label, pos in groups.items():
+                    sel = torch.tensor(pos, device=self.device)
+                    b = len(pos)
+                    for s_val in VAL_S_VALUES:
+                        s = torch.full((b, 1, 1), s_val, device=self.device)
+                        loss, l_lat, l_sca, _, _ = flow_matching_loss(
+                            self.model, x0[sel], present_target[sel], context[sel], encoded_past[sel],
+                            structure_vector=None if structure is None else structure[sel],
+                            n_latent=self.n_latent, has_scale=self.has_scale,
+                            prefix=None if prefix is None else prefix[sel], s=s
+                        )
+                        tot += loss * b
+                        lat += l_lat * b
+                        sca += l_sca * b
+                        file_sum[label] = file_sum.get(label, zero) + loss * b
+                    file_n[label] = file_n.get(label, 0) + b
+                    n += b * len(VAL_S_VALUES)
+
+        n = max(n, 1)
+        per_file = {k: file_sum[k].item() / (file_n[k] * len(VAL_S_VALUES)) for k in file_sum}
+        return tot.item() / n, lat.item() / n, sca.item() / n, per_file
+
+    # Spectral mode (encodec48k only): V1's validation, random x0 and s, with the RNG states restored afterwards
+    @torch.no_grad()
+    def _eval_spectral(self, loader):
+        self.model.eval()
+        self.local_encoder.eval()
+        sums = [0.0] * 5
+        with torch.random.fork_rng():
+            for batch in loader:
+                past_memory, present_target, context, structure = self._prepare_batch(batch)
+                encoded_past, _ = self._encode_past(past_memory, train=False)
+                noise = torch.randn(present_target.size(0), self.spectral_frames, self.frame_dim, device=self.device)
+                _, l_mag, l_cos, l_sin, l_scale, _, _ = spectral_flow_matching_loss(
+                    self.model, noise, present_target, context, encoded_past, structure_vector=structure
+                )
+                for i, v in enumerate((l_mag + l_cos + l_sin + l_scale, l_mag, l_cos, l_sin, l_scale)):
+                    sums[i] += v.item()
+        n = len(loader)
+        return tuple(v / n for v in sums)
+
     def val_epoch(self):
         if self.val_loader is None:
             return 0.0, 0.0, 0.0
-
-        self.model.eval()
-        self.local_encoder.eval()
-        total_loss = 0
-        total_lat = 0
-        total_cos = 0
-        total_sin = 0
-        total_scale = 0
-
-        for batch in self.val_loader:
-            past_memory, present_target, context, structure = self._prepare_batch(batch)
-            encoded_past = self.local_encoder(past_memory)
-
-            if self.spectral_mode:
-                noise = torch.randn(present_target.size(0), self.spectral_frames, self.frame_dim,
-                                    device=self.device)
-                _, l_mag, l_cos, l_sin, l_scale, _, _ = spectral_flow_matching_loss(
-                    self.model, noise, present_target, context, encoded_past,
-                    structure_vector=structure
-                )
-                loss = l_mag + l_cos + l_sin + l_scale
-                total_loss += loss.item()
-                total_lat += l_mag.item()
-                total_cos += l_cos.item()
-                total_sin += l_sin.item()
-                total_scale += l_scale.item()
-            else:
-                noise = torch.randn_like(present_target)
-                loss, l_lat, l_scale, _, _ = flow_matching_loss(
-                    self.model, noise, present_target, context, encoded_past,
-                    structure_vector=structure
-                )
-                total_loss += loss.item()
-                total_lat += l_lat.item()
-                total_scale += l_scale.item()
-
-        n = len(self.val_loader)
         if self.spectral_mode:
-            return total_loss / n, total_lat / n, total_cos / n, total_sin / n, total_scale / n
-        else:
-            return total_loss / n, total_lat / n, total_scale / n
+            return self._eval_spectral(self.val_loader)
+        total, lat, sca, per_file = self._eval_loss(self.val_loader)
+        self._last_val_per_file = per_file
+        return total, lat, sca
 
+    # Deterministic val loss of a subset with the real past and with the whole past replaced by the null embedding.
+    def evaluate_past_usage(self, subset) -> dict:
+        loader = DataLoader(subset, batch_size=self.batch_size, shuffle=False)
+        l_real = self._eval_loss(loader)[0]
+        l_null = self._eval_loss(loader, null_past=True)[0]
+        return {"L_real": l_real, "L_null": l_null, "ratio": l_real / l_null}
+
+    # Validation audio is rendered by inference/render.py (slice B5); until then it is skipped.
     @torch.no_grad()
     def generate_validation_audio(self, epoch, NFE=32):
         if not self.val_audio_files:
             return
-
-        self.model.eval()
-        self.local_encoder.eval()
-
-        hop_time = self.atoms_hop_frames / 150.0
-        num_atoms = int(self.val_duration // hop_time)
-
-        macro_overlap_frames = self.atom_frames - self.atoms_hop_frames
-
-        samples_per_frame = self.dataset.samples_per_frame
-
-        segment_samples = self.atom_frames * samples_per_frame
-        hop_samples     = self.atoms_hop_frames * samples_per_frame
-        crossfade_samples = self.crossfade_frames * samples_per_frame
-
-        zeros_frames = macro_overlap_frames - self.crossfade_frames
-        zeros = torch.zeros(zeros_frames * samples_per_frame, device=self.device)
-
-        hann = torch.hann_window(crossfade_samples * 2, device=self.device)
-
-        ones_frames = self.atoms_hop_frames - self.crossfade_frames
-        ones = torch.ones(ones_frames * samples_per_frame, device=self.device)
-
-        window = torch.cat([
-            zeros,
-            hann[:crossfade_samples],
-            ones,
-            hann[crossfade_samples:]
-        ]).view(1, 1, -1)
-
-        alpha_smooth = 0.6
-        max_jump = 1.15
-        max_drop = 0.85
-
-        for target_file in self.val_audio_files:
-            file_indices = [i for i, (fname, _) in enumerate(self.dataset.all_indices) if fname == target_file]
-            if not file_indices:
-                continue
-
-            seq_indices = file_indices[:num_atoms]
-
-            total_samples = (len(seq_indices) - 1) * hop_samples + segment_samples
-            tf_out_audio = torch.zeros(1, 2, total_samples, device=self.device)
-
-            prev_scale = None
-
-            for i, idx in enumerate(tqdm(seq_indices, desc=f"Generating {target_file} (TF)")):
-                raw_batch = self.dataset[idx]
-                for k in raw_batch:
-                    if isinstance(raw_batch[k], torch.Tensor):
-                        raw_batch[k] = raw_batch[k].unsqueeze(0)
-
-                _prepared = self._prepare_batch(raw_batch)
-                gt_past, _, context, structure = _prepared[:4]
-
-                if self.spectral_mode:
-                    x0 = torch.randn(1, self.spectral_frames, self.frame_dim, device=self.device)
-                else:
-                    x0 = torch.randn(1, self.atom_frames, 129, device=self.device)
-
-                enc_tf = self.local_encoder(gt_past)
-                tf_pred_raw = self.model.generate(
-                    x0,
-                    enc_tf,
-                    context,
-                    structure_vector=structure,
-                    max_nfe=NFE,
-                    cfg_scale=self.model_config['cfg_scale']
-                )
-
-                if self.spectral_mode:
-                    # Convert spectral output to time domain
-                    latent_spec = tf_pred_raw[:, :, :384]
-                    latent_time = spectral_to_time(latent_spec, self.atom_frames)
-                    scale_spec = tf_pred_raw[:, :, 384:]
-                    scale_val = scale_spec.mean(dim=1, keepdim=True)
-                    scale_time = scale_val.expand(-1, self.atom_frames, -1)
-                    tf_pred = torch.cat([latent_time, scale_time], dim=-1).transpose(1, 2)
-                else:
-                    tf_pred = tf_pred_raw.transpose(1, 2)
-
-                tf_pred_smooth = tf_pred.clone()
-                raw_scale = torch.abs(tf_pred[:, 128, :]).mean(dim=-1, keepdim=True)
-
-                if prev_scale is None:
-                    smoothed_scale = raw_scale
-                else:
-                    target_scale = torch.clamp(raw_scale, prev_scale * max_drop, prev_scale * max_jump)
-                    smoothed_scale = (alpha_smooth * target_scale) + ((1.0 - alpha_smooth) * prev_scale)
-
-                prev_scale = smoothed_scale
-                tf_pred_smooth[:, 128, :] = smoothed_scale.expand_as(tf_pred_smooth[:, 128, :])
-
-                latents = tf_pred_smooth[:, :128, :]
-                meta = {
-                    "audio_scales": [smoothed_scale.squeeze(0).float()],
-                    "padding_mask": torch.ones((1, self.atom_frames * samples_per_frame),
-                                             dtype=torch.bool, device=self.device)
-                }
-
-                audio = self.processor.decode_latents_audio(latents, metadata=meta)
-                audio = audio * window
-
-                start = i * hop_samples
-                tf_out_audio[:, :, start : start + segment_samples] += audio
-
-            file_stem = Path(target_file).stem
-            sf.write(self.val_dir / f"epoch_{epoch}_{file_stem}_TF.wav",
-                     tf_out_audio.squeeze(0).T.cpu().numpy(), 48000)
-
-        print(f"✅ Validation audio for epoch {epoch} saved!")
+        print("⚠️ Validation audio is not available yet (it moves to inference/render.py in slice B5); skipped.")
 
     # ==========================================
     # DISCRIMINATOR TRAINING
@@ -758,25 +795,84 @@ class FlowTrainer:
     # MAIN TRAINING LOOP (2-stage)
     # ==========================================
 
-    def _epoch_bookkeeping(self, global_epoch, current_metric, audio_val_freq, val_nfe):
-        """Shared checkpoint/save/log logic after each epoch."""
-        trainer_state = None
-        if self.save_resume_states:
-            trainer_state = {
-                'epoch': global_epoch,
-                'best_metric': min(current_metric, self.best_metric),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'train_losses': self.train_losses,
-                'val_losses': self.val_losses
-            }
 
-        if current_metric < self.best_metric:
-            self.best_metric = current_metric
+    def _trainer_state(self, global_epoch):
+        return {
+            'epoch': global_epoch,
+            'global_step': self.global_step,
+            'best_metric': self.best_metric,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'train_losses': self.train_losses,
+            'val_losses': self.val_losses
+        }
+
+    # Validation pass (skipped without a val loader, or if it already ran at this step): logs the per-file losses and
+    # saves the best checkpoint by the deterministic val loss. Returns the val loss or None.
+    def _validate(self):
+        if self.val_loader is None:
+            return None
+        if self._last_val_step == self.global_step:
+            return self._last_val_metric
+        val_out = self.val_epoch()
+        self._last_val_step = self.global_step
+        if self.spectral_mode:
+            avg_v_total, avg_v_mag, avg_v_cos, avg_v_sin, avg_v_scale = val_out
+            self.val_losses["total"].append(avg_v_total)
+            self.val_losses["mag"].append(avg_v_mag)
+            self.val_losses["cos"].append(avg_v_cos)
+            self.val_losses["sin"].append(avg_v_sin)
+            self.val_losses["scale"].append(avg_v_scale)
+            print(f"Val   | Total: {avg_v_total:.4f} (Mag: {avg_v_mag:.4f}, Cos: {avg_v_cos:.4f}, Sin: {avg_v_sin:.4f}, Sca: {avg_v_scale:.4f})")
+        else:
+            avg_v_total, avg_v_lat, avg_v_scale = val_out
+            self.val_losses["total"].append(avg_v_total)
+            self.val_losses["latent"].append(avg_v_lat)
+            self.val_losses["scale"].append(avg_v_scale)
+            print(f"Val   | step {self.global_step} | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
+            self.logger.log_val(self.global_step, self._last_val_per_file)
+
+        self._last_val_metric = avg_v_total
+        if avg_v_total < self.best_metric:
+            self.best_metric = avg_v_total
             torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "best_flow_model.pt")
             torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "best_local_encoder.pt")
             if self.save_resume_states:
-                torch.save(trainer_state, self.ckpt_dir / "best_trainer_state.pt")
+                torch.save(self._trainer_state(self.start_epoch), self.ckpt_dir / "best_trainer_state.pt")
             print("🌟 Saved new best models!")
+        return avg_v_total
+
+    def _record_train(self, train_out):
+        if self.spectral_mode:
+            (avg_t_total, avg_t_mag, avg_t_cos, avg_t_sin,
+             avg_t_scale, avg_t_adv, avg_t_reg) = train_out
+            self.train_losses["total"].append(avg_t_total)
+            self.train_losses["mag"].append(avg_t_mag)
+            self.train_losses["cos"].append(avg_t_cos)
+            self.train_losses["sin"].append(avg_t_sin)
+            self.train_losses["scale"].append(avg_t_scale)
+            self.train_losses.setdefault("adv", []).append(avg_t_adv)
+            self.train_losses.setdefault("reg", []).append(avg_t_reg)
+            parts = [f"Train | Total: {avg_t_total:.4f} (Mag: {avg_t_mag:.4f}, Cos: {avg_t_cos:.4f}, Sin: {avg_t_sin:.4f}, Sca: {avg_t_scale:.4f}"]
+        else:
+            avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = train_out
+            self.train_losses["total"].append(avg_t_total)
+            self.train_losses["latent"].append(avg_t_lat)
+            self.train_losses["scale"].append(avg_t_scale)
+            self.train_losses.setdefault("adv", []).append(avg_t_adv)
+            self.train_losses.setdefault("reg", []).append(avg_t_reg)
+            parts = [f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}"]
+        if avg_t_reg > 0:
+            parts.append(f"Reg: {avg_t_reg:.6f}")
+        if avg_t_adv > 0:
+            parts.append(f"Adv: {avg_t_adv:.6f}")
+        print(", ".join(parts) + ")")
+
+    def _max_steps_reached(self):
+        return self.max_steps is not None and self.global_step >= self.max_steps
+
+    def _epoch_bookkeeping(self, global_epoch, audio_val_freq, val_nfe):
+        """Shared checkpoint/save/log logic after each epoch (the best checkpoint is saved in _validate)."""
+        trainer_state = self._trainer_state(global_epoch) if self.save_resume_states else None
 
         ckpt_freq = self.checkpoint_freq
         if ckpt_freq > 0 and global_epoch % ckpt_freq == 0:
@@ -804,81 +900,50 @@ class FlowTrainer:
 
         self._plot_and_save_losses(global_epoch)
 
+    # One epoch of stage 1 or 2: train, validate (if there is a val loader), save, count patience.
+    # Returns True if training must stop (max_steps reached, or patience exhausted).
+    def _run_epoch(self, global_epoch, audio_val_freq, val_nfe, patience, best_ref, discriminator=None, collect_adv=False):
+        train_out = self.train_epoch(discriminator=discriminator, collect_adv=collect_adv)
+        self._record_train(train_out)
+        metric = self._validate()
+        self._epoch_bookkeeping(global_epoch, audio_val_freq, val_nfe)
+        self.start_epoch += 1
+
+        if self._max_steps_reached():
+            print(f"  Stopped at max_steps = {self.max_steps}")
+            return True
+        # Patience needs a val loss and is off when max_steps is set
+        if self.max_steps is None and metric is not None:
+            if metric < best_ref["value"]:
+                best_ref["value"] = metric
+                best_ref["no_improve"] = 0
+            else:
+                best_ref["no_improve"] += 1
+                if best_ref["no_improve"] >= patience:
+                    print(f"  Early stopping at epoch {global_epoch} (no improvement for {patience} epochs)")
+                    return True
+        return False
+
     def train(self, epochs, audio_val_freq=5, val_nfe=32, patience=10):
         # ─── Stage 1: Standard Flow Matching ───
         print(f"\n{'='*60}")
-        print(f"🔥 Stage 1 — Standard Flow Matching ({epochs} epochs, patience={patience})")
+        print(f"🔥 Stage 1 — Standard Flow Matching ({epochs} epochs, patience={patience}, max_steps={self.max_steps})")
         print(f"{'='*60}")
 
         self.x_hat_buffer = []
-        epochs_no_improve = 0
+        best_ref = {"value": self.best_metric, "no_improve": 0}
+        stop = False
 
         for epoch in range(1, epochs + 1):
             global_epoch = self.start_epoch
             print(f"\n=== Stage 1 — Epoch {global_epoch} ===")
-
             collect_adv = self.use_discriminator and (epoch == epochs)
-            train_out = self.train_epoch(collect_adv=collect_adv)
+            stop = self._run_epoch(global_epoch, audio_val_freq, val_nfe, patience, best_ref, collect_adv=collect_adv)
+            if stop:
+                break
 
-            if self.spectral_mode:
-                (avg_t_total, avg_t_mag, avg_t_cos, avg_t_sin,
-                 avg_t_scale, avg_t_adv, avg_t_reg) = train_out
-                self.train_losses["total"].append(avg_t_total)
-                self.train_losses["mag"].append(avg_t_mag)
-                self.train_losses["cos"].append(avg_t_cos)
-                self.train_losses["sin"].append(avg_t_sin)
-                self.train_losses["scale"].append(avg_t_scale)
-                self.train_losses.setdefault("adv", []).append(avg_t_adv)
-                self.train_losses.setdefault("reg", []).append(avg_t_reg)
-                parts = [f"Train | Total: {avg_t_total:.4f} (Mag: {avg_t_mag:.4f}, Cos: {avg_t_cos:.4f}, Sin: {avg_t_sin:.4f}, Sca: {avg_t_scale:.4f}"]
-            else:
-                avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = train_out
-                self.train_losses["total"].append(avg_t_total)
-                self.train_losses["latent"].append(avg_t_lat)
-                self.train_losses["scale"].append(avg_t_scale)
-                self.train_losses.setdefault("adv", []).append(avg_t_adv)
-                self.train_losses.setdefault("reg", []).append(avg_t_reg)
-                parts = [f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}"]
-
-            if avg_t_reg > 0:
-                parts.append(f"Reg: {avg_t_reg:.6f}")
-            if avg_t_adv > 0:
-                parts.append(f"Adv: {avg_t_adv:.6f}")
-            print(", ".join(parts) + ")")
-
-            if self.val_loader is not None:
-                val_out = self.val_epoch()
-                if self.spectral_mode:
-                    avg_v_total, avg_v_mag, avg_v_cos, avg_v_sin, avg_v_scale = val_out
-                    self.val_losses["total"].append(avg_v_total)
-                    self.val_losses["mag"].append(avg_v_mag)
-                    self.val_losses["cos"].append(avg_v_cos)
-                    self.val_losses["sin"].append(avg_v_sin)
-                    self.val_losses["scale"].append(avg_v_scale)
-                    print(f"Val   | Total: {avg_v_total:.4f} (Mag: {avg_v_mag:.4f}, Cos: {avg_v_cos:.4f}, Sin: {avg_v_sin:.4f}, Sca: {avg_v_scale:.4f})")
-                else:
-                    avg_v_total, avg_v_lat, avg_v_scale = val_out
-                    self.val_losses["total"].append(avg_v_total)
-                    self.val_losses["latent"].append(avg_v_lat)
-                    self.val_losses["scale"].append(avg_v_scale)
-                    print(f"Val   | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
-                current_metric = avg_v_total
-            else:
-                current_metric = avg_t_total
-
-            old_best = self.best_metric
-            self._epoch_bookkeeping(global_epoch, current_metric, audio_val_freq, val_nfe)
-            self.start_epoch += 1
-
-            if self.best_metric < old_best:
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
-                    print(f"  Early stopping at epoch {global_epoch} (no improvement for {patience} epochs)")
-                    break
-
-        if not self.use_discriminator:
+        if stop or not self.use_discriminator:
+            self.logger.finish()
             print(f"\n✅ Training complete!")
             return
 
@@ -898,8 +963,8 @@ class FlowTrainer:
         print(f"   Buffer has {sum(x.shape[0] for x, _ in self.x_hat_buffer)} fake samples")
         print(f"{'='*60}")
 
-        best_stage2 = float('inf')
-        epochs_no_improve = 0
+        # Stage 2 has its own patience tracking — the loss landscape differs from stage 1
+        best_ref = {"value": float('inf'), "no_improve": 0}
 
         for epoch in range(1, self.stage2_epochs + 1):
             global_epoch = self.start_epoch
@@ -911,66 +976,14 @@ class FlowTrainer:
             print(f"  ─── Part B: Train generator (adversarial) ───")
 
             self.x_hat_buffer = []
-            train_out = self.train_epoch(discriminator=disc, collect_adv=True)
-
-            if self.spectral_mode:
-                (avg_t_total, avg_t_mag, avg_t_cos, avg_t_sin,
-                 avg_t_scale, avg_t_adv, avg_t_reg) = train_out
-                self.train_losses["total"].append(avg_t_total)
-                self.train_losses["mag"].append(avg_t_mag)
-                self.train_losses["cos"].append(avg_t_cos)
-                self.train_losses["sin"].append(avg_t_sin)
-                self.train_losses["scale"].append(avg_t_scale)
-                self.train_losses.setdefault("adv", []).append(avg_t_adv)
-                self.train_losses.setdefault("reg", []).append(avg_t_reg)
-                print(f"Train | Total: {avg_t_total:.4f} (Mag: {avg_t_mag:.4f}, Cos: {avg_t_cos:.4f}, Sin: {avg_t_sin:.4f}, Sca: {avg_t_scale:.4f}, Adv: {avg_t_adv:.6f}, Reg: {avg_t_reg:.6f})")
-            else:
-                avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = train_out
-                self.train_losses["total"].append(avg_t_total)
-                self.train_losses["latent"].append(avg_t_lat)
-                self.train_losses["scale"].append(avg_t_scale)
-                self.train_losses.setdefault("adv", []).append(avg_t_adv)
-                self.train_losses.setdefault("reg", []).append(avg_t_reg)
-                print(f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}, Adv: {avg_t_adv:.6f}, Reg: {avg_t_reg:.6f})")
-
-            if self.val_loader is not None:
-                val_out = self.val_epoch()
-                if self.spectral_mode:
-                    avg_v_total, avg_v_mag, avg_v_cos, avg_v_sin, avg_v_scale = val_out
-                    self.val_losses["total"].append(avg_v_total)
-                    self.val_losses["mag"].append(avg_v_mag)
-                    self.val_losses["cos"].append(avg_v_cos)
-                    self.val_losses["sin"].append(avg_v_sin)
-                    self.val_losses["scale"].append(avg_v_scale)
-                    print(f"Val   | Total: {avg_v_total:.4f} (Mag: {avg_v_mag:.4f}, Cos: {avg_v_cos:.4f}, Sin: {avg_v_sin:.4f}, Sca: {avg_v_scale:.4f})")
-                else:
-                    avg_v_total, avg_v_lat, avg_v_scale = val_out
-                    self.val_losses["total"].append(avg_v_total)
-                    self.val_losses["latent"].append(avg_v_lat)
-                    self.val_losses["scale"].append(avg_v_scale)
-                    print(f"Val   | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
-                current_metric = avg_v_total
-            else:
-                current_metric = avg_t_total
-
-            self._epoch_bookkeeping(global_epoch, current_metric, audio_val_freq, val_nfe)
-            self.start_epoch += 1
-
-            # Patience (stage 2 uses its own tracking — loss landscape differs from stage 1)
-            if current_metric < best_stage2:
-                best_stage2 = current_metric
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= patience:
-                    print(f"  Early stopping at epoch {global_epoch} (no improvement for {patience} epochs)")
-                    del disc
-                    torch.cuda.empty_cache()
-                    break
+            stop = self._run_epoch(global_epoch, audio_val_freq, val_nfe, patience, best_ref,
+                                   discriminator=disc, collect_adv=True)
 
             # Clean up discriminator
             del disc
             torch.cuda.empty_cache()
+            if stop:
+                break
 
         # Unfreeze LocalEncoder for any downstream use
         self.local_encoder.train()
@@ -978,4 +991,5 @@ class FlowTrainer:
             p.requires_grad_(True)
 
         self.x_hat_buffer = []
+        self.logger.finish()
         print(f"\n✅ Training complete!")

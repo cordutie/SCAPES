@@ -64,50 +64,53 @@ def Dt_psi_conditioned(s, X0, X1, sigma_min=0.01, sigma_max=1.0):
     """
     return (sigma_max - sigma_min) * (X1 - X0)
 
-def flow_matching_loss(model, x0, x1, context, encoded_past, structure_vector=None, scale_weight=3.0, sigma_min=0.01, sigma_max=1.0):
+def flow_matching_loss(model, x0, x1, context, encoded_past, structure_vector=None, *, n_latent, has_scale,
+                       scale_weight=3.0, sigma_min=0.01, sigma_max=1.0, prefix=None, s=None):
     """
-    x0, x1: (B, 21, 129)
-    scale_weight: Hyperparameter to boost the importance of the 129th channel.
+    x0, x1: [B, U, frame_dim], frame_dim = n_latent + has_scale.
+    n_latent: number of latent channels (the first channels); the scale channel, if any, is the last one.
+    has_scale: if False there is no scale term (l_scale is a zero tensor).
+    scale_weight: weight of the scale channel loss.
+    prefix: None or [B, o, frame_dim] clean frames that go at the head of the model input, cat([prefix, x_s]).
+            The loss and X_hat use only the last U positions.
+    s: None (drawn uniformly as in V1) or [B, 1, 1] fixed times (deterministic validation); nothing is drawn then.
     """
     # 1. Sample time 's'
-    s = torch.rand(x1.size(0), 1, 1, device=x1.device)
+    if s is None:
+        s = torch.rand(x1.size(0), 1, 1, device=x1.device)
 
     # 2. Calculate Path and Target Velocity
-    xs = psi_conditioned(s, x0, X1=x1)
+    xs = psi_conditioned(s, x0, X1=x1, sigma_min=sigma_min, sigma_max=sigma_max)
     u_conditioned = Dt_psi_conditioned(s, x0, X1=x1, sigma_min=sigma_min, sigma_max=sigma_max)
-    
-    # 3. Predict Velocity
-    s_model = s.squeeze(-1) 
-    u_model = model(x_t=xs, s=s_model, context_vector=context, encoded_past=encoded_past, structure_vector=structure_vector)
-    
-    # --- NEW: Split Latents (0-127) and Scale (128) ---
-    # Velocity for latents
-    u_model_latents = u_model[:, :, :128]
-    u_cond_latents  = u_conditioned[:, :, :128]
-    
-    # Velocity for scale
-    u_model_scale = u_model[:, :, 128:]
-    u_cond_scale  = u_conditioned[:, :, 128:]
-    
-    # 4. Compute Independent MSEs
-    loss_latents = F.mse_loss(u_model_latents, u_cond_latents)
-    loss_scale   = F.mse_loss(u_model_scale, u_cond_scale)
-    
-    # Combine with weighting
-    total_loss = loss_latents + (scale_weight * loss_scale)
+
+    # 3. Predict Velocity (with a prefix the model sees o + U positions, only the last U are used)
+    s_model = s.squeeze(-1)
+    x_in = xs if prefix is None else torch.cat([prefix, xs], dim=1)
+    u_model = model(x_t=x_in, s=s_model, context_vector=context, encoded_past=encoded_past, structure_vector=structure_vector)
+    if prefix is not None:
+        u_model = u_model[:, prefix.size(1):]
+
+    # 4. Independent MSEs: latents and (if present) scale
+    loss_latents = F.mse_loss(u_model[:, :, :n_latent], u_conditioned[:, :, :n_latent])
+    if has_scale:
+        loss_scale = F.mse_loss(u_model[:, :, n_latent:], u_conditioned[:, :, n_latent:])
+        total_loss = loss_latents + (scale_weight * loss_scale)
+    else:
+        loss_scale = torch.zeros((), device=x1.device, dtype=loss_latents.dtype)
+        total_loss = loss_latents
 
     # Model's estimate of the final data point (for adversarial regularization)
     X_hat = xs + (1.0 - s) * u_model
-    
+
     return total_loss, loss_latents, loss_scale, X_hat, s
 
 
-def time_phase_regularizer(x1_hat: torch.Tensor, x1_true: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+def time_phase_regularizer(x1_hat: torch.Tensor, x1_true: torch.Tensor, s: torch.Tensor, n_latent: int) -> torch.Tensor:
     """
     Penalizes incorrect temporal slopes, weighted heavily towards the end of the flow (s -> 1).
     """
-    hat_latents = x1_hat[:, :, :128]
-    true_latents = x1_true[:, :, :128]
+    hat_latents = x1_hat[:, :, :n_latent]
+    true_latents = x1_true[:, :, :n_latent]
 
     diff_hat = hat_latents[:, 1:, :] - hat_latents[:, :-1, :]
     diff_true = true_latents[:, 1:, :] - true_latents[:, :-1, :]
@@ -126,12 +129,12 @@ def time_phase_regularizer(x1_hat: torch.Tensor, x1_true: torch.Tensor, s: torch
     # 4. Return the final scalar for backprop
     return weighted_mse.mean()
 
-def fft_phase_regularizer(x1_hat: torch.Tensor, x1_true: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+def fft_phase_regularizer(x1_hat: torch.Tensor, x1_true: torch.Tensor, s: torch.Tensor, n_latent: int) -> torch.Tensor:
     """
     Penalizes incorrect modulation phase in the frequency domain, weighted by true magnitude and ODE time 's'.
     """
-    hat_latents = x1_hat[:, :, :128]
-    true_latents = x1_true[:, :, :128]
+    hat_latents = x1_hat[:, :, :n_latent]
+    true_latents = x1_true[:, :, :n_latent]
 
     fft_hat = torch.fft.rfft(hat_latents, dim=1)
     fft_true = torch.fft.rfft(true_latents, dim=1)
