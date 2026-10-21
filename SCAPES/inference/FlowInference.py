@@ -1,21 +1,24 @@
+import math
+import tempfile
 import soundfile as sf
 import librosa
 import torch
-import torch.nn as nn
-import math
+import torch.nn.functional as F
 from typing import List, Dict, Any, Optional
 from tqdm import tqdm
 from IPython.display import Audio, display
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-from SCAPES.data.config_loader import parse_gin_config, _get_nested, _SIZE_TABLE, _resolve_size_table, TrainingConfig
+from SCAPES.data.config_loader import (parse_gin_config, _get_nested, _SIZE_TABLE, ConfigError, load_dataprep_config)
+from SCAPES.data.geometry import geometry_from_inference_gin, resolve_geometry
+from SCAPES.data.representations import frames_to_samples_48k
 from SCAPES.models.flow.FlowModel import FlowModel
 from SCAPES.models.factorization.LocalEncoder import LocalEncoder
-from SCAPES.auxiliar.encodec_wrapper import EncodecProcessor
-from SCAPES.auxiliar.clap_wrapper import CLAPWrapper
 from SCAPES.data.dataprep.structure import _compute_structure_features
 from SCAPES.auxiliar.losses_flow import time_to_spectral, spectral_to_time
+from SCAPES.inference.render import StreamRenderer, render_atoms
+from SCAPES import codecs as scapes_codecs
 
 # ==========================================
 # PIPELINE HELPER FUNCTIONS
@@ -23,8 +26,8 @@ from SCAPES.auxiliar.losses_flow import time_to_spectral, spectral_to_time
 
 def load_and_encode(engine, audio_path, max_duration=None):
     audio_tensor = engine.load_audio_to_tensor(audio_path)
-    if max_duration != None and audio_tensor.shape[-1] > engine.sr * max_duration:
-        audio_tensor = audio_tensor[:,:,:engine.sr*max_duration]
+    if max_duration != None and audio_tensor.shape[-1] > engine.load_sr * max_duration:
+        audio_tensor = audio_tensor[:,:,:engine.load_sr*max_duration]
         
     print(f"--- Encoding audio: {audio_path}")
     atoms = engine.encode_audio_to_atoms(audio_tensor)
@@ -325,7 +328,20 @@ def run_interpolation_pipeline(
 # FLOW INFERENCE ENGINE
 # ==========================================
 
+_CODEC_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "codecs"
+
+
+def _gin_value(v):
+    return f'"{v}"' if isinstance(v, str) else str(v)
+
+
 class FlowInference:
+    """
+    Generation from a trained model directory, in both modes (design: Inference).
+    The codec and the geometry come from <model_dir>/checkpoints/inference.gin (V1 files need the two lines
+    codec.name and generation.mode). Latents inside the timeline are in model units (standardised if the model was).
+    """
+
     def __init__(
         self,
         model_dir: str,
@@ -335,9 +351,6 @@ class FlowInference:
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = device
-        self.verbose = verbose
-
         model_dir = Path(model_dir)
         gin_path = model_dir / "checkpoints" / "inference.gin"
         if not gin_path.exists():
@@ -345,88 +358,32 @@ class FlowInference:
                 f"Expected inference config at {gin_path}. "
                 "Run training first to generate this file."
             )
+        raw = parse_gin_config(gin_path)
+        codec_name = _get_nested(raw, ["codec", "name"], None)
+        if codec_name is None or _get_nested(raw, ["generation", "mode"], None) is None:
+            raise ConfigError(f"{gin_path}: codec.name and generation.mode are required "
+                              f"(a V1 inference.gin works after adding these two lines)")
+        info = scapes_codecs.get_codec_info(codec_name)
+        geom = geometry_from_inference_gin(raw, info)
 
-        config = parse_gin_config(gin_path)
-
-        # ─── Data geometry ───
-        self.spectral_mode = _get_nested(config, ["training", "spectral_representation"], False)
-        if self.spectral_mode:
-            frame_dim = 385  # 128*3 + 1
-            self.spectral_frames = int(_get_nested(config, ["atoms", "spectral_frames"],
-                                                    _get_nested(config, ["atoms", "frames"], 48) // 2 + 1))
-        else:
-            frame_dim = 129
-            self.spectral_frames = None
-        context_vector_dim = 1024
-        sr = 48000
-        frame_rate = 150
-
-        self.atoms_frames = int(_get_nested(config, ["atoms", "frames"], 48))
-        self.atoms_hop_frames = int(_get_nested(config, ["atoms", "hop_frames"], 15))
-        self.crossfade_frames = int(_get_nested(config, ["atoms", "crossfade_frames"], 3))
-        self.memory_buffer_atoms = int(_get_nested(config, ["dataset", "memory_buffer_atoms"], 3))
-
-        self.context_seconds = float(_get_nested(config, ["dataset", "context_seconds"], 1.0))
-        self.semantic_random_extension = _get_nested(config, ["dataset", "semantic_random_extension"], True)
-        self.structure_feature_names = _get_nested(config, ["structure", "features"], None)
-
-        # ─── Model architecture ───
-        raw_size = _get_nested(config, ["model", "size"], None)
-        raw_d_model = _get_nested(config, ["model", "d_model"], None)
-        raw_nhead = _get_nested(config, ["model", "nhead"], None)
-        raw_num_layers = _get_nested(config, ["model", "num_layers"], None)
-        raw_dim_feedforward = _get_nested(config, ["model", "dim_feedforward"], None)
-
-        pseudo_config = TrainingConfig(
-            size=raw_size,
-            d_model=raw_d_model,
-            nhead=raw_nhead,
-            num_layers=raw_num_layers,
-            dim_feedforward=raw_dim_feedforward,
-            local_encoder_hidden_dim=int(_get_nested(config, ["local_encoder", "hidden_dim"], 256)),
-            local_encoder_time_entanglement=_get_nested(config, ["local_encoder", "time_entanglement"], True),
-            local_encoder_temporal_compression=int(_get_nested(config, ["local_encoder", "temporal_compression"], 1)),
-            cfg_scale=float(_get_nested(config, ["inference", "cfg_scale"], 3.0)),
-        )
-        pseudo_config = _resolve_size_table(pseudo_config)
-        self.training_config = pseudo_config
-
-        structure_dim = len(self.structure_feature_names) if self.structure_feature_names else 0
-
-        # ─── Build models ───
-        model_frames_per_atom = self.spectral_frames if self.spectral_mode else self.atoms_frames
-
-        self.local_encoder = LocalEncoder(
-            in_channels=frame_dim,
-            hidden_dim=pseudo_config.local_encoder_hidden_dim,
-            out_channels=pseudo_config.d_model,
-            time_entanglement=pseudo_config.local_encoder_time_entanglement,
-            temporal_compression=pseudo_config.local_encoder_temporal_compression,
-        ).to(self.device).eval()
-
-        self.model = FlowModel(
-            frame_dim=frame_dim,
-            context_vector_dim=context_vector_dim,
-            num_past_atoms=self.memory_buffer_atoms,
-            frames_per_atom=model_frames_per_atom,
-            d_model=pseudo_config.d_model,
-            nhead=pseudo_config.nhead,
-            num_layers=pseudo_config.num_layers,
-            dim_feedforward=pseudo_config.dim_feedforward,
-            structure_dim=structure_dim,
-            device=self.device,
-        ).to(self.device).eval()
+        arch = {
+            "d_model": _get_nested(raw, ["model", "d_model"], None),
+            "nhead": _get_nested(raw, ["model", "nhead"], None),
+            "num_layers": _get_nested(raw, ["model", "num_layers"], None),
+            "dim_feedforward": _get_nested(raw, ["model", "dim_feedforward"], None),
+        }
+        if any(v is None for v in arch.values()):
+            size = _get_nested(raw, ["model", "size"], None)
+            if size not in _SIZE_TABLE:
+                raise ConfigError(f"{gin_path}: model architecture is missing (model.size or the four model.* lines)")
+            arch = dict(_SIZE_TABLE[size])
+        self._setup(raw, info, geom, arch, device, verbose)
 
         # ─── Load checkpoint weights ───
         flow_name, local_name = self._resolve_checkpoint_names(checkpoint, model_dir)
-
-        flow_ckpt = model_dir / "checkpoints" / flow_name
-        local_ckpt = model_dir / "checkpoints" / local_name
-
-        for ckpt_path, target_model, label in [
-            (flow_ckpt, self.model, "flow model"),
-            (local_ckpt, self.local_encoder, "local encoder"),
-        ]:
+        for name, target_model, label in [(flow_name, self.model, "flow model"),
+                                          (local_name, self.local_encoder, "local encoder")]:
+            ckpt_path = model_dir / "checkpoints" / name
             if not ckpt_path.exists():
                 raise FileNotFoundError(
                     f"Checkpoint not found at {ckpt_path}. "
@@ -440,37 +397,133 @@ class FlowInference:
             if self.verbose:
                 print(f"  Loaded {label} from {ckpt_path.name}")
 
+        # ─── Latent statistics of standardised models ───
+        if self.standardize:
+            stats_path = model_dir / "checkpoints" / "latent_stats.pt"
+            if not stats_path.exists():
+                raise FileNotFoundError(f"{stats_path} is missing but training.standardize_latents is True")
+            stats = torch.load(stats_path, map_location=self.device, weights_only=True)
+            self.mu, self.std = stats["mu"].float(), stats["std"].float()
+
+    # Random-init engine with the template geometry of <codec>_<mode>.gin (S3 timing); weights are not loaded and the codec
+    # is only loaded at the first decode. geometry: optional gin overrides, e.g. {"ar.block_seconds": 0.32};
+    # size "custom" reads the model.* lines from the template.
+    @classmethod
+    def from_config(cls, codec: str, mode: str, size: str = "large", geometry: Optional[dict] = None,
+                    device: Optional[str] = None, seed: int = 0):
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        suffix = "ar" if mode == "autoregressive" else "atoms"
+        lines = (_CODEC_CONFIG_DIR / f"{codec}_{suffix}.gin").read_text().splitlines()
+        lines += [f"{k} = {_gin_value(v)}" for k, v in (geometry or {}).items()]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dataprep.gin"
+            path.write_text("\n".join(lines) + "\n")
+            raw = parse_gin_config(path)
+            info = scapes_codecs.get_codec_info(codec)
+            geom = resolve_geometry(load_dataprep_config(path), info)
+        if size == "custom":
+            arch = {k: _get_nested(raw, ["model", k], None) for k in ("d_model", "nhead", "num_layers", "dim_feedforward")}
+            if any(v is None for v in arch.values()):
+                raise ConfigError("size 'custom' needs model.d_model, nhead, num_layers and dim_feedforward in the gin lines")
+        else:
+            arch = dict(_SIZE_TABLE[size])
+        torch.manual_seed(seed)
+        obj = cls.__new__(cls)
+        obj._setup(raw, info, geom, arch, device, False)
+        return obj
+
+    def _setup(self, raw, info, geom, arch, device, verbose):
+        self.device = device
+        self.verbose = verbose
+        self.info = info
+        self.geom = geom
+        self.mode = geom.mode
+        self.sr = info.sample_rate            # output rate (codec rate)
+        self.load_sr = 48000                  # rate of the audio given to CLAP, structure and the helper pipelines
+        self.frame_rate = info.frame_rate
+        self.latent_dim = geom.latent_dim
+        self._codec = None
+        self._context_model = None
+        self.mu = self.std = None
+        self.standardize = bool(_get_nested(raw, ["training", "standardize_latents"], False))
+
+        # ─── Geometry in frames ───
+        self.spectral_mode = bool(_get_nested(raw, ["training", "spectral_representation"], False))
+        if self.spectral_mode and geom.codec != "encodec48k":
+            raise NotImplementedError("spectral_representation is only available for encodec48k (D13)")
+        if self.spectral_mode:
+            frame_dim = 385  # 128*3 + 1
+            self.spectral_frames = int(_get_nested(raw, ["atoms", "spectral_frames"], geom.unit_frames // 2 + 1))
+            model_frames = self.spectral_frames
+        else:
+            frame_dim = geom.frame_dim
+            self.spectral_frames = None
+            model_frames = geom.unit_frames + geom.prefix_frames
+        self.unit_frames = geom.unit_frames
+        self.memory_buffer_atoms = geom.memory_units
+        self.segment_length = geom.memory_units
+        self.context_seconds = geom.context_seconds
+        self.context_samples = int(round(self.context_seconds * self.load_sr))
+        self.semantic_random_extension = _get_nested(raw, ["dataset", "semantic_random_extension"], True)
+        self.structure_feature_names = _get_nested(raw, ["structure", "features"], None)
+        structure_dim = len(self.structure_feature_names) if self.structure_feature_names else 0
+        self.use_structure = structure_dim > 0
+
+        # ─── Models ───
+        hidden = int(_get_nested(raw, ["local_encoder", "hidden_dim"], 256))
+        entangle = _get_nested(raw, ["local_encoder", "time_entanglement"], True)
+        compression = int(_get_nested(raw, ["local_encoder", "temporal_compression"], 1))
+        if geom.mode == "autoregressive" and compression != 1:
+            raise NotImplementedError("autoregressive mode needs local_encoder.temporal_compression = 1")
+        self.local_encoder = LocalEncoder(
+            in_channels=frame_dim,
+            hidden_dim=hidden,
+            out_channels=arch["d_model"],
+            time_entanglement=entangle,
+            temporal_compression=compression,
+        ).to(device).eval()
+        self.model = FlowModel(
+            frame_dim=frame_dim,
+            context_vector_dim=1024,
+            num_past_atoms=geom.memory_units,
+            frames_per_atom=model_frames,
+            d_model=arch["d_model"],
+            nhead=arch["nhead"],
+            num_layers=arch["num_layers"],
+            dim_feedforward=arch["dim_feedforward"],
+            structure_dim=structure_dim,
+            memory_frames=geom.memory_frames if geom.mode == "autoregressive" else None,
+            device=device,
+        ).to(device).eval()
         if self.verbose:
             for m in [self.local_encoder, self.model]:
                 n = sum(p.numel() for p in m.parameters() if p.requires_grad)
                 print(f"  {m.__class__.__name__}: {n:,} params")
 
-        # ─── Set up components ───
-        self.processor = EncodecProcessor(sr=sr, streamable=True, device=self.device)
-        self.context_model = CLAPWrapper(version="2023", use_cuda=(self.device == "cuda"))
-
-        self.use_structure = structure_dim > 0
-        self.segment_length = self.memory_buffer_atoms
-
-        self.sr = sr
-        self.frame_rate = frame_rate
-        self.samples_per_frame = sr // frame_rate
-        self.macro_overlap_frames = self.atoms_frames - self.atoms_hop_frames
-
-        self.segment_samples = self.atoms_frames * self.samples_per_frame
-        self.hop_samples = self.atoms_hop_frames * self.samples_per_frame
-        self.crossfade_samples = self.crossfade_frames * self.samples_per_frame
-        self.macro_overlap_samples = self.macro_overlap_frames * self.samples_per_frame
-
-        # Context window: time-based (same logic as dataset.py)
-        self.context_samples = int(round(self.context_seconds * self.sr))
-
-        self.ola_window = self._build_ola_window().to(self.device)
         self.timeline: List[Dict[str, Any]] = []
 
+    # The codec and CLAP are loaded at first use
+    @property
+    def codec(self):
+        if self._codec is None:
+            self._codec = scapes_codecs.get_codec(self.info.name, self.device)
+        return self._codec
+
+    @property
+    def context_model(self):
+        if self._context_model is None:
+            from SCAPES.auxiliar.clap_wrapper import CLAPWrapper
+            self._context_model = CLAPWrapper(version="2023", use_cuda=(str(self.device).startswith("cuda")))
+        return self._context_model
+
+    # "best" falls back to "last" when training had no validation split (no best checkpoint is written then)
     @staticmethod
     def _resolve_checkpoint_names(checkpoint, model_dir):
         if checkpoint == "best":
+            if not (Path(model_dir) / "checkpoints" / "best_flow_model.pt").exists():
+                print("No best checkpoint (training had no validation split): using the last one.")
+                return "last_flow_model.pt", "last_local_encoder.pt"
             return "best_flow_model.pt", "best_local_encoder.pt"
         elif checkpoint == "last":
             return "last_flow_model.pt", "last_local_encoder.pt"
@@ -481,165 +534,145 @@ class FlowInference:
         else:
             raise ValueError(f"checkpoint must be 'best', 'last', or an int (epoch number), got {checkpoint}")
 
-    def _build_ola_window(self):
-        zeros_frames = self.macro_overlap_frames - self.crossfade_frames
-        zeros = torch.zeros(zeros_frames * self.samples_per_frame)
-        
-        hann_window = torch.hann_window(self.crossfade_samples * 2)
-        left_hann = hann_window[:self.crossfade_samples]
-        right_hann = hann_window[self.crossfade_samples:]
-        
-        ones_frames = self.atoms_hop_frames - self.crossfade_frames
-        ones = torch.ones(ones_frames * self.samples_per_frame)
-        
-        return torch.cat([zeros, left_hann, ones, right_hann])
-    
     def load_audio_to_tensor(self, audio_path: str) -> torch.Tensor:
-        audio_input, _ = librosa.load(audio_path, sr=self.sr, mono=False)
-        audio_tensor = torch.tensor(audio_input).unsqueeze(0) 
-        
+        audio_input, _ = librosa.load(audio_path, sr=self.load_sr, mono=False)
+        audio_tensor = torch.tensor(audio_input).unsqueeze(0)
+
         if audio_tensor.dim() == 2 or audio_tensor.shape[1] == 1:
             if audio_tensor.dim() == 2:
                 audio_tensor = audio_tensor.unsqueeze(1)
             audio_tensor = audio_tensor.repeat(1, 2, 1)
-            
+
         elif audio_tensor.shape[1] > 2:
             audio_tensor = audio_tensor[:, :2, :]
-            
+
         return audio_tensor.to(self.device).float()
+
+    # Start samples (48 kHz) of the generation units that fit in `total_samples`, and the unit length in 48 kHz samples
+    def _unit_starts(self, total_samples):
+        g = self.geom
+        seg = int(frames_to_samples_48k(g.unit_frames, g))
+        starts = []
+        k = 0
+        while True:
+            start = int(frames_to_samples_48k(k * g.unit_hop_frames, g))
+            if start + seg > total_samples:
+                break
+            starts.append(start)
+            k += 1
+        return starts, seg
 
     @torch.no_grad()
     def encode_audio_to_atoms(self, audio_tensor: torch.Tensor) -> List[torch.Tensor]:
+        """Units [1, frame_dim, U] in model units (standardised latents, plus the scale channel if the codec has one)."""
+        g = self.geom
         audio_tensor = audio_tensor.to(self.device)
         if audio_tensor.dim() == 2:
-            audio_tensor = audio_tensor.unsqueeze(0) 
-            
-        total_samples = audio_tensor.shape[-1]
-        atoms_129D = []
-        
-        for start in range(0, total_samples, self.hop_samples):
-            end = start + self.segment_samples
-            segment = audio_tensor[:, :, start:end]
-            
-            if segment.shape[-1] < self.segment_samples:
-                break
-                
-            latent_list, metadata = self.processor.audio_to_latents(segment, self.sr)
-            latent = torch.cat(latent_list, dim=-1) 
-            scale = metadata["audio_scales"][0]     
-            
-            scale_expanded = scale.unsqueeze(-1).expand(-1, -1, self.atoms_frames) 
-            atom_combined = torch.cat([latent, scale_expanded], dim=1)            
-            
-            atoms_129D.append(atom_combined)
-            
-        return atoms_129D
-    
+            audio_tensor = audio_tensor.unsqueeze(0)
+        starts, seg = self._unit_starts(audio_tensor.shape[-1])
+        units = []
+        if g.mode == "autoregressive":
+            enc = self.codec.encode(audio_tensor, self.load_sr)
+            z = self._standardise(enc.z)
+            for k in range(len(starts)):
+                units.append(z[:, :, k * g.unit_frames:(k + 1) * g.unit_frames])
+            return units
+        for start in starts:
+            enc = self.codec.encode(audio_tensor[:, :, start:start + seg], self.load_sr)
+            z = self._standardise(enc.z)[:, :, :g.unit_frames]
+            if g.has_scale:
+                scale = enc.scale.reshape(-1, 1, 1).expand(-1, 1, g.unit_frames)
+                z = torch.cat([z, scale], dim=1)
+            units.append(z)
+        return units
+
+    def _standardise(self, z):
+        if self.mu is None:
+            return z
+        return (z - self.mu.view(1, -1, 1).to(z.device)) / self.std.view(1, -1, 1).to(z.device)
+
     @torch.no_grad()
     def compute_context_track(self, audio_tensor: torch.Tensor) -> List[torch.Tensor]:
-        context_embeddings = []
         total_samples = audio_tensor.shape[-1]
+        starts, _ = self._unit_starts(total_samples)
+        context_embeddings = []
         last_valid_emb = None
-
-        total_atoms = 0
-        for start in range(0, total_samples, self.hop_samples):
-            end = start + self.segment_samples
+        for start in starts:
+            end = start + self.context_samples
             if end <= total_samples:
-                total_atoms += 1
-            else:
-                break
-
-        for t in range(total_atoms):
-            start_sample = t * self.hop_samples
-            end_sample = start_sample + self.context_samples
-
-            if end_sample <= total_samples:
-                window_audio = audio_tensor[:, :, start_sample:end_sample]
-
                 emb = self.context_model.compute_embedding(
-                    window_audio,
-                    og_sr=self.sr,
+                    audio_tensor[:, :, start:end],
+                    og_sr=self.load_sr,
                     random_extension=self.semantic_random_extension,
                 ).squeeze(0)
-
                 context_embeddings.append(emb)
                 last_valid_emb = emb
-
+            elif last_valid_emb is not None:
+                context_embeddings.append(last_valid_emb)
             else:
-                if last_valid_emb is not None:
-                    context_embeddings.append(last_valid_emb)
-                else:
-                    raise ValueError("Audio file is too short to compute even one context window!")
-
+                raise ValueError("Audio file is too short to compute even one context window!")
         return context_embeddings
 
     @torch.no_grad()
     def compute_structure_track(self, audio_tensor: torch.Tensor) -> List[torch.Tensor]:
         """Extracts 1D Structure Features using the exact matching Sliding Window."""
         audio_tensor = audio_tensor.to(self.device)
-        total_samples = audio_tensor.shape[-1]
+        starts, seg = self._unit_starts(audio_tensor.shape[-1])
+        hop48 = int(round(self.info.hop_length * self.load_sr / self.info.sample_rate))
+        n_fft = max(256, hop48 * 4)
         structures = []
-        
-        n_fft = max(256, self.samples_per_frame * 4)
-        hop_length = self.samples_per_frame
-        
-        for start in range(0, total_samples, self.hop_samples):
-            end = start + self.segment_samples
-            segment = audio_tensor[:, :, start:end]
-            
-            if segment.shape[-1] < self.segment_samples:
-                break
-                
+        for start in starts:
             struct = _compute_structure_features(
-                audio=segment,
-                sr=self.sr,
-                atoms_frames=self.atoms_frames,
+                audio=audio_tensor[:, :, start:start + seg],
+                sr=self.load_sr,
+                atoms_frames=self.geom.unit_frames,
                 n_fft=n_fft,
-                hop_length=hop_length,
-                feature_names=self.structure_feature_names, # <--- NEW: Force exact match
-                mean_pooling=True 
+                hop_length=hop48,
+                feature_names=self.structure_feature_names,
+                mean_pooling=True
             )
             structures.append(struct.to(self.device))
-            
         return structures
-    
+
     def build_base_timeline(self, atoms_129D, context_embeddings, structure_embeddings=None, default_TF=False):
         if len(atoms_129D) != len(context_embeddings):
             raise ValueError("Length mismatch!")
-            
+
         timeline = []
         for t in range(len(atoms_129D)):
             step_dict = {
                 "step": t,
-                "atom_given": atoms_129D[t],           
-                "context_embedding": context_embeddings[t], 
+                "atom_given": atoms_129D[t],
+                "context_embedding": context_embeddings[t],
                 "structure_embedding": structure_embeddings[t] if structure_embeddings else None,
-                "atom_generated": None,                
-                "TF": default_TF                       
+                "atom_generated": None,
+                "TF": default_TF
             }
             timeline.append(step_dict)
-            
-        self.timeline = timeline 
+
+        self.timeline = timeline
         return timeline
-    
+
     def generate_soundscape(
         self,
         clap_embeddings: List[torch.Tensor],
-        nfe: int = 32,
+        nfe: int = 16,
         cfg_scale: float = 3.0,
         output_path: Optional[str] = None,
+        seed: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Generate audio from a sequence of precomputed CLAP embeddings,
-        without requiring an input audio file.
-
-        Each entry in clap_embeddings corresponds to one atom step.
-        Past context is autoregressively filled from generated atoms
-        (dummy zeros for the first memory_buffer_atoms steps).
+        Generate audio from a sequence of precomputed CLAP embeddings (one per unit), without an input audio file.
+        The past is filled from the generated units (zeros, masked, before the first ones).
+        seed: if given, seeds torch before the first solve and is the base seed of stochastic decoders; otherwise the
+        global torch RNG is used as it is.
 
         Returns:
-            audio tensor [2, T] at 48kHz
+            audio tensor [C, N] at the codec rate
         """
+        if seed is not None:
+            torch.manual_seed(seed)
+        self.decode_seed = 0 if seed is None else int(seed)
         timeline = self.build_base_timeline(
             atoms_129D=[None] * len(clap_embeddings),
             context_embeddings=clap_embeddings,
@@ -649,6 +682,53 @@ class FlowInference:
         timeline = self.generate(timeline, NFE=nfe, cfg_scale=cfg_scale)
         return self.decode_timeline(timeline, output_path=output_path)
 
+    # Unit of the past at step i: the given one when teacher-forced, else the generated one ([1, frame_dim, U])
+    def _unit_at(self, timeline, i):
+        step = timeline[i]
+        return (step["atom_given"] if step["TF"] else step["atom_generated"]).to(self.device)
+
+    # Atoms: the M previous atoms (zeros before the start) -> encoded past [1, M, T', d]; the missing ones are null
+    def _atoms_past(self, timeline, t):
+        g = self.geom
+        M = g.memory_units
+        dummy_atom = torch.zeros(1, g.frame_dim, g.unit_frames, device=self.device)
+        past_atoms = [dummy_atom if i < 0 else self._unit_at(timeline, i) for i in range(t - M, t)]
+        past_buffer = torch.cat(past_atoms, dim=0).unsqueeze(0)
+
+        if self.spectral_mode:
+            B_past, N_past, C_past, T_past = past_buffer.shape
+            past_lat = past_buffer[:, :, :128, :]
+            past_scl = past_buffer[:, :, 128:, :]
+            past_lat_flat = past_lat.reshape(-1, 128, T_past).transpose(1, 2)
+            past_spec_flat = time_to_spectral(past_lat_flat)
+            past_spec = past_spec_flat.reshape(B_past, N_past, self.spectral_frames, 384).transpose(2, 3)
+            past_scl_val = past_scl.mean(dim=-1, keepdim=True)
+            past_scl_exp = past_scl_val.expand(-1, -1, -1, self.spectral_frames)
+            past_buffer = torch.cat([past_spec, past_scl_exp], dim=2)
+
+        encoded_past = self.local_encoder(past_buffer)
+        num_nulls = max(0, M - t)
+        if num_nulls > 0:
+            encoded_past[:, :num_nulls, :, :] = self.model.null_past_embed
+        return encoded_past, None
+
+    # AR: one window of the last W frames. When fewer exist (t*B < W) the missing oldest frames are zeros and masked, as
+    # in training (generation-start condition). The clean prefix is the last o frames of that window (zeros if missing).
+    def _ar_past(self, timeline, t):
+        g = self.geom
+        W, o = g.memory_frames, g.prefix_frames
+        frames = [self._unit_at(timeline, i) for i in range(t)]
+        past = torch.cat(frames, dim=-1)[..., -W:] if frames else torch.zeros(1, g.frame_dim, 0, device=self.device)
+        missing = W - past.shape[-1]
+        if missing > 0:
+            past = F.pad(past, (missing, 0))
+        encoded_past = self.local_encoder(past.unsqueeze(1))              # [1, 1, W, d_model]
+        if missing > 0:
+            masked = (torch.arange(W, device=self.device) < missing).view(1, 1, W, 1)
+            encoded_past = torch.where(masked, self.model.null_past_embed[:, :, :W], encoded_past)
+        prefix = past[..., -o:].transpose(1, 2).contiguous() if o > 0 else None
+        return encoded_past, prefix
+
     @torch.no_grad()
     def generate(self, timeline: List[Dict[str, Any]], NFE: int = 32, cfg_scale: float = 3.0) -> List[Dict[str, Any]]:
         self.model.eval()
@@ -657,59 +737,31 @@ class FlowInference:
         if not timeline:
             raise ValueError("Timeline is empty!")
 
-        M = self.segment_length
+        g = self.geom
         total_steps = len(timeline)
-        dummy_atom = torch.zeros(1, 129, self.atoms_frames, device=self.device)
-
         if self.verbose:
             print(f"\n--- Starting Generation over {total_steps} steps (NFE={NFE}, CFG={cfg_scale}) ---")
 
         for t in tqdm(range(total_steps), desc="Solving ODE", disable=not self.verbose):
-            past_atoms = []
-            
-            for i in range(t - M, t):
-                if i < 0:
-                    past_atoms.append(dummy_atom)
-                else:
-                    step_dict = timeline[i]
-                    if step_dict["TF"]:
-                        past_atoms.append(step_dict["atom_given"].to(self.device))
-                    else:
-                        past_atoms.append(step_dict["atom_generated"].to(self.device))
-                        
-            past_buffer = torch.cat(past_atoms, dim=0).unsqueeze(0)
-
-            if self.spectral_mode:
-                B_past, N_past, C_past, T_past = past_buffer.shape
-                past_lat = past_buffer[:, :, :128, :]
-                past_scl = past_buffer[:, :, 128:, :]
-                past_lat_flat = past_lat.reshape(-1, 128, T_past).transpose(1, 2)
-                past_spec_flat = time_to_spectral(past_lat_flat)
-                past_spec = past_spec_flat.reshape(B_past, N_past, self.spectral_frames, 384).transpose(2, 3)
-                past_scl_val = past_scl.mean(dim=-1, keepdim=True)
-                past_scl_exp = past_scl_val.expand(-1, -1, -1, self.spectral_frames)
-                past_buffer = torch.cat([past_spec, past_scl_exp], dim=2)
-
-            encoded_past = self.local_encoder(past_buffer) 
-            
-            num_nulls = max(0, M - t)
-            if num_nulls > 0:
-                encoded_past[:, :num_nulls, :, :] = self.model.null_past_embed
+            if g.mode == "autoregressive":
+                encoded_past, prefix = self._ar_past(timeline, t)
+            else:
+                encoded_past, prefix = self._atoms_past(timeline, t)
 
             context = timeline[t]["context_embedding"].to(self.device)
             if context.dim() == 1:
-                context = context.unsqueeze(0) 
+                context = context.unsqueeze(0)
 
             structure = timeline[t].get("structure_embedding")
             if structure is not None:
                 structure = structure.to(self.device)
                 if structure.dim() == 1:
                     structure = structure.unsqueeze(0)
-                
+
             if self.spectral_mode:
                 x0 = torch.randn(1, self.spectral_frames, 385, device=self.device)
             else:
-                x0 = torch.randn(1, self.atoms_frames, 129, device=self.device)
+                x0 = torch.randn(1, g.unit_frames, g.frame_dim, device=self.device)
 
             pred = self.model.generate(
                 x0=x0,
@@ -717,15 +769,16 @@ class FlowInference:
                 clap_context=context,
                 structure_vector=structure,
                 max_nfe=NFE,
-                cfg_scale=cfg_scale
+                cfg_scale=cfg_scale,
+                prefix=prefix,
             )
 
             if self.spectral_mode:
                 latent_spec = pred[:, :, :384]
-                latent_time = spectral_to_time(latent_spec, self.atoms_frames).to(self.device)
+                latent_time = spectral_to_time(latent_spec, g.unit_frames).to(self.device)
                 scale_spec = pred[:, :, 384:]
                 scale_val = scale_spec.mean(dim=1, keepdim=True)
-                scale_time = scale_val.expand(-1, self.atoms_frames, -1)
+                scale_time = scale_val.expand(-1, g.unit_frames, -1)
                 pred_time = torch.cat([latent_time, scale_time], dim=-1)
                 timeline[t]["atom_generated"] = pred_time.transpose(1, 2)
             else:
@@ -734,84 +787,46 @@ class FlowInference:
         if self.verbose:
             print("✅ Generation Complete!")
         return timeline
-    
-    def _decode_single_atom(self, atom_129D: torch.Tensor, override_scale=None) -> torch.Tensor:
-        latent = atom_129D[:, :128, :] 
-        if override_scale is not None:
-            scale_val = override_scale
-        else:
-            scale_val = torch.abs(atom_129D[:, 128, :]).mean(dim=-1, keepdim=True)       
 
-        metadata = {
-            "audio_scales": [scale_val.squeeze(0).float()],
-            "padding_mask": torch.ones(
-                (1, latent.shape[-1] * self.samples_per_frame), 
-                dtype=torch.bool, device=self.device
-            )
-        }
-        audio = self.processor.decode_latents_audio(latent, metadata=metadata)
-        return audio.cpu()
-
+    # Atoms: overlap-add (with V1's scale smoothing iff the codec has a scale). AR: the streaming decoder, once per block.
     @torch.no_grad()
     def decode_timeline(self, timeline: List[Dict[str, Any]], output_path: str = None, method: str = "ola_smooth"):
         if not timeline:
             raise ValueError("Timeline is empty!")
-            
-        total_steps = len(timeline)
-        total_samples = (total_steps - 1) * self.hop_samples + self.segment_samples
-        output_buffer = torch.zeros(1, 2, total_samples) 
-        ola_window = self.ola_window.view(1, 1, -1).cpu()
+        if method != "ola_smooth":
+            raise ValueError(f"Method '{method}' removed/unsupported. Please use 'ola_smooth'.")
+        g = self.geom
+        seed = getattr(self, "decode_seed", 0)
 
-        if method == "ola_smooth":
+        units, generated = [], []
+        for step in timeline:
+            atom = step.get("atom_generated")
+            is_generated = atom is not None
+            if atom is None:
+                atom = step.get("atom_given")
+            if atom is None:
+                atom = torch.zeros(1, g.frame_dim, g.unit_frames, device=self.device)
+            units.append(atom.to(self.device))
+            generated.append(is_generated)
+
+        if g.mode == "autoregressive":
+            renderer = StreamRenderer(self.codec)
+            for atom in units:
+                renderer.push(self._unstandardise(atom[:, :g.latent_dim, :]))
+            audio = renderer.finish()
+        else:
             if self.verbose:
                 print("\n--- Rendering Audio Timeline (Smooth Mode) ---")
-                
-            alpha_smooth = 0.6      
-            max_jump = 1.15  
-            max_drop = 0.85  
-            prev_scale = None
-
-            for t in tqdm(range(total_steps), desc="Mixing Audio", disable=not self.verbose):
-                step_dict = timeline[t]
-                
-                atom_to_decode = step_dict.get("atom_generated")
-                is_generated = True
-                
-                if atom_to_decode is None:
-                    atom_to_decode = step_dict.get("atom_given")
-                    is_generated = False
-                    
-                if atom_to_decode is None:
-                    continue
-
-                if is_generated:
-                    raw_scale = torch.abs(atom_to_decode[:, 128, :]).mean(dim=-1, keepdim=True)
-                    if prev_scale is None:
-                        smoothed_scale = raw_scale
-                    else:
-                        target_scale = torch.clamp(raw_scale, prev_scale * max_drop, prev_scale * max_jump)
-                        smoothed_scale = (alpha_smooth * target_scale) + ((1.0 - alpha_smooth) * prev_scale)
-                        
-                    prev_scale = smoothed_scale
-                    audio = self._decode_single_atom(atom_to_decode, override_scale=smoothed_scale)
-                else:
-                    audio = self._decode_single_atom(atom_to_decode)
-                    
-                audio = audio * ola_window
-                
-                start_sample = t * self.hop_samples
-                end_sample = start_sample + self.segment_samples
-                output_buffer[:, :, start_sample:end_sample] += audio
-                
-        else:
-            raise ValueError(f"Method '{method}' removed/unsupported. Please use 'ola_smooth'.")
-
-        final_audio_tensor = output_buffer.squeeze(0)
+            audio = render_atoms(self.codec, units, g, self.mu, self.std, base_seed=seed, smooth=generated)
+        final_audio_tensor = audio.cpu()
 
         if output_path:
-            sf_audio = final_audio_tensor.transpose(0, 1).numpy()
-            sf.write(output_path, sf_audio, self.sr)
+            sf.write(str(output_path), final_audio_tensor.transpose(0, 1).numpy(), self.sr)
             if self.verbose:
-                print(f"✅ Audio perfectly rendered and saved to: {output_path}")
-            
+                print(f"✅ Audio rendered and saved to: {output_path}")
         return final_audio_tensor
+
+    def _unstandardise(self, z):
+        if self.mu is None:
+            return z
+        return z * self.std.view(1, -1, 1).to(z.device) + self.mu.view(1, -1, 1).to(z.device)

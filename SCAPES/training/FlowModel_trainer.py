@@ -710,12 +710,76 @@ class FlowTrainer:
         l_null = self._eval_loss(loader, null_past=True)[0]
         return {"L_real": l_real, "L_null": l_null, "ratio": l_real / l_null}
 
-    # Validation audio is rendered by inference/render.py (slice B5); until then it is skipped.
+    # Teacher-forced validation audio: for each chosen file, consecutive units of its val region (train if it has none) are
+    # predicted from the real past and rendered by inference/render.py (overlap-add for atoms, the streaming decoder for AR).
     @torch.no_grad()
     def generate_validation_audio(self, epoch, NFE=32):
         if not self.val_audio_files:
             return
-        print("⚠️ Validation audio is not available yet (it moves to inference/render.py in slice B5); skipped.")
+        import soundfile as sf
+        from SCAPES.codecs import get_codec
+        from SCAPES.inference.render import StreamRenderer, render_atoms
+
+        self.model.eval()
+        self.local_encoder.eval()
+        g = self.geom
+        codec = get_codec(g.codec, self.device)
+        step = g.unit_frames if self.mode == "autoregressive" else g.unit_hop_frames
+        num_units = max(1, int(self.val_duration * g.frame_rate // step))
+        regions = self.dataset._regions
+
+        for target_file in self.val_audio_files:
+            by_start = {}
+            for region in ("train", "val"):
+                for i, (fname, start) in enumerate(self.dataset.all_indices):
+                    if fname == target_file and regions[i] == region:
+                        by_start.setdefault(region, {})[start] = i
+            starts = by_start.get("val") or by_start.get("train")
+            if not starts:
+                continue
+            # consecutive units: each target starts one step after the previous one
+            first = min(starts)
+            seq = []
+            while first + len(seq) * step in starts and len(seq) < num_units:
+                seq.append(starts[first + len(seq) * step])
+
+            atoms = []
+            for idx in tqdm(seq, desc=f"Generating {target_file} (TF)"):
+                raw_batch = self.dataset[idx]
+                for k in raw_batch:
+                    if isinstance(raw_batch[k], torch.Tensor):
+                        raw_batch[k] = raw_batch[k].unsqueeze(0)
+                gt_past, _, context, structure = self._prepare_batch(raw_batch)[:4]
+                encoded_past, prefix = self._encode_past(gt_past)
+                if self.spectral_mode:
+                    x0 = torch.randn(1, self.spectral_frames, self.frame_dim, device=self.device)
+                else:
+                    x0 = torch.randn(1, self.unit_frames, self.frame_dim, device=self.device)
+                pred_raw = self.model.generate(x0, encoded_past, context, structure_vector=structure, max_nfe=NFE,
+                                               cfg_scale=self.model_config['cfg_scale'], prefix=prefix)
+                if self.spectral_mode:
+                    latent_time = spectral_to_time(pred_raw[:, :, :384], self.atom_frames)
+                    scale_time = pred_raw[:, :, 384:].mean(dim=1, keepdim=True).expand(-1, self.atom_frames, -1)
+                    pred = torch.cat([latent_time, scale_time], dim=-1).transpose(1, 2)
+                else:
+                    pred = pred_raw.transpose(1, 2)
+                atoms.append(pred)
+
+            if self.mode == "autoregressive":
+                renderer = StreamRenderer(codec)
+                for a in atoms:
+                    z = a[:, :self.n_latent, :]
+                    if self.standardize:
+                        z = z * self.std.view(1, -1, 1) + self.mu.view(1, -1, 1)
+                    renderer.push(z)
+                audio = renderer.finish()
+            else:
+                audio = render_atoms(codec, atoms, g, self.mu, self.std)
+
+            file_stem = Path(target_file).stem
+            sf.write(self.val_dir / f"epoch_{epoch}_{file_stem}_TF.wav", audio.cpu().T.numpy(), g.sample_rate)
+
+        print(f"✅ Validation audio for epoch {epoch} saved!")
 
     # ==========================================
     # DISCRIMINATOR TRAINING

@@ -1,4 +1,5 @@
-"""Entry points of the V2 pipeline. build_run_config, run_dataprep, build_trainer and run_training so far; run_generation comes later."""
+"""Entry points of the V2 pipeline: build_run_config, run_dataprep, build_trainer, run_training and run_generation."""
+import math
 import random
 from pathlib import Path
 
@@ -174,3 +175,37 @@ def run_training(dataset_path, save_path, config_dir=None, resume=None, max_step
     trainer.train(epochs=cfg.epochs, audio_val_freq=cfg.audio_val_freq, val_nfe=cfg.val_nfe)
     print("Training complete!")
     return Path(save_path)
+
+
+# Number of generation units that cover `seconds` of audio: AR blocks of B frames, or atoms placed H frames apart
+def units_for_seconds(geom, seconds: float) -> int:
+    frames = seconds * geom.frame_rate
+    if geom.mode == "autoregressive":
+        return max(1, math.ceil(frames / geom.unit_frames - 1e-6))
+    return max(1, math.ceil((frames - geom.unit_frames) / geom.unit_hop_frames - 1e-6) + 1)
+
+
+# Generates audio from CLAP prompts with a trained model and writes a wav (codec rate). One prompt per unit: a single
+# prompt is held for every unit; fewer prompts than units hold the last one. The number of units is unit_count, or
+# enough for `seconds`, or len(prompts). out_path without a suffix is a folder and the file is generation.wav in it.
+# checkpoint "best" falls back to "last" when training had no validation split. Returns the path of the wav.
+def run_generation(model_dir, out_path, prompts: list, unit_count=None, seconds=None, seed: int = 0, nfe: int = 16,
+                   cfg_scale: float = 3.0, checkpoint="best") -> Path:
+    import soundfile as sf
+    from SCAPES.inference.FlowInference import FlowInference
+
+    if not prompts:
+        raise ValueError("run_generation needs at least one prompt")
+    engine = FlowInference(model_dir, checkpoint=checkpoint)
+    if unit_count is None:
+        unit_count = units_for_seconds(engine.geom, seconds) if seconds is not None else len(prompts)
+    clap = [torch.as_tensor(prompts[min(k, len(prompts) - 1)]).reshape(-1).float() for k in range(unit_count)]
+
+    out_path = Path(out_path)
+    if out_path.suffix == "":
+        out_path = out_path / "generation.wav"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    audio = engine.generate_soundscape(clap, nfe=nfe, cfg_scale=cfg_scale, seed=seed)
+    sf.write(str(out_path), audio.transpose(0, 1).numpy(), engine.sr)
+    print(f"Generated {unit_count} units ({audio.shape[-1] / engine.sr:.2f} s) -> {out_path}")
+    return out_path
