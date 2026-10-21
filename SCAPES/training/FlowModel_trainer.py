@@ -232,6 +232,8 @@ class FlowTrainer:
             self.train_losses = {"total": [], "latent": [], "scale": []}
             self.val_losses   = {"total": [], "latent": [], "scale": []}
 
+        # Epochs without improvement at the end of the saved history (restored on resume, so patience counts exactly)
+        self.resume_no_improve = 0
         if resume_from is not None and resume_from is not False:
             resolved_path = self._resolve_resume_path(resume_from)
             if resolved_path:
@@ -298,6 +300,12 @@ class FlowTrainer:
 
         self.train_losses = state.get('train_losses', self.train_losses)
         self.val_losses = state.get('val_losses', self.val_losses)
+
+        # Patience counter: validations since the first occurrence of the best val loss in the saved history
+        val_total = self.val_losses.get("total", [])
+        if val_total and min(val_total) <= self.best_metric:
+            self.resume_no_improve = len(val_total) - 1 - val_total.index(min(val_total))
+        print(f"   Patience counter restored: {self.resume_no_improve}")
 
         print(f"✅ Successfully resumed! Starting at Epoch {self.start_epoch} (Best Metric so far: {self.best_metric:.4f})")
 
@@ -900,8 +908,6 @@ class FlowTrainer:
             self.best_metric = avg_v_total
             torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "best_flow_model.pt")
             torch.save({'model_state_dict': self.local_encoder.state_dict()}, self.ckpt_dir / "best_local_encoder.pt")
-            if self.save_resume_states:
-                torch.save(self._trainer_state(self.start_epoch), self.ckpt_dir / "best_trainer_state.pt")
             print("🌟 Saved new best models!")
         return avg_v_total
 
@@ -995,7 +1001,7 @@ class FlowTrainer:
         print(f"{'='*60}")
 
         self.x_hat_buffer = []
-        best_ref = {"value": self.best_metric, "no_improve": 0}
+        best_ref = {"value": self.best_metric, "no_improve": self.resume_no_improve}
         stop = False
 
         for epoch in range(1, epochs + 1):
