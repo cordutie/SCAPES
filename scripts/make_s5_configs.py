@@ -18,6 +18,9 @@ sys.path.insert(0, str(REPO))
 from SCAPES.pipeline import build_run_config
 
 SNIPPETS = {"encodec24k": "encodec24k_ar.gin", "spectrostream": "spectrostream_ar.gin", "codicodec": "codicodec_atoms.gin"}
+# CoDiCodec has 15 steps per epoch: validate every 100 steps so that patience 10 means 1000 steps (the others have 97-118
+# steps per epoch, so the default of one validation per epoch already gives about 1000 steps)
+VAL_EVERY_STEPS = {"codicodec": 100}
 AR_CODECS = ("encodec24k", "spectrostream")
 
 
@@ -41,6 +44,8 @@ def main():
             "training.log_every = 50",
             "training.seed = 0",
         ]
+        if codec in VAL_EVERY_STEPS:
+            overrides.append(f"training.val_every_steps = {VAL_EVERY_STEPS[codec]}   # patience 10 = 10 validations = 1000 steps")
         if codec in AR_CODECS:
             overrides.append(f"ar.prefix_seconds = {prefix}")
         build_run_config(Path(args.dataset) / "config", [REPO / "SCAPES" / "config" / "codecs" / snippet], overrides,

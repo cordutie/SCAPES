@@ -341,6 +341,7 @@ class TrainingConfig:
     standardize_latents: bool = False
     past_noise: float = 0.0
     max_steps: Optional[int] = None   # None -> epochs with V1 patience
+    val_every_steps: Optional[int] = None   # None -> validate once per epoch; else every N steps, patience counts validations
     log_every: int = 50
     seed: Optional[int] = None
 
@@ -374,6 +375,7 @@ _TRAINING_GIN_MAP = [
     (["training", "standardize_latents"], "standardize_latents"),
     (["training", "past_noise"], "past_noise"),
     (["training", "max_steps"], "max_steps"),
+    (["training", "val_every_steps"], "val_every_steps"),
     (["training", "log_every"], "log_every"),
     (["training", "seed"], "seed"),
 ]

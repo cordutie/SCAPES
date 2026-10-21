@@ -79,12 +79,15 @@ class FlowTrainer:
         self.conditioning_dropout = config.conditioning_dropout
         self.past_noise = config.past_noise
         self.max_steps = config.max_steps
+        self.val_every_steps = config.val_every_steps   # None: validate once per epoch
         self.log_every = config.log_every
         self.batch_size = config.batch_size
         self.global_step = 0
         self._last_val_step = None
         self._last_val_metric = None
         self._last_val_per_file = {}
+        self._patience = None        # (best_ref, patience) of the running stage, set by _run_epoch
+        self._stop_requested = False  # set by _validate when patience ran out (val_every_steps mode)
 
         # Geometry and dimensions come from the dataset, not from gin
         self.geom = geom = dataset.geom
@@ -523,9 +526,14 @@ class FlowTrainer:
         win = {k: zero.clone() for k in keys}
         n_steps = n_win = 0
 
-        # Validation inside long epochs (only with max_steps): every 500 steps
-        val_every = 500 if (self.max_steps is not None and self.val_loader is not None
-                            and len(self.train_loader) > 500) else None
+        # Validation inside the epoch: every val_every_steps steps if set, else (only with max_steps) every 500 steps
+        # in epochs longer than 500 steps
+        if self.val_every_steps is not None and self.val_loader is not None:
+            val_every = self.val_every_steps
+        elif self.max_steps is not None and self.val_loader is not None and len(self.train_loader) > 500:
+            val_every = 500
+        else:
+            val_every = None
 
         # Build regularizer list once
         active_regularizers = []
@@ -626,6 +634,8 @@ class FlowTrainer:
                 self._validate()
                 self.model.train()
                 self.local_encoder.train()
+                if self._stop_requested:
+                    break
 
         n = max(n_steps, 1)
         e = {k: v.item() / n for k, v in ep.items()}
@@ -904,6 +914,17 @@ class FlowTrainer:
             self.logger.log_val(self.global_step, self._last_val_per_file)
 
         self._last_val_metric = avg_v_total
+        # val_every_steps mode: patience counts validations (not epochs); off when max_steps is set, as before
+        if self.val_every_steps is not None and self._patience is not None and self.max_steps is None:
+            best_ref, patience = self._patience
+            if avg_v_total < best_ref["value"]:
+                best_ref["value"] = avg_v_total
+                best_ref["no_improve"] = 0
+            else:
+                best_ref["no_improve"] += 1
+                if best_ref["no_improve"] >= patience:
+                    print(f"  Early stopping at step {self.global_step} (no improvement for {patience} validations)")
+                    self._stop_requested = True
         if avg_v_total < self.best_metric:
             self.best_metric = avg_v_total
             torch.save({'model_state_dict': self.model.state_dict()}, self.ckpt_dir / "best_flow_model.pt")
@@ -973,11 +994,19 @@ class FlowTrainer:
     # One epoch of stage 1 or 2: train, validate (if there is a val loader), save, count patience.
     # Returns True if training must stop (max_steps reached, or patience exhausted).
     def _run_epoch(self, global_epoch, audio_val_freq, val_nfe, patience, best_ref, discriminator=None, collect_adv=False):
+        self._patience = (best_ref, patience)
         train_out = self.train_epoch(discriminator=discriminator, collect_adv=collect_adv)
         self._record_train(train_out)
-        metric = self._validate()
+        if self.val_every_steps is None:
+            metric = self._validate()
+        else:
+            # validations happen every val_every_steps inside train_epoch; one more at the end only when max_steps stops the run
+            metric = self._validate() if self._max_steps_reached() else None
         self._epoch_bookkeeping(global_epoch, audio_val_freq, val_nfe)
         self.start_epoch += 1
+
+        if self.val_every_steps is not None and self._stop_requested:
+            return True
 
         if self._max_steps_reached():
             print(f"  Stopped at max_steps = {self.max_steps}")
