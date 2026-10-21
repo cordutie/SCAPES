@@ -172,7 +172,9 @@ def run_training(dataset_path, save_path, config_dir=None, resume=None, max_step
         build_semantics_folder(csv_path=cherry_csv, output_dir=Path(save_path) / "semantics", dataset=trainer.dataset)
 
     cfg = load_training_config(config_dir / "training.gin")
-    trainer.train(epochs=cfg.epochs, audio_val_freq=cfg.audio_val_freq, val_nfe=cfg.val_nfe)
+    # with a step budget the epoch count must not cut the run short: every epoch has at least one step
+    epochs = cfg.epochs if trainer.max_steps is None else max(cfg.epochs, trainer.max_steps)
+    trainer.train(epochs=epochs, audio_val_freq=cfg.audio_val_freq, val_nfe=cfg.val_nfe)
     print("Training complete!")
     return Path(save_path)
 
