@@ -280,7 +280,7 @@ def run_model(args):
                                     args.n_boot, 0, "floor")
 
     metrics = {
-        "name": args.name, "codec": geom.codec, "mode": geom.mode,
+        "name": args.name, "note": args.note, "codec": geom.codec, "mode": geom.mode,
         "checkpoint": {"flow": str(ckpt_paths[0]), "local_encoder": str(ckpt_paths[1]), "which": args.checkpoint,
                        "flow_sha256_12": file_sha(ckpt_paths[0])},
         "geometry": {"unit_frames": geom.unit_frames, "unit_hop_frames": geom.unit_hop_frames,
@@ -362,7 +362,8 @@ def write_summary(out_root: Path):
     for name, m in models.items():
         md.append(f"- {name}: codec {m['codec']}, mode {m['mode']}, checkpoint {Path(m['checkpoint']['flow']).name} "
                   f"(sha256 {m['checkpoint']['flow_sha256_12']}...), seed {m['generation']['seed']}, nfe {m['generation']['nfe']}, "
-                  f"cfg {m['generation']['cfg']}, region [{m['region']['start_s']:.1f}, {m['region']['end_s']:.2f}) s")
+                  f"cfg {m['generation']['cfg']}, region [{m['region']['start_s']:.1f}, {m['region']['end_s']:.2f}) s"
+                  + (f". {m['note']}" if m.get("note") else ""))
     md += ["", "## MSS (big windows)", "", mss_table(models), "",
            "## KAD (CLAP embedding, 100 x unbiased MMD^2, RBF kernel, sigma = median distance of the reference)", "",
            f"Reference set: the {first['kad']['n_files']} original clips. Bootstrap: {first['kad']['n_boot']} resamples of the clips "
@@ -439,6 +440,9 @@ smoothing). AR blocks go through the codec's stateful streaming decoder, with no
 - With teacher forcing the past is always perfect; free-running generation is harder and will score worse.
 - Clip-level KAD has 16 vs 16 items, far below the N >= 100 the KAD paper tested; the estimate is noisy and can be negative.
   Segment-level KAD has 80 vs 80 items but the 5 segments of a clip are correlated, so it is not 80 independent samples.
+- Every evaluation set is paired with the reference by file (the same 16 files), while the white noise is not. The pairing
+  raises the cross term of the MMD, which is why the floor and the codec round trip can come out negative: compare rows with
+  each other (the paired differences in the summary), not with zero.
 - A sound's generated version is a new draw, not a copy: the spectral metrics at long windows are insensitive to the fine
   structure, and MSS and KAD are not perceptual scores. Listen.
 - The original reference WAVs are 16-bit renderings of the 24-bit files; the metrics use the float signal.
@@ -459,6 +463,7 @@ def main():
     ap.add_argument("--cfg", type=float, default=3.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--n-boot", type=int, default=200)
+    ap.add_argument("--note", default="", help="free text kept in metrics.json and shown in the summary")
     ap.add_argument("--max-files", type=int, default=0, help="debug: only the first N files")
     ap.add_argument("--summarize-only", action="store_true")
     args = ap.parse_args()
