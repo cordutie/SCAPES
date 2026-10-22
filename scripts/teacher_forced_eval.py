@@ -441,7 +441,7 @@ The first 0.2 s of the atoms output are silent by design (see below).
 
 {listening_order(models)}
 
-## What was generated (teacher forcing, semantic reconstruction)
+## What was generated (teacher forcing: real past, real per-unit CLAP)
 
 For every unit of the model (an atom with its hop, or an AR block) over the first 10 s: the past is the REAL latent of the
 original (the stored codec encoding in `datasets/microtex/representations/<codec>__<encoding>/`), the CLAP condition is the
