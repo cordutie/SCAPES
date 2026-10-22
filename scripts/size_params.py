@@ -1,7 +1,7 @@
 """Exact parameter counts (flow model + local encoder) of every model size for the four codecs, random init on CPU.
 
     ../venv_SCAPES/bin/python scripts/size_params.py --out ../runs/size_params
-Sizes: the loader's table (small, medium, large, extra_large, audiobox) plus vsmall (256/4/4/1024) and mid (384/6/5/1536).
+Sizes: the loader's table (small, medium, large, extra_large, audiobox) plus petite (256/4/4/1024) and mid (384/6/5/1536).
 Geometry: the S5 geometries (AR 8/120 frames for encodec24k and spectrostream, atoms for the others; encodec48k with M = 1 as the trained run).
 Also fits per-layer parameters against 14 d^2 + 2 d ff and breaks the model into blocks. No GPU, no training.
 """
@@ -15,7 +15,7 @@ import torch
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-SIZES = {"vsmall": (256, 4, 4, 1024), "mid": (384, 6, 5, 1536), "small": (512, 8, 6, 2048), "medium": (768, 12, 8, 2048),
+SIZES = {"petite": (256, 4, 4, 1024), "tiny": (384, 6, 5, 1536), "small": (512, 8, 6, 2048), "medium": (768, 12, 8, 2048),
          "large": (1024, 16, 12, 2048), "extra_large": (1280, 20, 16, 2048), "audiobox": (1024, 16, 24, 4096)}
 CODECS = {"encodec24k": "autoregressive", "spectrostream": "autoregressive", "encodec48k": "atoms", "codicodec": "atoms"}
 GEOMETRY = {"encodec48k": {"dataset.memory_buffer_atoms": 1}}

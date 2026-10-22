@@ -276,13 +276,19 @@ def _get_nested(config, keys, default=None):
 
 # ─── Training Config ────────────────────────────────────────────────────────────
 
+# Canonical names in size order: petite, tiny, small, medium, large, extra_large (audiobox is unnamed). Musical-dynamics aliases:
+# pp = petite, p = tiny, mp = small, mf = medium, f = large, ff = extra_large. Explicit d_model/nhead/num_layers/ff keep working.
 _SIZE_TABLE = {
+    "petite":      {"d_model": 256,  "num_layers": 4,  "nhead": 4,  "dim_feedforward": 1024},
+    "tiny":        {"d_model": 384,  "num_layers": 5,  "nhead": 6,  "dim_feedforward": 1536},
     "small":       {"d_model": 512,  "num_layers": 6,  "nhead": 8,  "dim_feedforward": 2048},
     "medium":      {"d_model": 768,  "num_layers": 8,  "nhead": 12, "dim_feedforward": 2048},
     "large":       {"d_model": 1024, "num_layers": 12, "nhead": 16, "dim_feedforward": 2048},
     "extra_large": {"d_model": 1280, "num_layers": 16, "nhead": 20, "dim_feedforward": 2048},
     "audiobox":    {"d_model": 1024, "num_layers": 24, "nhead": 16, "dim_feedforward": 4096},
 }
+_SIZE_TABLE.update({"pp": _SIZE_TABLE["petite"], "p": _SIZE_TABLE["tiny"], "mp": _SIZE_TABLE["small"], "mf": _SIZE_TABLE["medium"],
+                    "f": _SIZE_TABLE["large"], "ff": _SIZE_TABLE["extra_large"]})
 
 
 @dataclass

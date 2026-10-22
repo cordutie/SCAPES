@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "scripts"))
 import val_split_report as vsr
 
@@ -35,3 +36,14 @@ def test_eval_small_all_dry_and_guard(tmp_path):
     assert "reserve" not in out.stdout
     guard = subprocess.run(cmd + ["--only", "d"], capture_output=True, text=True)
     assert guard.returncode != 0 and "chain has not finished" in (guard.stderr + guard.stdout)
+
+
+def test_size_aliases_resolve_to_the_same_config():
+    from SCAPES.data.config_loader import _SIZE_TABLE
+    groups = {"petite": "pp", "tiny": "p", "small": "mp", "medium": "mf", "large": "f", "extra_large": "ff"}
+    for name, alias in groups.items():
+        assert _SIZE_TABLE[name] == _SIZE_TABLE[alias], name
+    assert _SIZE_TABLE["petite"] == {"d_model": 256, "num_layers": 4, "nhead": 4, "dim_feedforward": 1024}
+    assert _SIZE_TABLE["tiny"] == {"d_model": 384, "num_layers": 5, "nhead": 6, "dim_feedforward": 1536}
+    assert "ppp" not in _SIZE_TABLE
+    assert "audiobox" in _SIZE_TABLE and all(v["d_model"] // v["nhead"] == 64 for v in _SIZE_TABLE.values())

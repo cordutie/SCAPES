@@ -39,8 +39,14 @@ CONFIGS = [("nfe32_cfg3", 32, 3.0, False), ("nfe16_cfg3", 16, 3.0, False), ("nfe
            ("nfe32_cfg3_bf16", 32, 3.0, True), ("nfe16_cfg3_bf16", 16, 3.0, True)]
 
 
+# Folders of the trained runs of each size (canonical names; the old runs keep their folders)
+TRAINED = {"large": "s5", "small": "s5_small", "tiny": "s5_tiny", "petite": "s5_petite"}
+
+
 def models(args):
     out = {}
+    if args.trained:     # trained models of the given sizes: runs/<folder>/<codec>/model
+        return {f"{c}_{size}": str(RUNS / TRAINED[size] / c / "model") for size in args.trained for c in CODECS}
     if args.random_init:      # untrained weights of any size, timing only
         return {f"{c}_{s}_random": f"random:{c}:{s}" for s in args.sizes for c in CODECS}
     for size, runs in (("large", args.large_runs), ("small", args.small_runs)):
@@ -261,12 +267,20 @@ def main():
     ap.add_argument("--no-bf16", action="store_true")
     ap.add_argument("--only", nargs="+", default=None, help="model names such as encodec24k_small (default all 8)")
     ap.add_argument("--worker", default=None, help="internal: bench this model name in this process")
+    ap.add_argument("--trained", nargs="+", choices=list(TRAINED), default=None,
+                    help="bench the trained models of these sizes (large small tiny petite) instead of the default large+small pair; "
+                         "bf16 is off unless --bf16 is given; default --out is runs/rtf_bench_all")
+    ap.add_argument("--bf16", action="store_true", help="with --trained: add the bf16 columns")
     ap.add_argument("--random-init", action="store_true", help="time untrained (random-weight) models of the sizes in --sizes: timing only, no quality meaning")
-    ap.add_argument("--sizes", nargs="+", default=["vsmall", "mid", "small", "medium", "large", "extra_large", "audiobox"],
+    ap.add_argument("--sizes", nargs="+", default=["petite", "tiny", "small", "medium", "large", "extra_large", "audiobox"],
                     help="with --random-init: size names of scripts/size_params.py")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
+    if a.trained:
+        a.no_bf16 = not a.bf16
+        if a.out == str(RUNS / "rtf_bench"):
+            a.out = str(RUNS / "rtf_bench_all")
     allm = models(a)
     names = a.only or list(allm)
     if a.worker:
@@ -285,7 +299,11 @@ def main():
         if busy:
             sys.exit("another process uses the GPU: " + "; ".join(busy) + " (use --force to override)")
         log = Path(a.small_runs) / "chain.log"
-        if not (log.exists() and "chain done" in log.read_text()):
+        if a.trained:
+            missing = [z for z in a.trained if z in ("tiny", "petite") and not (RUNS / TRAINED[z] / "chain_done_marker").exists()]
+            if missing:
+                sys.exit(f"the training chain of {missing} has not finished (no chain_done_marker); use --force to override")
+        elif not (log.exists() and "chain done" in log.read_text()):
             sys.exit("the training chain has not finished (no 'chain done' in chain.log); use --force to override")
     out = Path(a.out)
     if out.exists() and (out / "rtf_bench.json").exists():
@@ -296,7 +314,7 @@ def main():
     for n in names:
         cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", n, "--out", str(out), "--calls", str(a.calls),
                "--warmup", str(a.warmup), "--device", a.device, "--large-runs", a.large_runs, "--small-runs", a.small_runs] + \
-              (["--no-bf16"] if a.no_bf16 else []) + (["--random-init", "--sizes", *a.sizes] if a.random_init else [])
+              (["--no-bf16"] if a.no_bf16 else []) + (["--trained", *a.trained] if a.trained else []) + (["--random-init", "--sizes", *a.sizes] if a.random_init else [])
         with open(out / f"{n}.log", "w") as fh:
             code = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT).returncode
         if code != 0:
