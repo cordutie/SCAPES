@@ -327,6 +327,24 @@ def mss_table(models: dict) -> str:
     return "\n".join(lines)
 
 
+# Band-limited MSS (bins below max_hz only), mean over the three windows; same rows as the full-band table
+def band_table(bands: dict) -> str:
+    if not bands:
+        return ""
+    hz = next(iter(bands.values()))["max_hz"]
+    lines = [f"## MSS restricted to bins below {hz / 1000:.0f} kHz (mean over the three windows)", "",
+             "Recomputed from the 16-bit wavs (scripts/eval_extra.py), so the full-band values of the table above can differ "
+             "slightly from a recomputation (quantisation floor in near-empty bins). Added to find out whether the empty "
+             "high band dominates the log-L1.", "",
+             "| row | L1 | SC |", "|---|---|---|"]
+    for name, b in bands.items():
+        for row, label in [("generated", "generated (teacher forced)"), ("codec_roundtrip", "codec round trip"),
+                           ("white_noise", "white noise (RMS matched)"), ("delayed_0.5s", "original delayed 0.5 s")]:
+            r = b["rows"][row]
+            lines.append(f"| {name}: {label} | {r['mean_log_l1']:.3f} | {r['mean_spec_conv']:.3f} |")
+    return "\n".join(lines)
+
+
 def kad_cell(v: dict) -> str:
     return f"{v['kad']:.2f} (boot std {v['boot_std']:.2f}, 95% [{v['ci95'][0]:.2f}, {v['ci95'][1]:.2f}])"
 
@@ -354,6 +372,14 @@ def write_summary(out_root: Path):
     if not models:
         print("no metrics.json found")
         return
+    # band-limited MSS (scripts/eval_extra.py, from the saved wavs), kept next to the full-band numbers
+    bands = {}
+    for name in models:
+        bp = out_root / name / "mss_band.json"
+        if bp.exists():
+            bands[name] = json.loads(bp.read_text())
+            models[name]["mss_band"] = {"max_hz": bands[name]["max_hz"], "rows": bands[name]["rows"],
+                                        "source": "recomputed from the 16-bit wavs by scripts/eval_extra.py"}
     (out_root / "summary.json").write_text(json.dumps(models, indent=1))
     first = next(iter(models.values()))
     nf = first["kad"]["n_files"]
@@ -368,6 +394,7 @@ def write_summary(out_root: Path):
                   f"cfg {m['generation']['cfg']}, region [{m['region']['start_s']:.1f}, {m['region']['end_s']:.2f}) s"
                   + (f". {m['note']}" if m.get("note") else ""))
     md += ["", "## MSS (big windows)", "", mss_table(models), "",
+           band_table(bands), "",
            "## KAD (CLAP embedding, 100 x unbiased MMD^2, RBF kernel, sigma = median distance of the reference)", "",
            f"Reference set: the {first['kad']['n_files']} original clips. Bootstrap: {first['kad']['n_boot']} resamples of the clips "
            f"with replacement (paired across rows). The clip-level estimate is {nf} vs {nf} items, far below the N >= 100 the "

@@ -57,13 +57,17 @@ def stft_magnitude(x: np.ndarray, n_fft: int) -> torch.Tensor:
 
 
 # Per FFT size: log-magnitude L1 (natural log) and spectral convergence of y against the reference x
-def mss_scales(x: np.ndarray, y: np.ndarray, fft_sizes=MSS_FFT_SIZES, eps: float = LOG_EPS) -> dict:
+# max_hz (default None = full band): only the bins below this frequency enter both measures
+def mss_scales(x: np.ndarray, y: np.ndarray, fft_sizes=MSS_FFT_SIZES, eps: float = LOG_EPS, max_hz: float = None) -> dict:
     n = min(len(x), len(y))
     out = {}
     for n_fft in fft_sizes:
         if n < n_fft:
             raise ValueError(f"signal of {n} samples is shorter than the FFT size {n_fft}")
         s, s2 = stft_magnitude(x[:n], n_fft), stft_magnitude(y[:n], n_fft)
+        if max_hz is not None:
+            k = int(np.ceil(max_hz * n_fft / SR))
+            s, s2 = s[:, :k], s2[:, :k]
         l1 = (torch.log(s + eps) - torch.log(s2 + eps)).abs().mean().item()
         sc = (torch.linalg.norm(s - s2) / torch.linalg.norm(s)).item()
         out[n_fft] = {"log_l1": l1, "spec_conv": sc}
@@ -71,8 +75,8 @@ def mss_scales(x: np.ndarray, y: np.ndarray, fft_sizes=MSS_FFT_SIZES, eps: float
 
 
 # Adds the mean over scales
-def mss(x: np.ndarray, y: np.ndarray, fft_sizes=MSS_FFT_SIZES, eps: float = LOG_EPS) -> dict:
-    scales = mss_scales(x, y, fft_sizes, eps)
+def mss(x: np.ndarray, y: np.ndarray, fft_sizes=MSS_FFT_SIZES, eps: float = LOG_EPS, max_hz: float = None) -> dict:
+    scales = mss_scales(x, y, fft_sizes, eps, max_hz)
     return {"scales": scales,
             "mean_log_l1": float(np.mean([v["log_l1"] for v in scales.values()])),
             "mean_spec_conv": float(np.mean([v["spec_conv"] for v in scales.values()]))}
