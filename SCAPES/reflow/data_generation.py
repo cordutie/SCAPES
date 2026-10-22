@@ -17,6 +17,9 @@ Usage:
 
 Run from anywhere (handles its own path setup).
 """
+import warnings
+warnings.warn("ReFlow is V1-only and has not been ported to V2 yet: it still imports removed V1 names and will fail. "
+              "Use branch main for ReFlow.", stacklevel=2)
 
 import json
 import shutil
