@@ -41,6 +41,8 @@ CONFIGS = [("nfe32_cfg3", 32, 3.0, False), ("nfe16_cfg3", 16, 3.0, False), ("nfe
 
 def models(args):
     out = {}
+    if args.random_init:      # untrained weights of any size, timing only
+        return {f"{c}_{s}_random": f"random:{c}:{s}" for s in args.sizes for c in CODECS}
     for size, runs in (("large", args.large_runs), ("small", args.small_runs)):
         for c in CODECS:
             out[f"{c}_{size}"] = str(Path(runs) / c / "model")
@@ -133,7 +135,13 @@ class Decoder:
 def bench_model(args, name, model_dir):
     import torch
     from SCAPES.inference.FlowInference import FlowInference
-    engine = FlowInference(model_dir, device=args.device, checkpoint="best")
+    random_init = model_dir.startswith("random:")
+    if random_init:
+        import size_params
+        _, rcodec, rsize = model_dir.split(":")
+        engine = size_params.build(rcodec, rsize, device=args.device)
+    else:
+        engine = FlowInference(model_dir, device=args.device, checkpoint="best")
     g = engine.geom
     cuda = str(args.device).startswith("cuda")
     sync = torch.cuda.synchronize if cuda else (lambda: None)
@@ -141,7 +149,7 @@ def bench_model(args, name, model_dir):
     clap = torch.randn(1024, generator=gen)
     clap = clap / clap.norm()
     need = g.memory_units if g.mode == "atoms" else math.ceil(g.memory_frames / g.unit_frames)
-    result = {"model": name, "model_dir": model_dir, "codec": g.codec, "mode": g.mode, "unit_frames": g.unit_frames,
+    result = {"model": name, "model_dir": model_dir, "random_weights": random_init, "codec": g.codec, "mode": g.mode, "unit_frames": g.unit_frames,
               "unit_hop_frames": g.unit_hop_frames, "memory_units_needed": need, "sample_rate": engine.sr,
               "params": sum(p.numel() for p in list(engine.model.parameters()) + list(engine.local_encoder.parameters())),
               "precision": "fp32 weights and activations (bf16 columns: autocast of the flow part only)",
@@ -194,7 +202,10 @@ def bench_model(args, name, model_dir):
 
 def write_outputs(out: Path, res: dict):
     (out / "rtf_bench.json").write_text(json.dumps(res, indent=1))
-    L = ["# Generation speed per block (steady state, batch 1, flow + codec decode of the new audio)", "",
+    L = ["# Generation speed per block (steady state, batch 1, flow + codec decode of the new audio)", ""]
+    if any(m.get("random_weights") for m in res["models"].values()):
+        L += ["**Some or all models are RANDOM-INIT (untrained) weights: timing only, the audio has no quality meaning.**", ""]
+    L += [
          "Two factors: RTF_new = time per call / duration of only the NEW audio (AR: the block; atoms: the hop = atom minus overlap) is the one "
          "to judge real time (rtf column; headroom = 1 / RTF_new; RTF_new <= 0.5 gives 2x); RTF_generated = time per call / duration of the whole audio "
          "produced (AR: the same; atoms: the whole atom, so smaller by hop / atom). Block = one AR block, or the hop of one atom. fp32; bf16 rows autocast the flow part only (quality untested). "
@@ -250,6 +261,9 @@ def main():
     ap.add_argument("--no-bf16", action="store_true")
     ap.add_argument("--only", nargs="+", default=None, help="model names such as encodec24k_small (default all 8)")
     ap.add_argument("--worker", default=None, help="internal: bench this model name in this process")
+    ap.add_argument("--random-init", action="store_true", help="time untrained (random-weight) models of the sizes in --sizes: timing only, no quality meaning")
+    ap.add_argument("--sizes", nargs="+", default=["vsmall", "mid", "small", "medium", "large", "extra_large", "audiobox"],
+                    help="with --random-init: size names of scripts/size_params.py")
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
@@ -262,7 +276,8 @@ def main():
         return
     if a.dry:
         for n in names:
-            print(n, allm[n], "exists" if (Path(allm[n]) / "checkpoints" / "inference.gin").exists() else "MISSING")
+            print(n, allm[n], "random weights" if a.random_init else
+                  ("exists" if (Path(allm[n]) / "checkpoints" / "inference.gin").exists() else "MISSING"))
         print("configs:", [c[0] for c in CONFIGS], "calls", a.calls, "warmup", a.warmup)
         return
     if not a.force:
@@ -281,7 +296,7 @@ def main():
     for n in names:
         cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", n, "--out", str(out), "--calls", str(a.calls),
                "--warmup", str(a.warmup), "--device", a.device, "--large-runs", a.large_runs, "--small-runs", a.small_runs] + \
-              (["--no-bf16"] if a.no_bf16 else [])
+              (["--no-bf16"] if a.no_bf16 else []) + (["--random-init", "--sizes", *a.sizes] if a.random_init else [])
         with open(out / f"{n}.log", "w") as fh:
             code = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT).returncode
         if code != 0:
