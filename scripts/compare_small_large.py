@@ -50,7 +50,7 @@ def fmt(x, nd=3):
     return str(x)
 
 
-def collect(tf_dir, val_dir, sem_dir, usage_dir, runs_dir, usage_pattern):
+def collect(tf_dir, val_dir, sem_dir, usage_dir, runs_dir, usage_pattern, usage_fallback_dir=None):
     tfs = load(Path(tf_dir) / "summary.json") or {}
     val = load(Path(val_dir) / "s5_eval.json") or {}
     sem = load(Path(sem_dir) / "summary.json") or {}
@@ -60,6 +60,8 @@ def collect(tf_dir, val_dir, sem_dir, usage_dir, runs_dir, usage_pattern):
         v = val.get(c)
         s = sem.get(c)
         usage = load(Path(usage_dir) / usage_pattern.format(codec=c))
+        if usage is None and usage_fallback_dir:        # e.g. the large encodec48k result lives in eval_tf
+            usage = load(Path(usage_fallback_dir) / f"past_usage_{c}.json")
         hist = vsr.history(Path(runs_dir) / c / "model")
         r = {}
         for row in ("generated", "codec_roundtrip"):
@@ -71,6 +73,10 @@ def collect(tf_dir, val_dir, sem_dir, usage_dir, runs_dir, usage_pattern):
         r["kad_clip_generated_ci95"] = get(m, "kad", "clip_level", "sets", "generated", "ci95")
         r["kad_clip_roundtrip"] = get(m, "kad", "clip_level", "sets", "codec_roundtrip", "kad")
         r["past_usage_gain_percent"] = get(usage, "gain_percent")
+        r["past_usage_L_real"] = get(usage, "L_real")
+        r["past_usage_L_null"] = get(usage, "L_null")
+        r["past_usage_gain_percent_clean_files"] = get(usage, "gain_percent_clean_files", "mean")
+        r["past_usage_gain_percent_repeat_files"] = get(usage, "gain_percent_repeat_files", "mean")
         p = get(v, "production")
         r["production_pass"] = f"{p['n_pass']}/{p['n_clips']}" if p else None
         for k, key in (("D_b_generated", "generated"), ("D_b_other_file", "other_file_prompt"), ("D_b_real_floor", "real_floor")):
@@ -116,7 +122,7 @@ def main():
     ap.add_argument("--large-usage-dir", default=str(R / "diag_s5"))
     ap.add_argument("--small-usage-dir", default=None, help="default: the small eval_tf folder")
     a = ap.parse_args()
-    large = collect(a.large_tf, a.large_val, a.large_sem, a.large_usage_dir, a.large_runs, "past_usage_{codec}_best.json")
+    large = collect(a.large_tf, a.large_val, a.large_sem, a.large_usage_dir, a.large_runs, "past_usage_{codec}_best.json", usage_fallback_dir=a.large_tf)
     small = collect(a.small_tf, a.small_val, a.small_sem, a.small_usage_dir or a.small_tf, a.small_runs, "past_usage_{codec}.json")
     Path(a.out + ".json").write_text(json.dumps({"large": large, "small": small, "caveats": CAVEATS}, indent=1))
     L = ["# Small (37 M) against large (233 M) transformer, same data and recipe", "",
