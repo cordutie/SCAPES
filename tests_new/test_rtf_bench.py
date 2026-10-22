@@ -36,7 +36,7 @@ def test_bench_ar_and_atoms_toy(tmp_path):
             assert c["rtf_generated_over_rtf_new"] < 1.0 and c["overlap_seconds"] > 0
         assert c["finite"] and c["calls"] == 3 and c["rtf"]["mean"] > 0
         assert abs(c["per_block_seconds"]["mean"] - c["flow_seconds"]["mean"] - c["decode_seconds"]["mean"]) < 1e-9
-        assert set(r["configs"]) == {"nfe32_cfg3", "nfe16_cfg3", "nfe16_cfgoff"}
+        assert set(r["configs"]) == {"nfe32_cfg3", "nfe16_cfg3", "nfe16_cfgoff", "nfe32_cfgoff"}
 
 
 def test_bench_guards(tmp_path):

@@ -36,7 +36,7 @@ sys.path.insert(0, str(REPO))
 CODECS = ["encodec24k", "spectrostream", "encodec48k", "codicodec"]
 # (label, nfe, cfg scale, bf16)
 CONFIGS = [("nfe32_cfg3", 32, 3.0, False), ("nfe16_cfg3", 16, 3.0, False), ("nfe16_cfgoff", 16, 1.0, False),
-           ("nfe32_cfg3_bf16", 32, 3.0, True), ("nfe16_cfg3_bf16", 16, 3.0, True)]
+           ("nfe32_cfgoff", 32, 1.0, False), ("nfe32_cfg3_bf16", 32, 3.0, True), ("nfe16_cfg3_bf16", 16, 3.0, True)]
 
 
 # Folders of the trained runs of each size (canonical names; the old runs keep their folders)
@@ -65,6 +65,26 @@ def gpu_info():
         return {"error": str(e)}
 
 
+# CPU record for the CPU benchmark: model, logical cores, torch threads, load average
+def cpu_info():
+    import os
+    import torch
+    model = "unknown"
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                model = line.split(":", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    return {"name": model, "logical_cores": os.cpu_count(), "torch_threads": torch.get_num_threads(),
+            "torch_interop_threads": torch.get_num_interop_threads(), "load_avg_1_5_15": list(os.getloadavg())}
+
+
+def device_info(device):
+    return cpu_info() if str(device) == "cpu" else gpu_info()
+
+
 def other_gpu_processes():
     try:
         out = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory", "--format=csv,noheader"],
@@ -90,9 +110,12 @@ def generate_unit(engine, past_units, clap, nfe, cfg, bf16=False):
     ctx = clap.to(engine.device)
     if ctx.dim() == 1:
         ctx = ctx.unsqueeze(0)
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
+    n = past_units[-1].shape[0] if past_units else 1       # batch (AR only for n > 1)
+    if n > 1:
+        ctx = ctx.expand(n, -1)
+    with torch.no_grad(), torch.autocast("cuda" if str(engine.device).startswith("cuda") else "cpu", dtype=torch.bfloat16, enabled=bf16):
         encoded_past, prefix = engine._ar_past(steps, t) if g.mode == "autoregressive" else engine._atoms_past(steps, t)
-        x0 = torch.randn(1, g.unit_frames, g.frame_dim, device=engine.device)
+        x0 = torch.randn(n, g.unit_frames, g.frame_dim, device=engine.device)
         pred = engine.model.generate(x0=x0, encoded_past=encoded_past, clap_context=ctx, structure_vector=None, max_nfe=nfe,
                                      cfg_scale=cfg, prefix=prefix)
     return pred.float().transpose(1, 2)
@@ -100,12 +123,12 @@ def generate_unit(engine, past_units, clap, nfe, cfg, bf16=False):
 
 # Decoder state of the real-time path: AR streaming decoder, or the atoms overlap-add tail
 class Decoder:
-    def __init__(self, engine):
+    def __init__(self, engine, batch=1):
         import torch
         from SCAPES.data.geometry import ola_window
         self.engine, self.g = engine, engine.geom
         if self.g.mode == "autoregressive":
-            self.dec = engine.codec.streaming_decoder(1)
+            self.dec = engine.codec.streaming_decoder(batch)
         else:
             self.window = ola_window(self.g).to(engine.device)
             self.tail, self.k = None, 0
@@ -138,9 +161,17 @@ class Decoder:
             return out.cpu()
 
 
+def g_mode_is_atoms(model_dir, args):
+    name = Path(model_dir).parts
+    return any(c in ("encodec48k", "codicodec") for c in name) or any(c in str(model_dir) for c in ("encodec48k", "codicodec"))
+
+
 def bench_model(args, name, model_dir):
     import torch
     from SCAPES.inference.FlowInference import FlowInference
+    batch = getattr(args, "batch", 1)
+    if batch > 1 and g_mode_is_atoms(model_dir, args):
+        raise SystemExit("--batch > 1 is implemented for the autoregressive codecs only")
     random_init = model_dir.startswith("random:")
     if random_init:
         import size_params
@@ -159,15 +190,18 @@ def bench_model(args, name, model_dir):
               "unit_hop_frames": g.unit_hop_frames, "memory_units_needed": need, "sample_rate": engine.sr,
               "params": sum(p.numel() for p in list(engine.model.parameters()) + list(engine.local_encoder.parameters())),
               "precision": "fp32 weights and activations (bf16 columns: autocast of the flow part only)",
-              "gpu_start": gpu_info(), "configs": {}}
+              "batch": batch, "device": str(args.device), "gpu_start": device_info(args.device), "configs": {}}
     if cuda:
         torch.cuda.reset_peak_memory_stats()
+    wanted = getattr(args, "configs", None)
     for label, nfe, cfg, bf16 in CONFIGS:
         if bf16 and args.no_bf16:
             continue
+        if wanted and label not in wanted:
+            continue
         torch.manual_seed(0)
-        dec = Decoder(engine)
-        past = []
+        dec = Decoder(engine, batch)
+        past = [torch.randn(batch, g.frame_dim, g.unit_frames, device=engine.device)] if batch > 1 else []
         # fill the real past (untimed), then 3 discarded warm-up blocks
         for _ in range(need + 1 + args.warmup):
             unit = generate_unit(engine, past[-need:], clap, nfe, cfg, bf16)
@@ -194,13 +228,14 @@ def bench_model(args, name, model_dir):
             "nfe": nfe, "cfg_scale": cfg, "cfg_on": cfg != 1.0, "bf16": bf16, "calls": args.calls, "new_audio_seconds": dur,
             "generated_audio_seconds": gdur, "overlap_seconds": gdur - dur, "rtf_new": summary(total / dur),
             "rtf_generated": summary(total / gdur), "rtf_generated_over_rtf_new": float(dur / gdur),
+            "batch": batch, "rtf_per_stream": summary(total / (dur * batch)),
             "per_block_seconds": summary(total), "rtf": summary(total / dur), "flow_seconds": summary(flow),
             "decode_seconds": summary(decode), "flow_rtf": summary(np.array(flow) / dur), "decode_rtf": summary(np.array(decode) / dur),
             "headroom_x": float(dur / total.mean()), "latency_below_block_duration": bool(total.max() < dur), "finite": finite}
         print(f"[{name}] {label}: block {dur:.3f} s, time {total.mean():.4f} s, RTF {total.mean() / dur:.3f} (flow {np.mean(flow):.4f}, decode {np.mean(decode):.4f})", flush=True)
     result["peak_gpu_bytes"] = int(torch.cuda.max_memory_allocated()) if cuda else 0
-    result["gpu_end"] = gpu_info()
-    result["env"] = {"torch": torch.__version__, "cuda": torch.version.cuda,
+    result["gpu_end"] = device_info(args.device)
+    result["env"] = {"torch": torch.__version__, "cuda": torch.version.cuda, "threads": torch.get_num_threads(),
                      "tf32_matmul": torch.backends.cuda.matmul.allow_tf32, "tf32_cudnn": torch.backends.cudnn.allow_tf32,
                      "cudnn_benchmark": torch.backends.cudnn.benchmark, "matmul_precision": torch.get_float32_matmul_precision()}
     return result
@@ -224,13 +259,21 @@ def write_outputs(out: Path, res: dict):
                      f"{c['per_block_seconds']['min'] * 1e3:.1f} / {c['per_block_seconds']['max'] * 1e3:.1f} | {c['rtf']['mean']:.3f} | "
                      f"{c['rtf_generated']['mean']:.3f} | {c['rtf_generated_over_rtf_new']:.3f} | {c['flow_rtf']['mean']:.3f} | {c['decode_rtf']['mean']:.3f} | {c['headroom_x']:.2f}x | {c['latency_below_block_duration']} |")
     first = next(iter(res["models"].values()))
-    L += ["", f"GPU: {res['gpu_start'].get('name')} driver {res['gpu_start'].get('driver_version')}; at start SM clock {res['gpu_start'].get('clocks.sm')} MHz, "
+    if first.get("device") == "cpu":
+        c0, c1 = res["gpu_start"], res["gpu_end"]
+        L += ["", f"CPU: {c0.get('name')}, {c0.get('logical_cores')} logical cores, torch threads {first['env']['threads']}, load average (1/5/15 min) "
+              f"before {c0.get('load_avg_1_5_15')} and after {c1.get('load_avg_1_5_15')}; {res.get('calls')} timed blocks after {res.get('warmup')} warm-up blocks; "
+              f"torch {first['env']['torch']}. Quality with cfg off is NOT measured.", ""]
+        (out / "rtf_bench.md").write_text("\n".join(L))
+    else:
+      L += ["", f"GPU: {res['gpu_start'].get('name')} driver {res['gpu_start'].get('driver_version')}; at start SM clock {res['gpu_start'].get('clocks.sm')} MHz, "
           f"temperature {res['gpu_start'].get('temperature.gpu')} C; at end {res['gpu_end'].get('clocks.sm')} MHz, {res['gpu_end'].get('temperature.gpu')} C. "
           f"torch {first['env']['torch']}, CUDA {first['env']['cuda']}, TF32 matmul {first['env']['tf32_matmul']}, cudnn TF32 {first['env']['tf32_cudnn']}.", ""]
-    (out / "rtf_bench.md").write_text("\n".join(L))
+      (out / "rtf_bench.md").write_text("\n".join(L))
     from matplotlib.figure import Figure
     names = list(res["models"])
-    labels = ["nfe32_cfg3", "nfe16_cfg3"]
+    have = set.intersection(*[set(m["configs"]) for m in res["models"].values()])
+    labels = [l for l in ("nfe32_cfg3", "nfe16_cfg3") if l in have] or [l for l in ("nfe32_cfgoff", "nfe16_cfgoff") if l in have]
     fig = Figure(figsize=(13, 5))
     ax = fig.subplots()
     w = 0.38
@@ -249,7 +292,7 @@ def write_outputs(out: Path, res: dict):
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels(names, rotation=25, ha="right")
     ax.set_ylabel("RTF_new (bars; judge real time) and RTF_generated (markers)")
-    ax.set_title("RTF_new per model: NFE 32 (left bar) and NFE 16 (right bar), CFG 3, fp32, batch 1")
+    ax.set_title(f"RTF_new per model: {labels[0]} (left bar) and {labels[1]} (right bar), fp32")
     ax.legend(ncol=3, fontsize=8)
     ax.grid(True, axis="y", linestyle="--", alpha=0.5)
     fig.tight_layout()
@@ -261,9 +304,12 @@ def main():
     ap.add_argument("--large-runs", default=str(RUNS / "s5"))
     ap.add_argument("--small-runs", default=str(RUNS / "s5_small"))
     ap.add_argument("--out", default=str(RUNS / "rtf_bench"))
-    ap.add_argument("--calls", type=int, default=20)
-    ap.add_argument("--warmup", type=int, default=3)
-    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--calls", type=int, default=None, help="timed blocks (default 20 on GPU, 5 on CPU)")
+    ap.add_argument("--warmup", type=int, default=None, help="discarded warm-up blocks (default 3 on GPU, 2 on CPU)")
+    ap.add_argument("--device", default="cuda", help="cuda or cpu (cpu: batch 1, fp32, default configs nfe16_cfgoff and nfe32_cfgoff, default out runs/rtf_bench_cpu)")
+    ap.add_argument("--configs", nargs="+", default=None, choices=[c[0] for c in CONFIGS], help="subset of configs (default all, or the two cfg-off configs on CPU)")
+    ap.add_argument("--threads", type=int, default=None, help="torch threads (CPU; default: half the logical cores, fixed and reported)")
+    ap.add_argument("--batch", type=int, default=1, help="parallel streams (autoregressive codecs only); labelled as the launch-bound check, not real-time latency")
     ap.add_argument("--no-bf16", action="store_true")
     ap.add_argument("--only", nargs="+", default=None, help="model names such as encodec24k_small (default all 8)")
     ap.add_argument("--worker", default=None, help="internal: bench this model name in this process")
@@ -277,8 +323,22 @@ def main():
     ap.add_argument("--dry", action="store_true")
     ap.add_argument("--force", action="store_true")
     a = ap.parse_args()
+    cpu = str(a.device) == "cpu"
+    if a.calls is None:
+        a.calls = 5 if cpu else 20
+    if a.warmup is None:
+        a.warmup = 2 if cpu else 3
+    if cpu:
+        import os
+        import torch
+        a.threads = a.threads or max(1, (os.cpu_count() or 2) // 2)
+        torch.set_num_threads(a.threads)
+        a.no_bf16 = True
+        a.configs = a.configs or ["nfe16_cfgoff", "nfe32_cfgoff"]
+        if a.out == str(RUNS / "rtf_bench"):
+            a.out = str(RUNS / ("rtf_bench_cpu"))
     if a.trained:
-        a.no_bf16 = not a.bf16
+        a.no_bf16 = a.no_bf16 or not a.bf16
         if a.out == str(RUNS / "rtf_bench"):
             a.out = str(RUNS / "rtf_bench_all")
     allm = models(a)
@@ -295,9 +355,15 @@ def main():
         print("configs:", [c[0] for c in CONFIGS], "calls", a.calls, "warmup", a.warmup)
         return
     if not a.force:
-        busy = other_gpu_processes()
-        if busy:
-            sys.exit("another process uses the GPU: " + "; ".join(busy) + " (use --force to override)")
+        if cpu:
+            import os
+            load = os.getloadavg()[0]
+            if load > 1.5:
+                sys.exit(f"the machine is not idle (1-min load average {load:.1f}); use --force to override")
+        else:
+            busy = other_gpu_processes()
+            if busy:
+                sys.exit("another process uses the GPU: " + "; ".join(busy) + " (use --force to override)")
         log = Path(a.small_runs) / "chain.log"
         if a.trained:
             missing = [z for z in a.trained if z in ("tiny", "petite") and not (RUNS / TRAINED[z] / "chain_done_marker").exists()]
@@ -309,11 +375,12 @@ def main():
     if out.exists() and (out / "rtf_bench.json").exists():
         sys.exit(f"{out} already has results")
     out.mkdir(parents=True, exist_ok=True)
-    gpu0 = gpu_info()
+    gpu0 = device_info(a.device)
     res = {"models": {}, "gpu_start": gpu0, "calls": a.calls, "warmup": a.warmup}
     for n in names:
         cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", n, "--out", str(out), "--calls", str(a.calls),
-               "--warmup", str(a.warmup), "--device", a.device, "--large-runs", a.large_runs, "--small-runs", a.small_runs] + \
+               "--warmup", str(a.warmup), "--device", a.device, "--batch", str(a.batch)] + (["--threads", str(a.threads)] if cpu else []) + \
+              (["--configs", *a.configs] if a.configs else []) + ["--large-runs", a.large_runs, "--small-runs", a.small_runs] + \
               (["--no-bf16"] if a.no_bf16 else []) + (["--trained", *a.trained] if a.trained else []) + (["--random-init", "--sizes", *a.sizes] if a.random_init else [])
         with open(out / f"{n}.log", "w") as fh:
             code = subprocess.run(cmd, stdout=fh, stderr=subprocess.STDOUT).returncode
@@ -322,7 +389,7 @@ def main():
             continue
         res["models"][n] = json.loads((out / f"part_{n}.json").read_text())
         print(n, "done", flush=True)
-    res["gpu_end"] = gpu_info()
+    res["gpu_end"] = device_info(a.device)
     write_outputs(out, res)
 
 
