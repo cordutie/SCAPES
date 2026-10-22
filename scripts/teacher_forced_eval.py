@@ -59,6 +59,9 @@ def real_units(geom, latents: dict, clap: torch.Tensor, starts: list, standardis
         if geom.mode == "autoregressive":
             z = latents["latent"][:, t:t + geom.unit_frames].float().unsqueeze(0)
             z = standardise(z)
+        elif geom.encoding == "whole":
+            # atoms of a codec stored as one whole latent [d, T] (e.g. CoDiCodec): the atom is the slice [t, t + F)
+            z = standardise(latents["latent"][:, t:t + geom.unit_frames].float().unsqueeze(0))
         else:
             z = standardise(latents["latent"][k].float().unsqueeze(0))
             if geom.has_scale:
@@ -378,6 +381,17 @@ def write_summary(out_root: Path):
     print(f"summary written to {out_root}/summary.md ({len(models)} models)")
 
 
+# One line per model: codec, mode, output rate and the files to open, in the order to listen
+def listening_order(models: dict) -> str:
+    lines = []
+    for i, (n, m) in enumerate(models.items(), 1):
+        g = m["geometry"]
+        lines.append(f"{i}. `{n}` ({m['codec']}, {m['mode']}, {g['codec_sample_rate']} Hz, unit hop "
+                     f"{g['unit_hop_frames']} frames at {g['frame_rate']:.2f} Hz, compared region up to {m['region']['end_s']:.2f} s): "
+                     f"`{n}/generated/<file>.wav`, then `{n}/codec_roundtrip/<file>.wav`")
+    return "\n".join(lines)
+
+
 def write_readme(out_root: Path, models: dict):
     root = out_root.resolve()
     lines = [f"""# Teacher-forced evaluation (first 10 s of the microtex files)
@@ -395,6 +409,10 @@ Models found: {", ".join(f"`{n}`" for n in models)}.
 How to listen, per file: (1) `original_10s/<file>.wav`, (2) `<model>/generated/<file>.wav`, (3) `<model>/codec_roundtrip/<file>.wav`.
 Example: `original_10s/rain.wav`, `{next(iter(models))}/generated/rain.wav`, `{next(iter(models))}/codec_roundtrip/rain.wav`.
 The first 0.2 s of the atoms output are silent by design (see below).
+
+## Listening order (per file: original, then each model's generated, then its codec round trip)
+
+{listening_order(models)}
 
 ## What was generated (teacher forcing, semantic reconstruction)
 
