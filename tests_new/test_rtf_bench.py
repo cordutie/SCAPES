@@ -27,6 +27,13 @@ def test_bench_ar_and_atoms_toy(tmp_path):
         c = r["configs"]["nfe16_cfg3"]
         g_unit = r["unit_frames"] if mode == "autoregressive" else r["unit_hop_frames"]
         assert abs(c["new_audio_seconds"] - g_unit * 8 / 8000) < 1e-9          # toy codecs: hop 8 samples at 8 kHz
+        assert abs(c["generated_audio_seconds"] - r["unit_frames"] * 8 / 8000) < 1e-9
+        assert abs(c["rtf_generated"]["mean"] * c["generated_audio_seconds"] - c["rtf"]["mean"] * c["new_audio_seconds"]) < 1e-9
+        assert abs(c["overlap_seconds"] - (c["generated_audio_seconds"] - c["new_audio_seconds"])) < 1e-12
+        if mode == "autoregressive":
+            assert c["rtf_generated_over_rtf_new"] == 1.0 and c["overlap_seconds"] == 0.0
+        else:
+            assert c["rtf_generated_over_rtf_new"] < 1.0 and c["overlap_seconds"] > 0
         assert c["finite"] and c["calls"] == 3 and c["rtf"]["mean"] > 0
         assert abs(c["per_block_seconds"]["mean"] - c["flow_seconds"]["mean"] - c["decode_seconds"]["mean"]) < 1e-9
         assert set(r["configs"]) == {"nfe32_cfg3", "nfe16_cfg3", "nfe16_cfgoff"}

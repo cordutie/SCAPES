@@ -10,7 +10,7 @@ new audio:
 The past is real (generated blocks of the model itself: the AR window / the M previous atoms), the CLAP context is a fixed random unit vector
 (timing does not depend on its values). Batch 1, fp32 as trained; a bf16 autocast of the flow part is an extra column (quality untested).
 Configs per model: nfe 32 / cfg 3, nfe 16 / cfg 3, nfe 16 / cfg off (cfg_scale 1.0: a single forward per step), and bf16 for the first two.
-Per call: torch.cuda.synchronize() before and after each part. RTF = time / seconds of new audio; the real-time requirement is
+Per call: torch.cuda.synchronize() before and after each part. RTF_new = time / seconds of NEW audio (the one to judge); RTF_generated = time / seconds of the whole generated unit; the real-time requirement is
 RTF < 1 per block with margin (headroom = 1 / RTF).
 
 Usage (from SCAPES/, GPU idle, chain finished):
@@ -104,6 +104,10 @@ class Decoder:
         self.new_samples = (self.g.unit_frames if self.g.mode == "autoregressive" else self.g.unit_hop_frames) * self.g.hop_length
 
     @property
+    def generated_seconds(self):          # the whole audio of one generated unit (atom, or the AR block)
+        return self.g.unit_frames * self.g.hop_length / self.engine.sr
+
+    @property
     def new_seconds(self):
         return self.new_samples / self.engine.sr
 
@@ -171,8 +175,11 @@ def bench_model(args, name, model_dir):
         finite = bool(torch.isfinite(audio).all()) and bool(torch.isfinite(unit).all())
         total = np.array(flow) + np.array(decode)
         dur = dec.new_seconds
+        gdur = dec.generated_seconds
         result["configs"][label] = {
             "nfe": nfe, "cfg_scale": cfg, "cfg_on": cfg != 1.0, "bf16": bf16, "calls": args.calls, "new_audio_seconds": dur,
+            "generated_audio_seconds": gdur, "overlap_seconds": gdur - dur, "rtf_new": summary(total / dur),
+            "rtf_generated": summary(total / gdur), "rtf_generated_over_rtf_new": float(dur / gdur),
             "per_block_seconds": summary(total), "rtf": summary(total / dur), "flow_seconds": summary(flow),
             "decode_seconds": summary(decode), "flow_rtf": summary(np.array(flow) / dur), "decode_rtf": summary(np.array(decode) / dur),
             "headroom_x": float(dur / total.mean()), "latency_below_block_duration": bool(total.max() < dur), "finite": finite}
@@ -188,16 +195,17 @@ def bench_model(args, name, model_dir):
 def write_outputs(out: Path, res: dict):
     (out / "rtf_bench.json").write_text(json.dumps(res, indent=1))
     L = ["# Generation speed per block (steady state, batch 1, flow + codec decode of the new audio)", "",
-         "RTF = time to produce a block / duration of the new audio it contains. Real time needs RTF < 1 with margin (headroom = 1 / RTF; "
-         "RTF <= 0.5 gives 2x). Block = one AR block, or the hop of one atom. fp32; bf16 rows autocast the flow part only (quality untested). "
+         "Two factors: RTF_new = time per call / duration of only the NEW audio (AR: the block; atoms: the hop = atom minus overlap) is the one "
+         "to judge real time (rtf column; headroom = 1 / RTF_new; RTF_new <= 0.5 gives 2x); RTF_generated = time per call / duration of the whole audio "
+         "produced (AR: the same; atoms: the whole atom, so smaller by hop / atom). Block = one AR block, or the hop of one atom. fp32; bf16 rows autocast the flow part only (quality untested). "
          "cfg off = cfg_scale 1.0 (one forward per ODE step instead of two). Quality at nfe 16 against nfe 32 was NOT measured here "
          "(follow-up: the teacher-forced MSS/KAD at both).", "",
-         "| model | config | block (s) | time mean +- std (ms) | min / max (ms) | RTF | flow RTF | decode RTF | headroom | max < block |", "|---|---|---|---|---|---|---|---|---|---|"]
+         "| model | config | new audio (s) | generated audio (s) | overlap (s) | time mean +- std (ms) | min / max (ms) | RTF_new (judge this) | RTF_generated | RTF_gen / RTF_new | flow RTF_new | decode RTF_new | headroom | max < new audio |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for name, m in res["models"].items():
         for label, c in m["configs"].items():
-            L.append(f"| {name} | {label} | {c['new_audio_seconds']:.3f} | {c['per_block_seconds']['mean'] * 1e3:.1f} +- {c['per_block_seconds']['std'] * 1e3:.1f} | "
+            L.append(f"| {name} | {label} | {c['new_audio_seconds']:.3f} | {c['generated_audio_seconds']:.3f} | {c['overlap_seconds']:.3f} | {c['per_block_seconds']['mean'] * 1e3:.1f} +- {c['per_block_seconds']['std'] * 1e3:.1f} | "
                      f"{c['per_block_seconds']['min'] * 1e3:.1f} / {c['per_block_seconds']['max'] * 1e3:.1f} | {c['rtf']['mean']:.3f} | "
-                     f"{c['flow_rtf']['mean']:.3f} | {c['decode_rtf']['mean']:.3f} | {c['headroom_x']:.2f}x | {c['latency_below_block_duration']} |")
+                     f"{c['rtf_generated']['mean']:.3f} | {c['rtf_generated_over_rtf_new']:.3f} | {c['flow_rtf']['mean']:.3f} | {c['decode_rtf']['mean']:.3f} | {c['headroom_x']:.2f}x | {c['latency_below_block_duration']} |")
     first = next(iter(res["models"].values()))
     L += ["", f"GPU: {res['gpu_start'].get('name')} driver {res['gpu_start'].get('driver_version')}; at start SM clock {res['gpu_start'].get('clocks.sm')} MHz, "
           f"temperature {res['gpu_start'].get('temperature.gpu')} C; at end {res['gpu_end'].get('clocks.sm')} MHz, {res['gpu_end'].get('temperature.gpu')} C. "
@@ -215,12 +223,16 @@ def write_outputs(out: Path, res: dict):
         x = np.arange(len(names)) + (j - 0.5) * w
         ax.bar(x, fl, w, color="tab:blue" if j == 0 else "tab:cyan", label=f"flow, {label}")
         ax.bar(x, de, w, bottom=fl, color="tab:red" if j == 0 else "tab:orange", label=f"decode, {label}")
+    for j, label in enumerate(labels):      # RTF_generated (whole audio of the unit) as a marker on each bar
+        rg = [res["models"][n]["configs"][label]["rtf_generated"]["mean"] for n in names]
+        ax.scatter(np.arange(len(names)) + (j - 0.5) * w, rg, color="k", marker="D" if j == 0 else "o", zorder=5, s=28,
+                   label=f"RTF_generated, {label}")
     ax.axhline(1.0, color="k", linestyle="--", label="RTF 1.0")
     ax.axhline(0.5, color="grey", linestyle=":", label="RTF 0.5")
     ax.set_xticks(range(len(names)))
     ax.set_xticklabels(names, rotation=25, ha="right")
-    ax.set_ylabel("RTF (time per block / block duration)")
-    ax.set_title("Generation RTF per model: NFE 32 (left bar) and NFE 16 (right bar), CFG 3, fp32, batch 1")
+    ax.set_ylabel("RTF_new (bars; judge real time) and RTF_generated (markers)")
+    ax.set_title("RTF_new per model: NFE 32 (left bar) and NFE 16 (right bar), CFG 3, fp32, batch 1")
     ax.legend(ncol=3, fontsize=8)
     ax.grid(True, axis="y", linestyle="--", alpha=0.5)
     fig.tight_layout()
