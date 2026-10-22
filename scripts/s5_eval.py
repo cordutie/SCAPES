@@ -185,7 +185,15 @@ def evaluate_codec(args, name: str, run_dir: Path) -> dict:
     if not files:
         raise RuntimeError(f"{name}: no file has samples in the {region} region")
     ts = {f: sorted(by_region[(f, region)]) for f in files}
-    prompts = {f: dataset._clap[f][ts[f][0] // geom.stride_frames].reshape(-1).float() for f in files}
+    # prompt: the stored CLAP at the first grid point of the region start (not the first training sample)
+    prompt_k, prompts = {}, {}
+    for f in files:
+        lo, hi = dataset._bounds[f][region]
+        k = math.ceil(lo * fr / geom.stride_frames - 1e-6)
+        assert k * geom.stride_frames / fr + geom.context_seconds <= hi + 1e-6, f"{f}: prompt window leaves the region"
+        prompt_k[f] = k
+        prompts[f] = dataset._clap[f][k].reshape(-1).float()
+    prompt_start = {f: prompt_k[f] * geom.stride_frames / fr for f in files}
     n_units = units_for_seconds(geom, args.seconds)
 
     # ─── generation (timed), with an untimed warm-up that loads the codec ───
@@ -231,6 +239,7 @@ def evaluate_codec(args, name: str, run_dir: Path) -> dict:
         chk = production_checks(g["audio"], sr, ref_rms[f], args.seconds, unit_seconds)
         path = out_dir / name / "generated" / f"{stem}_seed{seed}.wav"
         write_wav(path, g["audio"].numpy(), sr)
+        torch.save({"z": g["z"], "units": g["units"]}, path.with_suffix(".pt"))
         g["checks"] = chk
         clips.append({"file": f, "seed": seed, **chk, "ref_rms": ref_rms[f], "gen_seconds": g["seconds"],
                       "rtf": g["seconds"] / (g["audio"].shape[-1] / sr), "wav": str(path.relative_to(out_dir))})
@@ -296,7 +305,7 @@ def evaluate_codec(args, name: str, run_dir: Path) -> dict:
             continue
         mine = torch.cat(mine)
         # real windows of the same region, after the prompt window, non-overlapping
-        real_ts, nxt = [], ts[f][0] + ctx_frames
+        real_ts, nxt = [], (prompt_k[f] * geom.stride_frames) + ctx_frames
         for t in ts[f]:
             if t >= nxt:
                 real_ts.append(t)
@@ -383,6 +392,28 @@ def evaluate_codec(args, name: str, run_dir: Path) -> dict:
                    "nearest-train distances of held-out val units (about 0.01 expected for a model that does not copy), "
                    "val units with an exact train copy (distance < 1e-3) left out of the threshold; "
                    "fraction_below_threshold_raw uses the plain 1st percentile"}
+    # the same check for the prompt region's own units (val or reserve) against the train region
+    reg_pairs = [(f, t) for f in files for t in ts[f]]
+    if len(reg_pairs) > MAX_VAL_UNITS:
+        reg_pairs = [reg_pairs[i] for i in sorted(rs.choice(len(reg_pairs), MAX_VAL_UNITS, replace=False))]
+    x_reg = matrix(reg_pairs)
+    reg_rows = [p_ for f in dict.fromkeys(q[0] for q in reg_pairs) for p_ in reg_pairs if p_[0] == f]
+    reg_nn = nearest_distance(x_reg, x_train, device)
+    reg_dup = reg_nn < 1e-3
+    reg_raw = float(np.percentile(reg_nn.numpy(), 1.0))
+    reg_thr = float(np.percentile(reg_nn[~reg_dup].numpy(), 1.0)) if bool((~reg_dup).any()) else reg_raw
+    reg_file_dup, reg_file_below = {}, {}
+    for f in files:
+        mask = torch.tensor([p_[0] == f for p_ in reg_rows])
+        reg_file_dup[f] = float(reg_dup[mask].float().mean()) if bool(mask.any()) else None
+    for f in files:
+        nn = torch.cat([nearest_distance(torch.stack([u.reshape(-1) for s in args.seeds for u in gens[(f, s)]["units"]]), x_train, device)])
+        reg_file_below[f] = float((nn < reg_thr).float().mean())
+    d_d.update({"region": region, "threshold_1st_percentile_region_to_train": reg_thr,
+                "threshold_region_raw": reg_raw, "region_units_with_exact_train_copy": float(reg_dup.float().mean()),
+                "region_files_with_exact_copy": sorted({p_[0] for p_, d_ in zip(reg_rows, reg_dup.tolist()) if d_}),
+                "region_exact_copy_fraction": reg_file_dup, "fraction_below_threshold_region_per_file": reg_file_below,
+                "fraction_below_threshold_region": stat(list(reg_file_below.values())), "n_region_units": int(len(x_reg))})
     del x_train
 
     # ─── D-e: efficiency ───
@@ -402,7 +433,7 @@ def evaluate_codec(args, name: str, run_dir: Path) -> dict:
             "seeds": list(args.seeds), "seconds": args.seconds, "nfe": args.nfe, "cfg": args.cfg, "sample_rate": sr,
             "unit_frames": geom.unit_frames, "unit_seconds": unit_seconds, "n_units": n_units, "n_files": len(files),
             "run_dir": str(run_dir), "has_latent_stats": engine.mu is not None,
-            "prompt_start_seconds": {f: ts[f][0] / fr for f in files}, "region_bounds_seconds": bounds}
+            "prompt_start_seconds": prompt_start, "region_bounds_seconds": bounds}
     return {"clips": clips, "production": production,
             "diagnostics": {"D-a": d_a, "D-b": d_b, "D-c": d_c, "D-d": d_d, "D-e": d_e}, "meta": meta}
 
