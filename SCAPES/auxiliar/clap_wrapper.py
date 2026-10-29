@@ -27,7 +27,7 @@ class CLAPWrapper(CLAPWrapper):
                             random_extension=random_extension,
                             sample_rate=clap_sr, 
                             duration=8.0, 
-                            overlap_ratio=0.1) # [B, 1, 8*48000]
+                            overlap_ratio=0.1) # [B, 1, 8*clap_sr]
         embedding = self._get_audio_embeddings(audio) # [B, 1024]
 
         # Normalize embeddings to unit norm
@@ -84,7 +84,7 @@ def audio_extender(input_audio, random_extension=False,
         random_extension: bool
         sample_rate: int
         duration: float (seconds)
-        overlap_ratio: float (default 0.1 → 100ms at 48kHz)
+        overlap_ratio: float (default 0.1 → 0.1 s of crossfade at any sample rate)
 
     Returns:
         Tensor of shape (B, 1, expected_length)
@@ -103,17 +103,31 @@ def audio_extender(input_audio, random_extension=False,
     audio = input_audio.mean(dim=1, keepdim=True)  # (B, 1, T)
 
     expected_length = int(sample_rate * duration)
-    overlap = int(overlap_ratio * sample_rate)
-
-    # --- Adjust overlap if audio is shorter than overlap window ---
-    overlap = min(overlap, T // 2)  # ensure safe crossfade
 
     # --- If longer → trim ---
     if T >= expected_length:
         return audio[:, :, :expected_length]
 
+    # --- Each row gets its own random segments and its own peak normalisation ---
+    output = torch.cat([_extend_row(audio[b:b + 1], random_extension, expected_length, sample_rate, overlap_ratio)
+                        for b in range(B)], dim=0)
+
+    if batch_added:
+        output = output.squeeze(0)  # (1, 1, T) → (1, T)
+
+    return output
+
+
+def _extend_row(audio, random_extension, expected_length, sample_rate, overlap_ratio):
+    """One mono row (1, 1, T) shorter than expected_length → (1, 1, expected_length), peak-normalised."""
+    T = audio.shape[-1]
+    overlap = int(overlap_ratio * sample_rate)
+
+    # --- Adjust overlap if audio is shorter than overlap window ---
+    overlap = min(overlap, T // 2)  # ensure safe crossfade
+
     # --- Create output tensor ---
-    output = torch.zeros((B, 1, expected_length), device=audio.device)
+    output = torch.zeros((1, 1, expected_length), device=audio.device)
 
     # --- Crossfade windows ---
     fade_out = torch.linspace(1, 0, overlap, device=audio.device)
@@ -179,8 +193,5 @@ def audio_extender(input_audio, random_extension=False,
     max_val = torch.max(torch.abs(output))
     if max_val > 0:
         output = output / max_val
-
-    if batch_added:
-        output = output.squeeze(0)  # (1, 1, T) → (1, T)
 
     return output
