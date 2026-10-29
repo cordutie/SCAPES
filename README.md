@@ -41,6 +41,12 @@ source .venv/bin/activate  # Linux/Mac
 # Install dependencies
 pip install --upgrade pip
 pip install -r requirements.txt
+# git dependencies (installed without their own pins): msclap, the codec wrappers
+# (cloned automatically into .venv/src/audio-codec-wrappers), magenta-rt and codicodec
+pip install --no-deps -r requirements-nodeps.txt
+
+# one-time download of the SpectroStream and CoDiCodec weights (EnCodec downloads itself)
+for c in spectrostream codicodec; do python .venv/src/audio-codec-wrappers/scripts/fetch_weights.py --codec $c; done
 ```
 
 > **Note**: You may need to install a CUDA-specific PyTorch build first depending on your setup.
