@@ -10,7 +10,7 @@ import pytest
 import torch
 
 REPO = Path(__file__).resolve().parents[1]
-CODECS = ["encodec24k", "spectrostream", "encodec48k", "codicodec"]
+CODECS = ["encodec24k", "spectrostream", "encodec48k", "codicodec", "music2latent"]
 SMOKE_DATASET = REPO.parent / "datasets" / "micro_microtex"
 
 
@@ -87,3 +87,29 @@ def test_pipeline_runs_for_every_codec(tmp_path):
         art = res["artefacts"]
         assert art["best_flow_model"] and art["inference_gin"] and art["wav_10s"], f"{name}: {art}"
         assert res["train"]["all_finite"], name
+        if codec_is_atoms(name):
+            _check_overlap_modes(out / name / "model", name)
+
+
+def codec_is_atoms(name):
+    return name in ("encodec48k", "codicodec", "music2latent")
+
+
+def _check_overlap_modes(model_dir, name):
+    """The three overlap modes on the freshly trained atoms model: same length, finite, different audio; brute is refused
+    where the atom is too short for it (EnCodec 48k)."""
+    from SCAPES.data.config_loader import ConfigError
+    from SCAPES.inference.FlowInference import FlowInference
+    g = torch.Generator().manual_seed(0)
+    clap = [torch.nn.functional.normalize(torch.randn(1024, generator=g), dim=0) for _ in range(5)]
+    audio = {}
+    for mode in ("normal", "strong", "brute"):
+        try:
+            engine = FlowInference(model_dir, device="cuda", checkpoint="last", overlap_mode=mode)
+        except ConfigError:
+            assert name == "encodec48k" and mode == "brute"
+            continue
+        audio[mode] = engine.generate_soundscape(clap, nfe=2, cfg_scale=1.0, seed=0)
+        assert torch.isfinite(audio[mode]).all()
+    assert len({a.shape[-1] for a in audio.values()}) == 1
+    assert not torch.equal(audio["normal"], audio["strong"])

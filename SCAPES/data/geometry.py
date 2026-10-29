@@ -1,7 +1,7 @@
 """Generation geometry in seconds, resolved to frames with the codec's rate and quantum (design: Geometry in seconds)."""
 import math
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -136,6 +136,27 @@ def geometry_from_inference_gin(raw: dict, info) -> Geometry:
         o = int(get("ar", "prefix_frames", default=0))
         return _make_geometry(info, "autoregressive", B, B, 1, W, S, 0, o, ctx)
     raise ConfigError(f"generation.mode = {mode!r} is invalid")
+
+
+# Overlap-add modes for atoms (inference only; the geometry stored with a model is not touched). The crossfade of "normal"
+# is the one of the model's config; "strong" and "brute" make it a fraction of the atom, so the grains fade into each other.
+OVERLAP_MODES = {"normal": None, "strong": 0.25, "brute": 0.5}
+
+
+def with_overlap_mode(geom: Geometry, info, mode: str) -> Geometry:
+    if mode not in OVERLAP_MODES:
+        raise ConfigError(f"overlap_mode = {mode!r} is invalid, choose from {sorted(OVERLAP_MODES)}")
+    fraction = OVERLAP_MODES[mode]
+    if fraction is None:
+        return geom
+    if geom.mode != "atoms":
+        raise ConfigError(f"overlap_mode {mode!r} needs atoms mode; this geometry is {geom.mode}")
+    X = int(round(fraction * geom.unit_frames * geom.hop_length))
+    try:
+        _check_atoms(info, geom.unit_frames, geom.unit_hop_frames, X)
+    except ConfigError as e:
+        raise ConfigError(f"overlap_mode {mode!r} ({fraction:.0%} of the atom) does not fit this geometry: {e}") from None
+    return replace(geom, crossfade_samples=X)
 
 
 # Overlap-add window of one atom: zeros, hann rise (X), ones, hann fall (X), as V1's _build_ola_window.

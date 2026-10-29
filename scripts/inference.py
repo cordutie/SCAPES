@@ -31,6 +31,7 @@ def _build_engine(args):
         device=args.device,
         verbose=args.verbose,
         checkpoint=args.checkpoint,
+        overlap_mode=args.overlap_mode,
     )
 
 
@@ -129,6 +130,9 @@ def main():
     parser.add_argument("--model_dir", type=str, required=True, help="Path to model directory (contains checkpoints/)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--verbose", action="store_true", default=False)
+    parser.add_argument("--overlap_mode", choices=["normal", "strong", "brute"], default="normal",
+                        help="atoms mode: crossfade between atoms. normal = the model's config, strong = 25%% of the atom, "
+                             "brute = 50%% (use strong or brute for stochastic decoders)")
     parser.add_argument("--checkpoint", type=str, default="best",
                         help="Which checkpoint to load: 'best', 'last', or an epoch number")
 

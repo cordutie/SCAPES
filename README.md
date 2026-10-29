@@ -50,10 +50,10 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 # 2. Packages that must be installed without their own dependency pins:
-#    msclap, magenta-rt, codicodec, and the wrappers (editable, from ./external/audio_codec_wrappers)
+#    msclap, magenta-rt, codicodec, music2latent, and the wrappers (editable, from ./external/audio_codec_wrappers)
 pip install --no-deps -r requirements-nodeps.txt
 
-# 3. One-time download of the SpectroStream and CoDiCodec weights (EnCodec downloads itself on first use)
+# 3. One-time download of the SpectroStream and CoDiCodec weights (EnCodec and Music2Latent download themselves on first use)
 for c in spectrostream codicodec; do python external/audio_codec_wrappers/scripts/fetch_weights.py --codec $c; done
 ```
 
@@ -67,6 +67,27 @@ Notes:
 - The wrappers are pinned by the submodule commit. To move to a newer version: `git -C external/audio_codec_wrappers pull origin main`, then `git add external/audio_codec_wrappers` and commit. To change the wrappers, edit them in `external/audio_codec_wrappers/` (it is its own git repository; commit and push there, then commit the new submodule pointer here).
 - The weights are stored in `~/.cache/audio_codec_wrappers` (set `ACW_CACHE` to change it).
 - `msclap` asks for numpy < 2; this is why it is installed with `--no-deps`. Its embeddings are unchanged with numpy 2 (checked by `tests/test_env_scapes.py`).
+
+## Codecs and overlap-add modes
+
+Supported codecs: `encodec24k`, `spectrostream` (causal, autoregressive mode), `encodec48k`, `codicodec`, `music2latent` (non-causal, atoms mode). Configuration templates are in `SCAPES/config/codecs/`.
+
+In atoms mode the generated atoms are decoded one by one and overlap-added. The decoders of CoDiCodec and Music2Latent are stochastic, so overlapping atoms are not continuous with each other and a short crossfade blends two different realisations. The inference option `overlap_mode` sets the crossfade:
+
+| mode | crossfade | use |
+|---|---|---|
+| `normal` | the model's `atoms.crossfade_seconds` (a few ms to tens of ms) | deterministic decoders (EnCodec 48k) |
+| `strong` | 25% of the atom | stochastic decoders |
+| `brute` | 50% of the atom (plain Hann overlap-add) | stochastic decoders; needs a hop of at least half the atom |
+
+```bash
+python scripts/inference.py --model_dir <model> --overlap_mode strong generate ...
+```
+```python
+engine = FlowInference(model_dir, overlap_mode="brute")   # or engine.set_overlap_mode("strong")
+```
+
+A mode whose crossfade does not fit the geometry (the crossfade cannot exceed the hop or the overlap of consecutive atoms) raises an error that says so; for example `brute` does not fit the EnCodec 48k atoms (0.32 s atom, 0.1 s hop).
 
 ## Pipeline
 

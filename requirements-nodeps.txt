@@ -12,3 +12,6 @@ msclap==1.3.4
 # SpectroStream (pip checks out the sequence-layers submodule) and CoDiCodec.
 magenta-rt @ git+https://github.com/magenta/magenta-realtime@694a545e4ba0b88bf1150137b129582166d3e07f
 codicodec @ git+https://github.com/SonyCSLParis/codicodec@1239148096a5b6725eeabb62eb950d064a951c64
+
+# Music2Latent (Sony CSL), used by the music2latent wrapper. Weights come from the Hugging Face hub on first use.
+music2latent==0.1.8
