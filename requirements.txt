@@ -21,7 +21,7 @@ soundfile>=0.12.1
 pandas>=2.0.0,<3.0.0
 transformers>=5,<6
 tqdm
-# jax set (SpectroStream), same pins as ../audio_codec_wrappers/requirements.txt
+# jax set (SpectroStream), same pins as requirements.txt in the audio_codec_wrappers repo
 jax[cuda12]==0.10.1
 jaxlib==0.10.1
 flax==0.12.7
