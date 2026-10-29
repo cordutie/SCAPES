@@ -17,7 +17,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-WRAPPERS = REPO.parent / "audio_codec_wrappers"
+import audio_codec_wrappers
+WRAPPERS = Path(audio_codec_wrappers.__file__).resolve().parents[1]
 SNIPPETS = {
     "encodec48k": "encodec48k_atoms.gin",
     "codicodec": "codicodec_atoms.gin",
