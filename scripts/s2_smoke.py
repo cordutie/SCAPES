@@ -23,6 +23,7 @@ SNIPPETS = {
     "encodec48k": "encodec48k_atoms.gin",
     "codicodec": "codicodec_atoms.gin",
     "music2latent": "music2latent_atoms.gin",
+    "codicodec_grains": "codicodec_grains.gin",
     "encodec24k": "encodec24k_ar.gin",
     "spectrostream": "spectrostream_ar.gin",
 }
@@ -195,7 +196,7 @@ def run_codec(args, codec, max_steps, out_dir, extra_overrides=(), stages=STAGES
 # Loss against step, one colour per codec with the step-0 band; per-file val loss (2 files = 2 colours) per codec
 def make_figures(out_dir, codecs):
     from matplotlib.figure import Figure
-    colours = {"encodec48k": "tab:blue", "codicodec": "tab:orange", "encodec24k": "tab:green", "spectrostream": "tab:red", "music2latent": "tab:purple"}
+    colours = {"encodec48k": "tab:blue", "codicodec": "tab:orange", "encodec24k": "tab:green", "spectrostream": "tab:red", "music2latent": "tab:purple", "codicodec_grains": "tab:brown"}
     fig = Figure(figsize=(8, 4.5))
     ax = fig.subplots()
     ax.axhspan(*STEP0_BAND, color="gray", alpha=0.25, label="step-0 band [1.8, 2.2]")

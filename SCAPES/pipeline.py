@@ -184,6 +184,8 @@ def units_for_seconds(geom, seconds: float) -> int:
     frames = seconds * geom.frame_rate
     if geom.mode == "autoregressive":
         return max(1, math.ceil(frames / geom.unit_frames - 1e-6))
+    if geom.grain_overlap_samples:
+        return max(1, math.ceil((seconds * geom.sample_rate - geom.unit_frames * geom.hop_length) / geom.audio_hop_samples - 1e-6) + 1)
     return max(1, math.ceil((frames - geom.unit_frames) / geom.unit_hop_frames - 1e-6) + 1)
 
 

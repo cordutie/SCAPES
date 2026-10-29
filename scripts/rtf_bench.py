@@ -132,7 +132,7 @@ class Decoder:
         else:
             self.window = ola_window(self.g).to(engine.device)
             self.tail, self.k = None, 0
-        self.new_samples = (self.g.unit_frames if self.g.mode == "autoregressive" else self.g.unit_hop_frames) * self.g.hop_length
+        self.new_samples = self.g.unit_frames * self.g.hop_length if self.g.mode == "autoregressive" else self.g.audio_hop_samples
 
     @property
     def generated_seconds(self):          # the whole audio of one generated unit (atom, or the AR block)

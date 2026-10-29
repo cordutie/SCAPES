@@ -49,11 +49,12 @@ def draw_case(ax_t, ax_g, g, info, title):
     law = crossfade_law_for(g, info)
     sr, h = g.sample_rate, g.hop_length
     F, H, X = g.unit_frames, g.unit_hop_frames, g.crossfade_samples
-    atom_s, hop_s = F * h / sr, H * h / sr
-    used_from = ((F - H) * h - X) / sr                # window is zero before this point of the atom
+    G = g.grain_overlap_samples
+    atom_s, hop_s = F * h / sr, g.audio_hop_samples / sr
+    used_from = 0.0 if G else ((F - H) * h - X) / sr   # window is zero before this point of the atom
     w = ola_window(g, law).double().numpy()
     t_local = np.arange(len(w)) / sr
-    total = np.zeros(int((N_ATOMS - 1) * H * h + len(w)))
+    total = np.zeros(int((N_ATOMS - 1) * g.audio_hop_samples + len(w)))
     t_total = np.arange(len(total)) / sr
     for k in range(N_ATOMS):
         c = ATOM_COLOURS[k]
@@ -62,7 +63,8 @@ def draw_case(ax_t, ax_g, g, info, title):
         ax_t.barh(k, atom_s - used_from, left=s + used_from, height=0.62, color=c, alpha=0.8, linewidth=0)
         ax_t.text(s + 0.5 * atom_s, k, f"atom {k + 1}", ha="center", va="center", fontsize=7.5, color=INK)
         ax_g.plot(s + t_local, w, color=c, linewidth=1.6)
-        total[k * H * h:k * H * h + len(w)] += w ** 2 if law == "equal_power" else w
+        i0 = k * g.audio_hop_samples
+        total[i0:i0 + len(w)] += w ** 2 if law == "equal_power" else w
     for k in range(N_ATOMS - 1):                     # overlap of atom k with atom k + 1
         lo, hi = (k + 1) * hop_s, k * hop_s + atom_s
         for ax in (ax_t, ax_g):
@@ -71,8 +73,11 @@ def draw_case(ax_t, ax_g, g, info, title):
     ax_t.set_ylim(N_ATOMS - 0.4, -0.7)
     ax_t.set_yticks([])
     ax_t.set_title(title, fontsize=9, color=INK, loc="left", pad=22)
-    ax_t.text(0.0, 1.03, f"atom {atom_s * 1000:.0f} ms, hop {hop_s * 1000:.0f} ms, overlap {(F - H) * h / sr * 1000:.0f} ms "
-              f"({(F - H) / F:.0%}), fade {X / sr * 1000:.0f} ms", transform=ax_t.transAxes, fontsize=7.5, color=INK2)
+    overlap_s = G / sr if G else (F - H) * h / sr
+    fade_s = G / sr if G else X / sr
+    ax_t.text(0.0, 1.03, f"atom {atom_s * 1000:.0f} ms, hop {hop_s * 1000:.0f} ms, overlap {overlap_s * 1000:.0f} ms "
+              f"({overlap_s / atom_s:.0%}), fade {fade_s * 1000:.0f} ms" + (" (grains)" if G else ""),
+              transform=ax_t.transAxes, fontsize=7.5, color=INK2)
     ax_g.set_ylim(0, 1.25)
     ax_g.set_xlim(*ax_t.get_xlim())
     ax_g.set_xlabel("time (s)", fontsize=8, color=INK2)
@@ -142,13 +147,12 @@ def main():
 
     cases = []
     g, info = geometry("codicodec_atoms.gin")
-    cases.append((g, info, "CoDiCodec, trained geometry (2 chunks)"))
+    cases.append((g, info, "CoDiCodec, trained V2 geometry (2 chunks)"))
     for mode in ("normal", "strong", "brute"):
-        g, info = geometry("codicodec_atoms.gin", **{"atoms.seconds": 2.9, "atoms.overlap_mode": f'"{mode}"',
-                                                     "atoms.hop_seconds": None, "atoms.crossfade_seconds": None})
-        cases.append((g, info, f"CoDiCodec, 4 chunks, {mode}"))
+        g, info = geometry("codicodec_grains.gin", **{"atoms.seconds": 0.74, "atoms.overlap_mode": f'"{mode}"'})
+        cases.append((g, info, f"CoDiCodec grains, overlap_mode = {mode}"))
     grid(cases, OUT / "fig_codicodec.png",
-         "CoDiCodec (chunks of 0.74 s): a 2-chunk atom can only overlap 50 %; the modes differ from 4 chunks on. Equal-power crossfade")
+         "CoDiCodec: the trained models regenerate a chunk (50 % overlap); grains generate one atom at a time and overlap in the audio only")
     print("written", sorted(p.name for p in OUT.iterdir()))
 
 

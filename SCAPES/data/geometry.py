@@ -42,11 +42,17 @@ class Geometry:
     encoding: str             # "whole" | f"atoms-f{F}-h{H}"
     overlap_mode: Optional[str] = None     # atoms of stochastic decoders: normal | strong | brute (the hop follows from it)
     crossfade_law: Optional[str] = None    # "hann" | "equal_power"; None = by codec (crossfade_law_for)
+    grain_overlap_samples: int = 0         # G > 0: grains. One atom at a time (hop = atom in latent frames), overlapped in the audio only
 
     @property
     def past_frames(self) -> int:
         """Frames from the start of the past to the start of the target."""
         return self.memory_units * self.unit_hop_frames if self.mode == "atoms" else self.memory_frames
+
+    # Samples between the starts of consecutive atoms in the output audio: the hop, or the atom minus the grain overlap.
+    @property
+    def audio_hop_samples(self) -> int:
+        return self.unit_hop_frames * self.hop_length - self.grain_overlap_samples
 
     # Frame-level lines, as written to inference.gin by training (read back by geometry_from_inference_gin).
     def to_gin_lines(self) -> list[str]:
@@ -59,6 +65,8 @@ class Geometry:
                 lines.append(f'atoms.overlap_mode = "{self.overlap_mode}"')
             if self.crossfade_law is not None:
                 lines.append(f'atoms.crossfade_law = "{self.crossfade_law}"')
+            if self.grain_overlap_samples:
+                lines.append(f"atoms.grain_overlap_samples = {self.grain_overlap_samples}")
         else:
             lines += [f"ar.block_frames = {self.unit_frames}", f"ar.memory_frames = {self.memory_frames}",
                       f"ar.stride_frames = {self.stride_frames}", f"ar.prefix_frames = {self.prefix_frames}"]
@@ -67,7 +75,7 @@ class Geometry:
 
 
 def _make_geometry(info, mode, unit, hop, memory_units, memory_frames, stride, crossfade, prefix, context_seconds,
-                   overlap_mode=None, crossfade_law=None):
+                   overlap_mode=None, crossfade_law=None, grain=0):
     has_scale = bool(info.normalizes_input)
     encoding = f"atoms-f{unit}-h{hop}" if has_scale else "whole"
     return Geometry(
@@ -77,7 +85,7 @@ def _make_geometry(info, mode, unit, hop, memory_units, memory_frames, stride, c
         stride_frames=stride, crossfade_samples=crossfade, prefix_frames=prefix,
         decode="ola" if mode == "atoms" else "stream", context_seconds=context_seconds, has_scale=has_scale,
         frame_dim=info.latent_dim + int(has_scale), encoding=encoding, overlap_mode=overlap_mode,
-        crossfade_law=crossfade_law,
+        crossfade_law=crossfade_law, grain_overlap_samples=grain,
     )
 
 
@@ -95,15 +103,20 @@ def _check_atoms(info, F, H, X):
 
 # ─── Overlap modes (codecs with a stochastic decoder: CoDiCodec, Music2Latent) ───
 # The decoded atoms of such a codec are not continuous with each other (the same latents decode to different waveforms), so
-# the overlap with the previous atom is only there to crossfade, and the hop follows from the mode: the overlap is a fraction
-# of the atom, rounded to the codec quantum and never below one quantum. normal: one quantum, short fade (atoms.crossfade_seconds,
-# default 0.05 s); strong: 25 % of the atom, crossfaded over the whole overlap; brute: 50 %, crossfaded over the whole overlap.
+# regenerating past frames buys no continuity and the atoms only overlap to be crossfaded. The overlap is a fraction of the
+# atom: normal = one quantum (short fade, atoms.crossfade_seconds, default 0.05 s), strong = 25 %, brute = 50 % (both crossfaded
+# over the whole overlap). The hop follows from the mode. Two ways to overlap:
+#   latent overlap (Music2Latent): the atoms share latent frames, the hop is the atom minus the overlap in frames;
+#   grains (CoDiCodec, whose quantum is a whole 0.743 s chunk): the model generates one atom at a time, atoms do not share
+#   frames (hop = atom in latent frames) and are placed in the audio with the overlap, the output being that much shorter.
 OVERLAP_FRACTIONS = {"normal": 0.0, "strong": 0.25, "brute": 0.5}
 DEFAULT_NORMAL_FADE_SECONDS = 0.05
 CROSSFADE_LAWS = ("hann", "equal_power")
+GRAIN_CODECS = ("codicodec",)
 
 
 def _overlap_geometry(info, cfg):
+    """(F, H, X, G): atom and hop in frames, latent crossfade and grain overlap in samples."""
     mode = cfg.atoms_overlap_mode
     if mode not in OVERLAP_FRACTIONS:
         raise ConfigError(f"atoms.overlap_mode = {mode!r} is invalid, choose from {list(OVERLAP_FRACTIONS)}")
@@ -114,19 +127,24 @@ def _overlap_geometry(info, cfg):
         raise ConfigError("atoms.hop_seconds is derived from atoms.overlap_mode: remove it")
     q, h = info.frame_quantum, info.hop_length
     F = seconds_to_frames(cfg.atoms_seconds, info.frame_rate, q)
-    O = max(q, min(q * round(OVERLAP_FRACTIONS[mode] * F / q), q * (F // (2 * q))))   # the overlap never exceeds the hop
-    H = F - O
-    if H < q:
-        raise ConfigError(f"overlap_mode {mode!r}: an atom of {F} frames leaves no hop after an overlap of {O} frames; "
-                          f"use a longer atoms.seconds")
     if mode == "normal":
         fade = DEFAULT_NORMAL_FADE_SECONDS if cfg.atoms_crossfade_seconds is None else cfg.atoms_crossfade_seconds
         X = seconds_to_samples(fade, info.sample_rate)
     else:
         if cfg.atoms_crossfade_seconds not in (None, 0.0):
             raise ConfigError(f"overlap_mode {mode!r} crossfades the whole overlap: remove atoms.crossfade_seconds")
-        X = O * h
-    return F, H, X
+        X = None
+    if info.name in GRAIN_CODECS:
+        G = X if X is not None else int(round(OVERLAP_FRACTIONS[mode] * F * h))
+        if 2 * G > F * h:
+            raise ConfigError(f"overlap_mode {mode!r}: the overlap of {G} samples is more than half the atom ({F * h} samples)")
+        return F, F, 0, G
+    O = max(q, min(q * round(OVERLAP_FRACTIONS[mode] * F / q), q * (F // (2 * q))))   # the overlap never exceeds the hop
+    H = F - O
+    if H < q:
+        raise ConfigError(f"overlap_mode {mode!r}: an atom of {F} frames leaves no hop after an overlap of {O} frames; "
+                          f"use a longer atoms.seconds")
+    return F, H, (O * h if X is None else X), 0
 
 
 def crossfade_law_for(geom: Geometry, info) -> str:
@@ -143,11 +161,12 @@ def resolve_geometry(cfg: DataprepConfig, info) -> Geometry:
         if info.causal:
             warnings.warn(f"atoms mode with the causal codec {info.name}: allowed for comparisons only", UserWarning)
         if cfg.atoms_overlap_mode is not None:
-            F, H, X = _overlap_geometry(info, cfg)
+            F, H, X, G = _overlap_geometry(info, cfg)
         else:
             F = seconds_to_frames(cfg.atoms_seconds, f, q)
             H = seconds_to_frames(cfg.atoms_hop_seconds, f, q)
             X = seconds_to_samples(cfg.atoms_crossfade_seconds or 0.0, r)
+            G = 0
         _check_atoms(info, F, H, X)
         law = cfg.atoms_crossfade_law
         if law is not None and law not in CROSSFADE_LAWS:
@@ -156,7 +175,7 @@ def resolve_geometry(cfg: DataprepConfig, info) -> Geometry:
         if M < 1:
             raise ConfigError("dataset.memory_buffer_atoms must be >= 1")
         return _make_geometry(info, "atoms", F, H, M, F, int(cfg.hop_atoms) * H, X, 0, cfg.semantic_context_seconds,
-                              overlap_mode=cfg.atoms_overlap_mode, crossfade_law=law)
+                              overlap_mode=cfg.atoms_overlap_mode, crossfade_law=law, grain=G)
     if cfg.generation_mode == "autoregressive":
         if not info.causal:
             raise ConfigError(f"autoregressive mode needs a causal codec; {info.name} is not causal")
@@ -190,7 +209,8 @@ def geometry_from_inference_gin(raw: dict, info) -> Geometry:
         M = int(get("dataset", "memory_buffer_atoms", default=1))
         _check_atoms(info, F, H, int(X))
         return _make_geometry(info, "atoms", F, H, M, F, int(get("dataset", "hop_atoms", default=1)) * H, int(X), 0, ctx,
-                              overlap_mode=get("atoms", "overlap_mode"), crossfade_law=get("atoms", "crossfade_law"))
+                              overlap_mode=get("atoms", "overlap_mode"), crossfade_law=get("atoms", "crossfade_law"),
+                              grain=int(get("atoms", "grain_overlap_samples", default=0)))
     if mode == "autoregressive":
         B, W = int(get("ar", "block_frames")), int(get("ar", "memory_frames"))
         S = int(get("ar", "stride_frames", default=B))
@@ -206,13 +226,17 @@ def ola_window(geom: Geometry, law: str = "hann") -> torch.Tensor:
     h, F, H, X = geom.hop_length, geom.unit_frames, geom.unit_hop_frames, geom.crossfade_samples
     if law not in CROSSFADE_LAWS:
         raise ConfigError(f"crossfade law {law!r} is invalid, choose from {list(CROSSFADE_LAWS)}")
-    if X > 0:
-        hann = torch.hann_window(2 * X)
-        rise, fall = hann[:X], hann[X:]
+    G = geom.grain_overlap_samples
+    n = max(X, G)
+    if n > 0:
+        hann = torch.hann_window(2 * n)
+        rise, fall = hann[:n], hann[n:]
         if law == "equal_power":
             rise, fall = rise.sqrt(), fall.sqrt()
     else:
         rise = fall = torch.zeros(0)
+    if G > 0:       # grains: rise, flat, fall over the whole atom
+        return torch.cat([rise, torch.ones(F * h - 2 * G), fall])
     return torch.cat([torch.zeros((F - H) * h - X), rise, torch.ones(H * h - X), fall])
 
 

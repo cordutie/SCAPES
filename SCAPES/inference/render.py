@@ -5,15 +5,16 @@ from SCAPES.data.geometry import Geometry, ola_window
 
 
 # Overlap-add of K unit audios [C, F*h] placed H*h samples apart, each multiplied by the atom window.
-# Returns [C, ((K-1)H + F) h].
+# Returns [C, (K-1) * step + F * h] with step = geom.audio_hop_samples.
 def ola_render(unit_audios: list, geom: Geometry, law: str = "hann") -> torch.Tensor:
-    h, F, H = geom.hop_length, geom.unit_frames, geom.unit_hop_frames
+    h, F = geom.hop_length, geom.unit_frames
+    step = geom.audio_hop_samples          # H*h, or the atom minus the overlap for grains
     K = len(unit_audios)
     first = unit_audios[0]
     window = ola_window(geom, law).to(device=first.device, dtype=first.dtype)
-    out = torch.zeros(first.shape[0], ((K - 1) * H + F) * h, device=first.device, dtype=first.dtype)
+    out = torch.zeros(first.shape[0], (K - 1) * step + F * h, device=first.device, dtype=first.dtype)
     for k, audio in enumerate(unit_audios):
-        start = k * H * h
+        start = k * step
         out[:, start:start + F * h] += audio * window
     return out
 

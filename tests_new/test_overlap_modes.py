@@ -47,17 +47,38 @@ def test_music2latent_template():
     assert (g.unit_frames, g.unit_hop_frames, g.latent_dim, g.has_scale, g.encoding) == (4, 3, 128, False, "whole")
 
 
-# CoDiCodec: quantum 8 frames (a chunk of 0.743 s), so a 2-chunk atom has only a 50 % overlap whatever the mode.
-def _codicodec(seconds, mode):
-    return _geom("codicodec_atoms.gin", **{"atoms.seconds": seconds, "atoms.overlap_mode": f'"{mode}"',
-                                           "atoms.hop_seconds": None, "atoms.crossfade_seconds": None})
+# CoDiCodec: grains. One atom (whole 0.743 s chunks) at a time, no shared latent frames, overlapped in the audio only.
+def _grains(seconds, mode):
+    return _geom("codicodec_grains.gin", **{"atoms.seconds": seconds, "atoms.overlap_mode": f'"{mode}"'})
 
 
-def test_codicodec_chunks():
-    for mode in ("normal", "strong", "brute"):
-        assert _fh(_codicodec(1.0, mode))[:2] == (16, 8), mode
-    assert _fh(_codicodec(2.9, "strong"))[:2] == (32, 24)       # 4 chunks, overlap 1 chunk (25 %)
-    assert _fh(_codicodec(2.9, "brute"))[:2] == (32, 16)        # overlap 2 chunks (50 %)
+@pytest.mark.parametrize("mode,overlap", [("normal", 2205), ("strong", 8192), ("brute", 16384)])
+def test_codicodec_grains(mode, overlap):
+    g = _grains(0.74, mode)
+    assert (g.unit_frames, g.unit_hop_frames, g.crossfade_samples, g.grain_overlap_samples) == (8, 8, 0, overlap)
+    assert g.audio_hop_samples == 8 * 4096 - overlap
+    assert g.stride_frames == 8                      # training windows and the CLAP grid do not overlap
+    assert g.overlap_mode == mode
+
+
+def test_codicodec_two_chunk_grains():
+    g = _grains(1.48, "strong")
+    assert (g.unit_frames, g.grain_overlap_samples) == (16, round(0.25 * 16 * 4096))
+
+
+def test_trained_codicodec_template_is_unchanged():
+    g = _geom("codicodec_atoms.gin")
+    assert (g.unit_frames, g.unit_hop_frames, g.grain_overlap_samples, g.overlap_mode) == (16, 8, 0, None)
+
+
+def test_grain_output_length_and_units():
+    from SCAPES.pipeline import units_for_seconds
+    g = _grains(0.74, "brute")
+    n = g.unit_frames * g.hop_length
+    out = ola_render([torch.ones(1, n) for _ in range(5)], g, "equal_power")
+    assert out.shape[-1] == 4 * g.audio_hop_samples + n
+    k = units_for_seconds(g, 10.0)
+    assert (k - 1) * g.audio_hop_samples + n >= 10.0 * g.sample_rate > (k - 2) * g.audio_hop_samples + n
 
 
 def test_overlap_mode_is_refused_for_deterministic_decoders():
@@ -110,6 +131,19 @@ def test_equal_power_window(mode):
     assert float((interior - 1).abs().max()) <= 1e-5          # powers add up to 1
     h = ola_window(g, "hann").double()
     assert torch.allclose(w.double() ** 2, h, atol=1e-6)      # equal power is the square root of Hann
+
+
+@pytest.mark.parametrize("mode", ["normal", "strong", "brute"])
+def test_equal_power_grain_window(mode):
+    g = _grains(0.74, mode)
+    w = ola_window(g, "equal_power").double()
+    n, step = w.shape[0], g.audio_hop_samples
+    assert n == g.unit_frames * g.hop_length
+    total = torch.zeros(n + 6 * step, dtype=torch.float64)
+    for k in range(7):
+        total[k * step:k * step + n] += w ** 2
+    interior = total[n:6 * step]
+    assert float((interior - 1).abs().max()) <= 1e-5
 
 
 def test_incoherent_audio_keeps_its_power_under_equal_power_but_dips_under_hann():

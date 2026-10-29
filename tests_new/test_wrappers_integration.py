@@ -11,6 +11,7 @@ import torch
 
 REPO = Path(__file__).resolve().parents[1]
 CODECS = ["encodec24k", "spectrostream", "encodec48k", "codicodec", "music2latent"]
+PIPELINE_CASES = CODECS + ["codicodec_grains"]
 SMOKE_DATASET = REPO.parent / "datasets" / "micro_microtex"
 
 
@@ -78,16 +79,16 @@ def test_pipeline_runs_for_every_codec(tmp_path):
     """Dataprep, 20 training steps and 10 s of generation per codec, each stage in a fresh process (scripts/s2_smoke.py)."""
     out = tmp_path / "s2"
     proc = subprocess.run([sys.executable, str(REPO / "scripts" / "s2_smoke.py"), "--dataset", str(SMOKE_DATASET),
-                           "--out", str(out), "--codecs", *CODECS, "--max-steps", "20", "--no-spectral-check"],
+                           "--out", str(out), "--codecs", *PIPELINE_CASES, "--max-steps", "20", "--no-spectral-check"],
                           cwd=REPO, capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(REPO)})
     assert proc.returncode == 0, proc.stderr[-2000:]
-    for name in CODECS:
+    for name in PIPELINE_CASES:
         res = json.loads((out / name / "s2_result.json").read_text())
         assert res["stages_ok"] == 3, f"{name}: {res['stages']}"
         art = res["artefacts"]
         assert art["best_flow_model"] and art["inference_gin"] and art["wav_10s"], f"{name}: {art}"
         assert res["train"]["all_finite"], name
-        if name in ("encodec48k", "codicodec", "music2latent"):
+        if name in ("encodec48k", "codicodec", "music2latent", "codicodec_grains"):
             _check_atoms_generation(out / name / "model", name)
 
 
@@ -101,5 +102,5 @@ def _check_atoms_generation(model_dir, name):
     audio = engine.generate_soundscape(clap, nfe=2, cfg_scale=1.0, seed=0)
     geom = engine.geom
     assert torch.isfinite(audio).all()
-    assert audio.shape[-1] == ((len(clap) - 1) * geom.unit_hop_frames + geom.unit_frames) * geom.hop_length
+    assert audio.shape[-1] == (len(clap) - 1) * geom.audio_hop_samples + geom.unit_frames * geom.hop_length
     assert crossfade_law_for(geom, engine.info) == ("hann" if name == "encodec48k" else "equal_power")
