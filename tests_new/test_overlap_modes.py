@@ -19,7 +19,7 @@ def _geom(codec_gin):
 
 def test_music2latent_geometry():
     g = _geom("music2latent_atoms.gin")
-    assert (g.unit_frames, g.unit_hop_frames, g.latent_dim, g.has_scale, g.encoding) == (16, 8, 128, False, "whole")
+    assert (g.unit_frames, g.unit_hop_frames, g.latent_dim, g.has_scale, g.encoding) == (8, 6, 128, False, "whole")
     assert g.hop_length == 4096 and g.sample_rate == 44100
 
 
@@ -28,9 +28,8 @@ def test_normal_keeps_the_geometry():
     assert with_overlap_mode(g, get_codec_info("codicodec"), "normal") is g
 
 
-@pytest.mark.parametrize("gin,codec", [("codicodec_atoms.gin", "codicodec"), ("music2latent_atoms.gin", "music2latent")])
-def test_strong_and_brute_fractions(gin, codec):
-    g, info = _geom(gin), get_codec_info(codec)
+def test_strong_and_brute_fractions():
+    g, info = _geom("codicodec_atoms.gin"), get_codec_info("codicodec")
     atom = g.unit_frames * g.hop_length
     strong, brute = with_overlap_mode(g, info, "strong"), with_overlap_mode(g, info, "brute")
     assert strong.crossfade_samples == round(0.25 * atom)
@@ -40,9 +39,16 @@ def test_strong_and_brute_fractions(gin, codec):
         assert w.shape[0] == atom and float(w.max()) <= 1.0
 
 
+def test_music2latent_overlaps_only_by_the_crossfade():
+    g, info = _geom("music2latent_atoms.gin"), get_codec_info("music2latent")
+    assert (g.unit_frames - g.unit_hop_frames) * g.hop_length == with_overlap_mode(g, info, "strong").crossfade_samples
+    with pytest.raises(ConfigError, match="does not fit"):
+        with_overlap_mode(g, info, "brute")
+
+
 def test_brute_is_a_plain_hann_overlap_add():
     """With the atom twice the hop and X = half the atom, the window is a full Hann and the overlap-add has constant gain."""
-    g = with_overlap_mode(_geom("music2latent_atoms.gin"), get_codec_info("music2latent"), "brute")
+    g = with_overlap_mode(_geom("codicodec_atoms.gin"), get_codec_info("codicodec"), "brute")
     atom = g.unit_frames * g.hop_length
     out = ola_render([torch.ones(2, atom) for _ in range(5)], g)
     steady = out[:, atom // 2: -atom // 2]

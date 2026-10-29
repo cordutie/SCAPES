@@ -78,7 +78,7 @@ In atoms mode the generated atoms are decoded one by one and overlap-added. The 
 |---|---|---|
 | `normal` | the model's `atoms.crossfade_seconds` (a few ms to tens of ms) | deterministic decoders (EnCodec 48k) |
 | `strong` | 25% of the atom | stochastic decoders |
-| `brute` | 50% of the atom (plain Hann overlap-add) | stochastic decoders; needs a hop of at least half the atom |
+| `brute` | 50% of the atom (plain Hann overlap-add) | stochastic decoders; needs the hop to be exactly half the atom (CoDiCodec's 2-chunk atoms) |
 
 ```bash
 python scripts/inference.py --model_dir <model> --overlap_mode strong generate ...
@@ -87,7 +87,9 @@ python scripts/inference.py --model_dir <model> --overlap_mode strong generate .
 engine = FlowInference(model_dir, overlap_mode="brute")   # or engine.set_overlap_mode("strong")
 ```
 
-A mode whose crossfade does not fit the geometry (the crossfade cannot exceed the hop or the overlap of consecutive atoms) raises an error that says so; for example `brute` does not fit the EnCodec 48k atoms (0.32 s atom, 0.1 s hop).
+A mode whose crossfade does not fit the geometry (the crossfade cannot exceed the hop or the overlap of consecutive atoms) raises an error that says so; for example `brute` does not fit the EnCodec 48k atoms (0.32 s atom, 0.1 s hop) or the Music2Latent atoms (0.74 s atom, 0.55 s hop).
+
+For stochastic decoders, regenerating past frames does not make the audio continuous (the same latents decode to different waveforms), so their configs use atoms that overlap the previous one only by the crossfade (`music2latent_atoms.gin`: 8-frame atoms, 6-frame hop). EnCodec 48k keeps the long overlap, which does enforce continuity with its deterministic decoder.
 
 ## Pipeline
 

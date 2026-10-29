@@ -97,7 +97,7 @@ def codec_is_atoms(name):
 
 def _check_overlap_modes(model_dir, name):
     """The three overlap modes on the freshly trained atoms model: same length, finite, different audio; brute is refused
-    where the atom is too short for it (EnCodec 48k)."""
+    where the overlap is shorter than half the atom (EnCodec 48k, Music2Latent)."""
     from SCAPES.data.config_loader import ConfigError
     from SCAPES.inference.FlowInference import FlowInference
     g = torch.Generator().manual_seed(0)
@@ -107,7 +107,7 @@ def _check_overlap_modes(model_dir, name):
         try:
             engine = FlowInference(model_dir, device="cuda", checkpoint="last", overlap_mode=mode)
         except ConfigError:
-            assert name == "encodec48k" and mode == "brute"
+            assert name in ("encodec48k", "music2latent") and mode == "brute"
             continue
         audio[mode] = engine.generate_soundscape(clap, nfe=2, cfg_scale=1.0, seed=0)
         assert torch.isfinite(audio[mode]).all()
