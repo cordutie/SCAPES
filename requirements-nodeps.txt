@@ -4,10 +4,10 @@
 # (same pins as audio_codec_wrappers/requirements-git.txt).
 msclap==1.3.4
 
-# Codec wrappers (separate repo). Editable VCS install: pip clones it into <venv>/src/audio-codec-wrappers
-# at this commit, so weights.lock.json and scripts/fetch_weights.py sit next to the package.
-# Bump the commit when the wrappers change. For a local checkout use: -e ../audio_codec_wrappers
--e git+https://github.com/cordutie/audio_codec_wrappers.git@26599efd3553be0b9bbe9cf4f228e27202410496#egg=audio_codec_wrappers
+# Codec wrappers: the git submodule ./external/audio_codec_wrappers (git clone --recurse-submodules, or
+# git submodule update --init). Run pip from the root of this repository. The submodule is pinned to a
+# commit; to use newer wrappers, update the submodule and commit it.
+-e ./external/audio_codec_wrappers
 
 # SpectroStream (pip checks out the sequence-layers submodule) and CoDiCodec.
 magenta-rt @ git+https://github.com/magenta/magenta-realtime@694a545e4ba0b88bf1150137b129582166d3e07f

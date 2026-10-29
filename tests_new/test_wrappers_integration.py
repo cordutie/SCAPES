@@ -2,7 +2,6 @@
 and the whole pipeline (dataprep, training, generation) for every codec on the small dataset."""
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -31,13 +30,13 @@ def test_wrappers_checkout_has_what_the_codecs_read():
     assert _git(root, "rev-parse", "HEAD").returncode == 0
 
 
-def test_installed_wrappers_contain_the_pinned_commit():
-    text = (REPO / "requirements-nodeps.txt").read_text()
-    pinned = re.search(r"audio_codec_wrappers\.git@([0-9a-f]{40})", text)
-    assert pinned, "requirements-nodeps.txt does not pin audio_codec_wrappers to a commit"
-    root = _wrappers_root()
-    assert _git(root, "merge-base", "--is-ancestor", pinned.group(1), "HEAD").returncode == 0, \
-        f"installed wrappers ({_git(root, 'rev-parse', 'HEAD').stdout.strip()}) do not contain pinned {pinned.group(1)}"
+def test_installed_wrappers_are_the_submodule():
+    """The environment imports the wrappers from the submodule, at the commit the submodule pointer records."""
+    assert _wrappers_root() == (REPO / "external" / "audio_codec_wrappers").resolve()
+    pointer = _git(REPO, "ls-tree", "HEAD", "external/audio_codec_wrappers").stdout.split()
+    assert pointer and pointer[1] == "commit", "external/audio_codec_wrappers is not a submodule of this repository"
+    assert _git(_wrappers_root(), "merge-base", "--is-ancestor", pointer[2], "HEAD").returncode == 0, \
+        f"submodule checkout does not contain the committed pointer {pointer[2]}"
 
 
 def test_wrapper_registry_matches_scapes_codecs():

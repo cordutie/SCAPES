@@ -32,14 +32,15 @@ Dive deep into the code and customize the training loop.
 
 ## Installation
 
-SCAPES installs together with its codec wrappers ([audio_codec_wrappers](https://github.com/cordutie/audio_codec_wrappers)) in a single virtual environment. You only clone this repository; pip clones the wrappers for you.
+SCAPES installs together with its codec wrappers ([audio_codec_wrappers](https://github.com/cordutie/audio_codec_wrappers), included as the git submodule `external/audio_codec_wrappers/`) in a single virtual environment.
 
-Requirements: Linux, Python 3.12, an NVIDIA GPU with a recent driver (CUDA 12), git (pip uses it to fetch the git dependencies).
+Requirements: Linux, Python 3.12, an NVIDIA GPU with a recent driver (CUDA 12), git.
 
 ```bash
-git clone https://github.com/cordutie/SCAPES.git
+git clone --recurse-submodules https://github.com/cordutie/SCAPES.git
 cd SCAPES
 git checkout v2        # until v2 is merged into main
+git submodule update --init   # only needed if you cloned without --recurse-submodules
 
 python3.12 -m venv .venv
 source .venv/bin/activate
@@ -49,11 +50,11 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 # 2. Packages that must be installed without their own dependency pins:
-#    msclap, magenta-rt, codicodec, and audio_codec_wrappers, which pip clones into .venv/src/audio-codec-wrappers
+#    msclap, magenta-rt, codicodec, and the wrappers (editable, from ./external/audio_codec_wrappers)
 pip install --no-deps -r requirements-nodeps.txt
 
 # 3. One-time download of the SpectroStream and CoDiCodec weights (EnCodec downloads itself on first use)
-for c in spectrostream codicodec; do python .venv/src/audio-codec-wrappers/scripts/fetch_weights.py --codec $c; done
+for c in spectrostream codicodec; do python external/audio_codec_wrappers/scripts/fetch_weights.py --codec $c; done
 ```
 
 Check the installation (needs the GPU; the last test trains 20 steps for each of the four codecs and takes a few minutes):
@@ -63,7 +64,7 @@ python -m pytest -q tests_new/test_wrappers_integration.py
 ```
 
 Notes:
-- `requirements-nodeps.txt` pins the wrappers to a commit. To use a newer version, change the commit in that file. To work on the wrappers themselves, clone them next to this repository and replace that line by `-e ../audio_codec_wrappers`.
+- The wrappers are pinned by the submodule commit. To move to a newer version: `git -C external/audio_codec_wrappers pull origin main`, then `git add external/audio_codec_wrappers` and commit. To change the wrappers, edit them in `external/audio_codec_wrappers/` (it is its own git repository; commit and push there, then commit the new submodule pointer here).
 - The weights are stored in `~/.cache/audio_codec_wrappers` (set `ACW_CACHE` to change it).
 - `msclap` asks for numpy < 2; this is why it is installed with `--no-deps`. Its embeddings are unchanged with numpy 2 (checked by `tests/test_env_scapes.py`).
 
