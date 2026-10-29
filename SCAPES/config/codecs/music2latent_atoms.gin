@@ -1,12 +1,14 @@
-# Music2Latent, atoms mode: whole-file encoding, frames of 4096 samples (0.093 s). The decoder is stochastic, so regenerating
-# past frames does not give continuous audio: atoms overlap their predecessor only by the crossfade.
-# Atom = 8 frames (0.74 s), hop = 6 frames (0.56 s), overlap = 2 frames (25 % of the atom, 0.19 s).
-# overlap_mode normal = 0.05 s crossfade, strong = 25 % of the atom (fits exactly). brute (50 %) needs hop = half the atom.
+# Music2Latent, atoms mode (stochastic decoder: see docs/overlap_add.md). Whole-file encoding, frames of 4096 samples (0.093 s).
+# The atom is 4 frames (0.37 s) and the hop follows from atoms.overlap_mode:
+#   normal: overlap 1 frame, hop 3 frames (0.28 s), short fade (atoms.crossfade_seconds, default 0.05 s)
+#   strong: overlap 1 frame (25 %), hop 3 frames (0.28 s), crossfade over the whole overlap
+#   brute:  overlap 2 frames (50 %), hop 2 frames (0.19 s), crossfade over the whole overlap
+# The hop is also the rate at which the semantic conditioning changes. A 2-frame atom would reach 0.093 s, but every mode would
+# then have the same 1-frame overlap and hop.
 codec.name = "music2latent"
 generation.mode = "atoms"
-atoms.seconds = 0.74
-atoms.hop_seconds = 0.55
-atoms.crossfade_seconds = 0.05
+atoms.seconds = 0.37
+atoms.overlap_mode = "strong"
 dataset.memory_buffer_atoms = 1
 # training
 training.standardize_latents = True

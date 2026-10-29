@@ -750,7 +750,8 @@ class FlowTrainer:
         if not self.val_audio_files:
             return
         import soundfile as sf
-        from SCAPES.codecs import get_codec
+        from SCAPES.codecs import get_codec, get_codec_info
+        from SCAPES.data.geometry import crossfade_law_for
         from SCAPES.inference.render import StreamRenderer, render_atoms
 
         self.model.eval()
@@ -807,7 +808,7 @@ class FlowTrainer:
                     renderer.push(z)
                 audio = renderer.finish()
             else:
-                audio = render_atoms(codec, atoms, g, self.mu, self.std)
+                audio = render_atoms(codec, atoms, g, self.mu, self.std, law=crossfade_law_for(g, get_codec_info(g.codec)))
 
             file_stem = Path(target_file).stem
             sf.write(self.val_dir / f"epoch_{epoch}_{file_stem}_TF.wav", audio.cpu().T.numpy(), g.sample_rate)

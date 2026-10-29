@@ -1,4 +1,5 @@
-"""Overlap-add modes for atoms (normal / strong / brute) and the Music2Latent geometry."""
+"""Overlap modes (normal / strong / brute) of the stochastic decoders and the crossfade laws (Hann, equal power)."""
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -6,76 +7,123 @@ import torch
 
 from SCAPES.codecs import get_codec_info
 from SCAPES.data.config_loader import ConfigError, load_dataprep_config
-from SCAPES.data.geometry import OVERLAP_MODES, ola_window, resolve_geometry, with_overlap_mode
+from SCAPES.data.geometry import crossfade_law_for, geometry_from_inference_gin, ola_window, resolve_geometry
 from SCAPES.inference.render import ola_render
+from SCAPES.data.config_loader import parse_gin_config
 
 CONFIG = Path(__file__).resolve().parents[1] / "SCAPES" / "config"
 
 
-def _geom(codec_gin):
-    cfg = load_dataprep_config(CONFIG / "codecs" / codec_gin)
+def _geom(codec_gin, **overrides):
+    lines = [l for l in (CONFIG / "codecs" / codec_gin).read_text().splitlines()
+             if not any(l.startswith(k + " ") for k in overrides)]
+    lines += [f"{k} = {v}" for k, v in overrides.items() if v is not None]    # None removes the key
+    path = Path(tempfile.mkdtemp()) / "a.gin"
+    path.write_text("\n".join(lines) + "\n")
+    cfg = load_dataprep_config(path)
     return resolve_geometry(cfg, get_codec_info(cfg.codec_name))
 
 
-def test_music2latent_geometry():
+def _fh(g):
+    return g.unit_frames, g.unit_hop_frames, g.crossfade_samples
+
+
+# Music2Latent: 4096-sample frames, quantum 1. Atom of 4 frames, 8 frames.
+@pytest.mark.parametrize("seconds,mode,expected", [
+    (0.37, "normal", (4, 3, 2205)),     # overlap 1 frame, short fade
+    (0.37, "strong", (4, 3, 4096)),     # overlap 1 frame = 25 %, whole overlap crossfaded
+    (0.37, "brute", (4, 2, 8192)),      # overlap 2 frames = 50 %
+    (0.74, "normal", (8, 7, 2205)),
+    (0.74, "strong", (8, 6, 8192)),
+    (0.74, "brute", (8, 4, 16384)),
+])
+def test_music2latent_hop_follows_the_mode(seconds, mode, expected):
+    g = _geom("music2latent_atoms.gin", **{"atoms.seconds": seconds, "atoms.overlap_mode": f'"{mode}"'})
+    assert _fh(g) == expected and g.overlap_mode == mode
+
+
+def test_music2latent_template():
     g = _geom("music2latent_atoms.gin")
-    assert (g.unit_frames, g.unit_hop_frames, g.latent_dim, g.has_scale, g.encoding) == (8, 6, 128, False, "whole")
-    assert g.hop_length == 4096 and g.sample_rate == 44100
+    assert (g.unit_frames, g.unit_hop_frames, g.latent_dim, g.has_scale, g.encoding) == (4, 3, 128, False, "whole")
 
 
-def test_normal_keeps_the_geometry():
-    g = _geom("codicodec_atoms.gin")
-    assert with_overlap_mode(g, get_codec_info("codicodec"), "normal") is g
+# CoDiCodec: quantum 8 frames (a chunk of 0.743 s), so a 2-chunk atom has only a 50 % overlap whatever the mode.
+def _codicodec(seconds, mode):
+    return _geom("codicodec_atoms.gin", **{"atoms.seconds": seconds, "atoms.overlap_mode": f'"{mode}"',
+                                           "atoms.hop_seconds": None, "atoms.crossfade_seconds": None})
 
 
-def test_strong_and_brute_fractions():
-    g, info = _geom("codicodec_atoms.gin"), get_codec_info("codicodec")
-    atom = g.unit_frames * g.hop_length
-    strong, brute = with_overlap_mode(g, info, "strong"), with_overlap_mode(g, info, "brute")
-    assert strong.crossfade_samples == round(0.25 * atom)
-    assert brute.crossfade_samples == round(0.5 * atom)
-    for h in (strong, brute):
-        w = ola_window(h)
-        assert w.shape[0] == atom and float(w.max()) <= 1.0
+def test_codicodec_chunks():
+    for mode in ("normal", "strong", "brute"):
+        assert _fh(_codicodec(1.0, mode))[:2] == (16, 8), mode
+    assert _fh(_codicodec(2.9, "strong"))[:2] == (32, 24)       # 4 chunks, overlap 1 chunk (25 %)
+    assert _fh(_codicodec(2.9, "brute"))[:2] == (32, 16)        # overlap 2 chunks (50 %)
 
 
-def test_music2latent_overlaps_only_by_the_crossfade():
-    g, info = _geom("music2latent_atoms.gin"), get_codec_info("music2latent")
-    assert (g.unit_frames - g.unit_hop_frames) * g.hop_length == with_overlap_mode(g, info, "strong").crossfade_samples
-    with pytest.raises(ConfigError, match="does not fit"):
-        with_overlap_mode(g, info, "brute")
+def test_overlap_mode_is_refused_for_deterministic_decoders():
+    lines = (CONFIG / "codecs" / "encodec48k_atoms.gin").read_text().splitlines() + ['atoms.overlap_mode = "strong"']
+    path = Path(tempfile.mkdtemp()) / "a.gin"
+    path.write_text("\n".join(lines))
+    with pytest.raises(ConfigError, match="stochastic decoder"):
+        resolve_geometry(load_dataprep_config(path), get_codec_info("encodec48k"))
 
 
-def test_brute_is_a_plain_hann_overlap_add():
-    """With the atom twice the hop and X = half the atom, the window is a full Hann and the overlap-add has constant gain."""
-    g = with_overlap_mode(_geom("codicodec_atoms.gin"), get_codec_info("codicodec"), "brute")
-    atom = g.unit_frames * g.hop_length
-    out = ola_render([torch.ones(2, atom) for _ in range(5)], g)
-    steady = out[:, atom // 2: -atom // 2]
-    assert torch.allclose(steady, torch.ones_like(steady), atol=1e-5)
-
-
-def test_crossfade_gain_is_one_for_every_mode():
-    g0 = _geom("codicodec_atoms.gin")
-    for mode in OVERLAP_MODES:
-        g = with_overlap_mode(g0, get_codec_info("codicodec"), mode)
-        atom = g.unit_frames * g.hop_length
-        out = ola_render([torch.ones(1, atom) for _ in range(4)], g)
-        assert torch.allclose(out[:, atom:-atom], torch.ones_like(out[:, atom:-atom]), atol=1e-5), mode
-
-
-def test_brute_does_not_fit_encodec48k_atoms():
-    g = _geom("encodec48k_atoms.gin")     # 0.32 s atoms, 0.1 s hop: the crossfade cannot exceed the hop
-    with pytest.raises(ConfigError, match="does not fit"):
-        with_overlap_mode(g, get_codec_info("encodec48k"), "brute")
-    with_overlap_mode(g, get_codec_info("encodec48k"), "strong")   # 25 % of 0.32 s = 0.08 s fits
-
-
-def test_invalid_mode_and_ar_geometry():
-    g = _geom("codicodec_atoms.gin")
+def test_invalid_mode_and_conflicting_keys():
     with pytest.raises(ConfigError, match="invalid"):
-        with_overlap_mode(g, get_codec_info("codicodec"), "soft")
-    ar = _geom("encodec24k_ar.gin")
-    assert with_overlap_mode(ar, get_codec_info("encodec24k"), "normal") is ar
-    with pytest.raises(ConfigError, match="atoms mode"):
-        with_overlap_mode(ar, get_codec_info("encodec24k"), "strong")
+        _geom("music2latent_atoms.gin", **{"atoms.overlap_mode": '"soft"'})
+    with pytest.raises(ConfigError, match="derived"):
+        _geom("music2latent_atoms.gin", **{"atoms.hop_seconds": 0.2})
+    with pytest.raises(ConfigError, match="whole overlap"):
+        _geom("music2latent_atoms.gin", **{"atoms.crossfade_seconds": 0.01})
+    with pytest.raises(ConfigError, match="longer"):
+        _geom("music2latent_atoms.gin", **{"atoms.seconds": 0.05, "atoms.overlap_mode": '"brute"'})
+
+
+def test_law_by_codec_and_override():
+    m2l, enc = get_codec_info("music2latent"), get_codec_info("encodec48k")
+    assert crossfade_law_for(_geom("music2latent_atoms.gin"), m2l) == "equal_power"
+    assert crossfade_law_for(_geom("encodec48k_atoms.gin"), enc) == "hann"
+    assert crossfade_law_for(_geom("music2latent_atoms.gin", **{"atoms.crossfade_law": '"hann"'}), m2l) == "hann"
+    assert crossfade_law_for(_geom("encodec48k_atoms.gin", **{"atoms.crossfade_law": '"equal_power"'}), enc) == "equal_power"
+    with pytest.raises(ConfigError, match="invalid"):
+        _geom("music2latent_atoms.gin", **{"atoms.crossfade_law": '"linear"'})
+
+
+def test_geometry_round_trips_through_inference_gin(tmp_path):
+    g = _geom("music2latent_atoms.gin", **{"atoms.overlap_mode": '"brute"', "atoms.crossfade_law": '"hann"'})
+    path = tmp_path / "inference.gin"
+    path.write_text("\n".join(g.to_gin_lines()) + "\n")
+    back = geometry_from_inference_gin(parse_gin_config(path), get_codec_info("music2latent"))
+    assert (_fh(back), back.overlap_mode, back.crossfade_law) == (_fh(g), "brute", "hann")
+
+
+@pytest.mark.parametrize("mode", ["normal", "strong", "brute"])
+def test_equal_power_window(mode):
+    g = _geom("music2latent_atoms.gin", **{"atoms.seconds": 0.74, "atoms.overlap_mode": f'"{mode}"'})
+    w = ola_window(g, "equal_power")
+    assert w.shape[0] == g.unit_frames * g.hop_length
+    H = g.unit_hop_frames * g.hop_length
+    total = torch.zeros(w.shape[0] + 6 * H, dtype=torch.float64)
+    for k in range(7):
+        total[k * H:k * H + w.shape[0]] += w.double() ** 2
+    interior = total[w.shape[0]:6 * H]
+    assert float((interior - 1).abs().max()) <= 1e-5          # powers add up to 1
+    h = ola_window(g, "hann").double()
+    assert torch.allclose(w.double() ** 2, h, atol=1e-6)      # equal power is the square root of Hann
+
+
+def test_incoherent_audio_keeps_its_power_under_equal_power_but_dips_under_hann():
+    g = _geom("music2latent_atoms.gin", **{"atoms.seconds": 0.74, "atoms.overlap_mode": '"brute"'})
+    n = g.unit_frames * g.hop_length
+    torch.manual_seed(0)
+    atoms = [torch.randn(1, n) for _ in range(40)]
+    H = g.unit_hop_frames * g.hop_length
+
+    def power_at_joins(law):
+        y = ola_render(atoms, g, law)
+        # the middle of each overlap region (where both atoms have weight 0.5 under Hann)
+        mids = [k * H + n - g.crossfade_samples // 2 for k in range(1, 38)]
+        return torch.stack([y[0, m - 200:m + 200].pow(2).mean() for m in mids]).mean().item()
+
+    assert abs(power_at_joins("equal_power") - 1.0) < 0.15
+    assert power_at_joins("hann") < 0.65                       # about -3 dB at the middle of the join

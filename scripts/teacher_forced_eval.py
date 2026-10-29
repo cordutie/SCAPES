@@ -86,6 +86,7 @@ def generate_teacher_forced(engine, units, claps, nfe: int, cfg: float, seed: in
 # (overlap-add with the raw stored scales for atoms, the streaming decoder for AR).
 @torch.no_grad()
 def codec_roundtrip(engine, units) -> torch.Tensor:
+    from SCAPES.data.geometry import crossfade_law_for
     from SCAPES.inference.render import StreamRenderer, render_atoms
     g = engine.geom
     if g.mode == "autoregressive":
@@ -94,7 +95,8 @@ def codec_roundtrip(engine, units) -> torch.Tensor:
             renderer.push(engine._unstandardise(z[:, :g.latent_dim, :].to(engine.device)))
         return renderer.finish().cpu()
     units = [u.to(engine.device) for u in units]
-    return render_atoms(engine.codec, units, g, engine.mu, engine.std, base_seed=0, smooth=[False] * len(units)).cpu()
+    return render_atoms(engine.codec, units, g, engine.mu, engine.std, base_seed=0, smooth=[False] * len(units),
+                        law=crossfade_law_for(g, engine.info)).cpu()
 
 
 # ─── audio files ───

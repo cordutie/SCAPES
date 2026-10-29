@@ -11,7 +11,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 from SCAPES.data.config_loader import (parse_gin_config, _get_nested, _SIZE_TABLE, ConfigError, load_dataprep_config)
-from SCAPES.data.geometry import geometry_from_inference_gin, resolve_geometry, with_overlap_mode
+from SCAPES.data.geometry import crossfade_law_for, geometry_from_inference_gin, resolve_geometry
 from SCAPES.data.representations import frames_to_samples_48k
 from SCAPES.models.flow.FlowModel import FlowModel
 from SCAPES.models.factorization.LocalEncoder import LocalEncoder
@@ -348,7 +348,6 @@ class FlowInference:
         device: Optional[str] = None,
         verbose: bool = False,
         checkpoint: str = "best",
-        overlap_mode: str = "normal",
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -379,7 +378,6 @@ class FlowInference:
                 raise ConfigError(f"{gin_path}: model architecture is missing (model.size or the four model.* lines)")
             arch = dict(_SIZE_TABLE[size])
         self._setup(raw, info, geom, arch, device, verbose)
-        self.set_overlap_mode(overlap_mode)
 
         # ─── Load checkpoint weights ───
         flow_name, local_name = self._resolve_checkpoint_names(checkpoint, model_dir)
@@ -406,12 +404,6 @@ class FlowInference:
                 raise FileNotFoundError(f"{stats_path} is missing but training.standardize_latents is True")
             stats = torch.load(stats_path, map_location=self.device, weights_only=True)
             self.mu, self.std = stats["mu"].float(), stats["std"].float()
-
-    # Atoms: "normal" = the crossfade of the model's config, "strong" = 25 % of the atom, "brute" = 50 % (see geometry.py).
-    # Raises ConfigError if the geometry cannot hold that crossfade (it must not exceed the hop or the overlap).
-    def set_overlap_mode(self, mode: str) -> None:
-        with_overlap_mode(self.geom, self.info, mode)
-        self.overlap_mode = mode
 
     # Random-init engine with the template geometry of <codec>_<mode>.gin (S3 timing); weights are not loaded and the codec
     # is only loaded at the first decode. geometry: optional gin overrides, e.g. {"ar.block_seconds": 0.32};
@@ -803,7 +795,7 @@ class FlowInference:
             raise ValueError("Timeline is empty!")
         if method != "ola_smooth":
             raise ValueError(f"Method '{method}' removed/unsupported. Please use 'ola_smooth'.")
-        g = with_overlap_mode(self.geom, self.info, getattr(self, "overlap_mode", "normal"))
+        g = self.geom
         seed = getattr(self, "decode_seed", 0)
 
         units, generated = [], []
@@ -825,7 +817,8 @@ class FlowInference:
         else:
             if self.verbose:
                 print("\n--- Rendering Audio Timeline (Smooth Mode) ---")
-            audio = render_atoms(self.codec, units, g, self.mu, self.std, base_seed=seed, smooth=generated)
+            audio = render_atoms(self.codec, units, g, self.mu, self.std, base_seed=seed, smooth=generated,
+                                 law=crossfade_law_for(g, self.info))
         final_audio_tensor = audio.cpu()
 
         if output_path:

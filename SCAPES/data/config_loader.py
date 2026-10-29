@@ -34,6 +34,8 @@ class DataprepConfig:
     atoms_seconds: Optional[float] = None
     atoms_hop_seconds: Optional[float] = None
     atoms_crossfade_seconds: Optional[float] = None
+    atoms_overlap_mode: Optional[str] = None      # normal | strong | brute (stochastic decoders): derives the hop
+    atoms_crossfade_law: Optional[str] = None     # hann | equal_power (None = by codec)
     memory_buffer_atoms: Optional[int] = None
     # Autoregressive mode geometry, in seconds (one past window and the present block)
     ar_block_seconds: Optional[float] = None
@@ -59,6 +61,8 @@ _GIN_MAP = [
     (["atoms", "seconds"], "atoms_seconds"),
     (["atoms", "hop_seconds"], "atoms_hop_seconds"),
     (["atoms", "crossfade_seconds"], "atoms_crossfade_seconds"),
+    (["atoms", "overlap_mode"], "atoms_overlap_mode"),
+    (["atoms", "crossfade_law"], "atoms_crossfade_law"),
     (["ar", "block_seconds"], "ar_block_seconds"),
     (["ar", "memory_seconds"], "ar_memory_seconds"),
     (["ar", "stride_seconds"], "ar_stride_seconds"),
@@ -247,11 +251,13 @@ def _check_required(cfg, path):
     if cfg.generation_mode not in MODES:
         raise ConfigError(f"{path}: generation.mode = {cfg.generation_mode!r} is invalid, choose from {list(MODES)}")
     if cfg.generation_mode == "atoms":
-        missing = [k for k, v in [("atoms.seconds", cfg.atoms_seconds), ("atoms.hop_seconds", cfg.atoms_hop_seconds),
-                                  ("dataset.memory_buffer_atoms", cfg.memory_buffer_atoms)] if v is None]
+        required = [("atoms.seconds", cfg.atoms_seconds), ("dataset.memory_buffer_atoms", cfg.memory_buffer_atoms)]
+        if cfg.atoms_overlap_mode is None:      # with an overlap mode the hop is derived from it
+            required.append(("atoms.hop_seconds", cfg.atoms_hop_seconds))
+        missing = [k for k, v in required if v is None]
         if missing:
             raise ConfigError(f"{path}: atoms mode requires {missing}")
-        if cfg.atoms_crossfade_seconds is None:
+        if cfg.atoms_crossfade_seconds is None and cfg.atoms_overlap_mode is None:
             cfg.atoms_crossfade_seconds = 0.0
     else:
         missing = [k for k, v in [("ar.block_seconds", cfg.ar_block_seconds), ("ar.memory_seconds", cfg.ar_memory_seconds)]

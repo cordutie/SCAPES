@@ -68,28 +68,11 @@ Notes:
 - The weights are stored in `~/.cache/audio_codec_wrappers` (set `ACW_CACHE` to change it).
 - `msclap` asks for numpy < 2; this is why it is installed with `--no-deps`. Its embeddings are unchanged with numpy 2 (checked by `tests/test_env_scapes.py`).
 
-## Codecs and overlap-add modes
+## Codecs and overlap-add
 
 Supported codecs: `encodec24k`, `spectrostream` (causal, autoregressive mode), `encodec48k`, `codicodec`, `music2latent` (non-causal, atoms mode). Configuration templates are in `SCAPES/config/codecs/`.
 
-In atoms mode the generated atoms are decoded one by one and overlap-added. The decoders of CoDiCodec and Music2Latent are stochastic, so overlapping atoms are not continuous with each other and a short crossfade blends two different realisations. The inference option `overlap_mode` sets the crossfade:
-
-| mode | crossfade | use |
-|---|---|---|
-| `normal` | the model's `atoms.crossfade_seconds` (a few ms to tens of ms) | deterministic decoders (EnCodec 48k) |
-| `strong` | 25% of the atom | stochastic decoders |
-| `brute` | 50% of the atom (plain Hann overlap-add) | stochastic decoders; needs the hop to be exactly half the atom (CoDiCodec's 2-chunk atoms) |
-
-```bash
-python scripts/inference.py --model_dir <model> --overlap_mode strong generate ...
-```
-```python
-engine = FlowInference(model_dir, overlap_mode="brute")   # or engine.set_overlap_mode("strong")
-```
-
-A mode whose crossfade does not fit the geometry (the crossfade cannot exceed the hop or the overlap of consecutive atoms) raises an error that says so; for example `brute` does not fit the EnCodec 48k atoms (0.32 s atom, 0.1 s hop) or the Music2Latent atoms (0.74 s atom, 0.55 s hop).
-
-For stochastic decoders, regenerating past frames does not make the audio continuous (the same latents decode to different waveforms), so their configs use atoms that overlap the previous one only by the crossfade (`music2latent_atoms.gin`: 8-frame atoms, 6-frame hop). EnCodec 48k keeps the long overlap, which does enforce continuity with its deterministic decoder.
+In atoms mode the generated atoms are decoded one by one and overlap-added. EnCodec 48k has a deterministic decoder: it uses a long overlap and a Hann crossfade. CoDiCodec and Music2Latent have stochastic decoders, so their atoms overlap only as much as the crossfade needs: `atoms.overlap_mode` (`normal`, `strong` = 25 %, `brute` = 50 %) sets the overlap, the hop follows from it, and the crossfade is equal power. The geometry, the two crossfade laws and diagrams for every codec and mode are in [docs/overlap_add.md](docs/overlap_add.md).
 
 ## Pipeline
 
