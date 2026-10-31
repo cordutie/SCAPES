@@ -1,4 +1,5 @@
 """Entry points of the V2 pipeline: build_run_config, run_dataprep, build_trainer, run_training and run_generation."""
+import dataclasses
 import math
 import random
 from pathlib import Path
@@ -7,12 +8,13 @@ import numpy as np
 import torch
 
 # gin keys owned by the codec snippet: a dataset's own lines in these namespaces are dropped
-_GEOMETRY_PREFIXES = ("atoms.", "ar.", "codec.", "generation.", "dataset.memory_buffer_atoms")
+_GEOMETRY_KEYS = ("codec", "conditioning_rate", "conditioning_memory_seconds")
+_GEOMETRY_PREFIXES = ("atoms.", "ar.", "codec.", "generation.", "resolved.", "dataset.memory_buffer_atoms")  # noqa: rejected key kept so old lines are dropped
 
 
 def _is_geometry_line(line: str) -> bool:
     key = line.split("=", 1)[0].strip() if "=" in line else ""
-    return key.startswith(_GEOMETRY_PREFIXES)
+    return key in _GEOMETRY_KEYS or key.startswith(_GEOMETRY_PREFIXES)
 
 
 # Writes out_dir/{dataprep,training}.gin: the dataset's files without their geometry lines, then each snippet, then the
@@ -72,6 +74,7 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
     from torch.optim import AdamW
     from torch.utils.data import DataLoader
     from SCAPES.codecs import get_codec_info
+    from SCAPES.generation import CODECS, print_resolution
     from SCAPES.data.config_loader import load_dataprep_config, load_training_config
     from SCAPES.data.dataset import AtomSequenceDataset
     from SCAPES.data.geometry import resolve_geometry
@@ -84,9 +87,17 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
     dataprep_config = load_dataprep_config(config_dir / "dataprep.gin")
     training_config = load_training_config(config_dir / "training.gin")
     geom = resolve_geometry(dataprep_config, get_codec_info(dataprep_config.codec_name))
+    print_resolution(geom.resolution)
+
+    # standardize_latents and past_noise absent from training.gin: the codec's default from the table
+    spec = CODECS[geom.codec]
+    if training_config.standardize_latents is None:
+        training_config = dataclasses.replace(training_config, standardize_latents=spec.standardize_latents)
+    if training_config.past_noise is None:
+        training_config = dataclasses.replace(training_config, past_noise=spec.past_noise)
 
     # Features that only exist for encodec48k (D13) and what the AR window assumes (R2-C4)
-    if geom.codec != "encodec48k" and (training_config.spectral_representation or training_config.use_discriminator):
+    if geom.codec != "encodec48" and (training_config.spectral_representation or training_config.use_discriminator):
         raise NotImplementedError("spectral_representation and use_discriminator are only available for encodec48k (D13)")
     if geom.mode == "autoregressive" and training_config.local_encoder_temporal_compression != 1:
         raise NotImplementedError("autoregressive mode needs local_encoder.temporal_compression = 1 "
@@ -184,9 +195,7 @@ def units_for_seconds(geom, seconds: float) -> int:
     frames = seconds * geom.frame_rate
     if geom.mode == "autoregressive":
         return max(1, math.ceil(frames / geom.unit_frames - 1e-6))
-    if geom.atom_type != "frames":
-        return max(1, math.ceil((seconds * geom.sample_rate - geom.atom_samples) / geom.hop_samples - 1e-6) + 1)
-    return max(1, math.ceil((frames - geom.unit_frames) / geom.unit_hop_frames - 1e-6) + 1)
+    return max(1, math.ceil((seconds * geom.sample_rate - geom.atom_samples) / geom.hop_samples - 1e-6) + 1)
 
 
 # Generates audio from CLAP prompts with a trained model and writes a wav (codec rate). One prompt per unit: a single

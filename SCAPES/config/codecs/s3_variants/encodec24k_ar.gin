@@ -1,8 +1,0 @@
-# S3 variant: encodec24k AR with a 0.32 s block
-codec.name = "encodec24k"
-generation.mode = "autoregressive"
-ar.block_seconds = 0.32
-ar.memory_seconds = 1.6
-# training
-training.standardize_latents = True
-training.past_noise = 0.1

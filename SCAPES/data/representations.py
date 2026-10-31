@@ -26,7 +26,7 @@ def frames_to_samples_48k(frames, geom):
     return out.astype(np.int64)
 
 
-# Ticks (a codec frame for legacy atoms, the hop for the sample-level types) -> samples at 48 kHz, rounded half-to-even.
+# Ticks (a codec frame in autoregressive mode, the hop in atoms mode) -> samples at 48 kHz, rounded half-to-even.
 def ticks_to_samples_48k(ticks, geom):
     out = np.rint(np.asarray(ticks, dtype=np.float64) * geom.tick_samples * 48000.0 / geom.sample_rate)
     return out.astype(np.int64)

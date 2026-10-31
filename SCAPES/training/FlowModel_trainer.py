@@ -107,7 +107,7 @@ class FlowTrainer:
 
         self.spectral_mode = config.spectral_representation
         if self.spectral_mode:
-            if geom.codec != "encodec48k":
+            if geom.codec != "encodec48":
                 raise NotImplementedError("spectral_representation is only available for encodec48k (D13)")
             self.spectral_frames = self.unit_frames // 2 + 1
             self.frame_dim = 385  # 128*3 + 1
@@ -116,7 +116,7 @@ class FlowTrainer:
             self.spectral_frames = self.unit_frames
             self.frame_dim = geom.frame_dim
             model_frames = self.unit_frames + self.prefix_frames
-        if config.use_discriminator and geom.codec != "encodec48k":
+        if config.use_discriminator and geom.codec != "encodec48":
             raise NotImplementedError("use_discriminator is only available for encodec48k (D13)")
 
         # Build config dicts for JSON serialization
@@ -336,17 +336,6 @@ class FlowTrainer:
         ]
         lines += g.to_gin_lines()
         f = g.frame_rate
-        if g.mode == "atoms" and g.atom_type != "frames":
-            r = g.sample_rate
-            lines += [f"# atoms.type = {g.atom_type}", f"# atoms.seconds = {g.atom_samples / r:.6g}",
-                      f"# atoms.hop_seconds = {g.hop_samples / r:.6g}",
-                      f"# atoms.crossfade_seconds = {g.crossfade_samples / r:.6g}"]
-        elif g.mode == "atoms":
-            lines += [f"# atoms.seconds = {g.unit_frames / f:.6g}", f"# atoms.hop_seconds = {g.unit_hop_frames / f:.6g}",
-                      f"# atoms.crossfade_seconds = {g.crossfade_samples / g.sample_rate:.6g}"]
-        else:
-            lines += [f"# ar.block_seconds = {g.unit_frames / f:.6g}", f"# ar.memory_seconds = {g.memory_frames / f:.6g}",
-                      f"# ar.stride_seconds = {g.stride_frames / f:.6g}", f"# ar.prefix_seconds = {g.prefix_frames / f:.6g}"]
         lines += [
             f"dataset.semantic_random_extension = {self.model_config['semantic_random_extension']}",
             f"training.standardize_latents = {self.standardize}",
@@ -756,7 +745,6 @@ class FlowTrainer:
             return
         import soundfile as sf
         from SCAPES.codecs import get_codec, get_codec_info
-        from SCAPES.data.geometry import window_for
         from SCAPES.inference.render import StreamRenderer, render_atoms
 
         self.model.eval()
@@ -818,7 +806,7 @@ class FlowTrainer:
                     renderer.push(z)
                 audio = renderer.finish()
             else:
-                audio = render_atoms(codec, atoms, g, self.mu, self.std, window=window_for(g, get_codec_info(g.codec)))
+                audio = render_atoms(codec, atoms, g, self.mu, self.std)
 
             file_stem = Path(target_file).stem
             sf.write(self.val_dir / f"epoch_{epoch}_{file_stem}_TF.wav", audio.cpu().T.numpy(), g.sample_rate)

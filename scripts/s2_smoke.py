@@ -2,11 +2,11 @@
 
 For each codec: write the run config with pipeline.build_run_config, record the git state of both repos, run dataprep,
 training and generation in three fresh subprocesses, record the git state again, and write <out>/<codec>/s2_result.json.
-After the codecs, an optional 20-step check with training.spectral_representation=True on encodec48k (D13).
+After the codecs, an optional 20-step check with training.spectral_representation=True on encodec48 (D13).
 
 Usage (from SCAPES/):
     ../venv_SCAPES/bin/python scripts/s2_smoke.py --dataset ../datasets/micro_microtex --out ../runs/s2 \
-        --codecs encodec48k codicodec encodec24k spectrostream
+        --codecs encodec48 encodec24 spectrostream music2latent
 """
 import argparse
 import json
@@ -19,13 +19,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 import audio_codec_wrappers
 WRAPPERS = Path(audio_codec_wrappers.__file__).resolve().parents[1]
-SNIPPETS = {
-    "encodec48k": "encodec48k_atoms.gin",
-    "codicodec": "codicodec_atoms.gin",
-    "music2latent": "music2latent_consistent.gin",
-    "encodec24k": "encodec24k_ar.gin",
-    "spectrostream": "spectrostream_ar.gin",
-}
+CODECS = ("encodec24", "spectrostream", "encodec48", "music2latent")      # canonical names, each at its defaults
 STAGES = ("dataprep", "training", "generation")
 STEP0_BAND = (1.8, 2.2)
 GEN_SECONDS = 10.0
@@ -53,29 +47,69 @@ def peak_memory_bytes():
     return int(torch.cuda.max_memory_allocated()) if torch.cuda.is_available() else 0
 
 
+def resolution_dict(res):
+    import dataclasses
+    d = dataclasses.asdict(res)
+    d["notes"] = list(d["notes"])
+    return d
+
+
+# Items of the dataset have the resolved shapes: target [d, unit_frames], memory [M, d, memory_frames]
+def item_shapes_ok(dataset, config):
+    from SCAPES.data.dataset import AtomSequenceDataset
+    ds = AtomSequenceDataset(dataset, config, requested_keys=["memory_buffer_latent", "target_latent", "index"], device="cpu")
+    g = ds.geom
+    item = ds[0]
+    return (tuple(item["target_latent"].shape) == (g.latent_dim, g.unit_frames)
+            and tuple(item["memory_buffer_latent"].shape) == (g.memory_units, g.latent_dim, g.memory_frames))
+
+
 def worker_dataprep(args):
+    from SCAPES.codecs import get_codec_info
+    from SCAPES.data.config_loader import load_dataprep_config
+    from SCAPES.data.geometry import resolve_geometry
     from SCAPES.pipeline import run_dataprep
     store = run_dataprep(args.dataset, config_dir=args.config_dir)
-    return {"rep_key": store.key, "rep_dir": str(store.root)}
+    config = load_dataprep_config(Path(args.config_dir) / "dataprep.gin")
+    res = resolve_geometry(config, get_codec_info(config.codec_name)).resolution
+    return {"rep_key": store.key, "rep_dir": str(store.root), "resolution": resolution_dict(res),
+            "item_shapes_ok": bool(item_shapes_ok(args.dataset, config))}
 
 
 def worker_training(args):
+    from SCAPES.codecs import get_codec_info
+    from SCAPES.data.config_loader import parse_gin_config
+    from SCAPES.data.geometry import geometry_from_inference_gin
     from SCAPES.pipeline import run_training
-    run_training(args.dataset, args.model_dir, config_dir=args.config_dir)
-    return {}
+    model_dir = run_training(args.dataset, args.model_dir, config_dir=args.config_dir)
+    raw = parse_gin_config(Path(args.model_dir) / "checkpoints" / "inference.gin")
+    geom = geometry_from_inference_gin(raw, get_codec_info(raw["codec"]))
+    return {"resolution": resolution_dict(geom.resolution)}
 
 
 # Prompt of each file: the CLAP array of the first sample of its val region (the first 1 s of that region); never reserve
 def worker_generation(args):
+    import soundfile as sf
     import torch
     from SCAPES.data.config_loader import load_dataprep_config
     from SCAPES.data.dataset import AtomSequenceDataset
-    from SCAPES.pipeline import run_generation
+    from SCAPES.inference.FlowInference import FlowInference
+    from SCAPES.pipeline import run_generation, units_for_seconds
 
     config = load_dataprep_config(Path(args.config_dir) / "dataprep.gin")
     dataset = AtomSequenceDataset(args.dataset, config, requested_keys=["target_semantic", "index"], device="cpu")
+    # the geometry is read silently: the startup line is printed once per stage, by the generation call below
+    import contextlib, io
+    with contextlib.redirect_stdout(io.StringIO()):
+        geom = FlowInference(args.model_dir, checkpoint="last").geom
+    units = units_for_seconds(geom, GEN_SECONDS)
+    if geom.mode == "atoms":
+        expected = (units - 1) * geom.hop_samples + geom.atom_samples
+    else:
+        expected = units * geom.unit_frames * geom.hop_length
     outputs = []
     seen = set()
+    length_ok = True
     for idx, (fname, start) in enumerate(dataset.all_indices):
         if dataset._regions[idx] != "val" or fname in seen:
             continue
@@ -84,8 +118,11 @@ def worker_generation(args):
         prompt = dataset[idx]["target_semantic"]
         stem = Path(fname).stem
         wav = run_generation(args.model_dir, Path(args.gen_dir) / stem, [prompt], seconds=GEN_SECONDS, seed=0)
+        length_ok = length_ok and sf.info(str(wav)).frames == expected
         outputs.append({"file": fname, "prompt_start_frame": int(start), "wav": str(wav)})
-    return {"prompts": outputs}
+        break      # one generation per codec keeps the startup line to one in the stage log
+    return {"prompts": outputs, "generation_length_ok": length_ok, "expected_samples": int(expected),
+            "resolution": resolution_dict(geom.resolution)}
 
 
 WORKERS = {"dataprep": worker_dataprep, "training": worker_training, "generation": worker_generation}
@@ -128,7 +165,10 @@ def build_config(args, codec_dir, extra_overrides, max_steps):
         "splits.val_split_ratio = 0.1",
         "splits.reserve_ratio = 0.1",
     ] + extra_overrides
-    snippet = REPO / "SCAPES" / "config" / "codecs" / SNIPPETS[args.codec_now]
+    # the dataset's config (dataprep.gin and training.gin of the repo templates) plus the codec line: its defaults
+    codec_dir.mkdir(parents=True, exist_ok=True)
+    snippet = codec_dir / "codec.gin"
+    snippet.write_text(f'codec = "{args.codec_now}"\n')
     return build_run_config(Path(args.dataset) / "config", [snippet], overrides, codec_dir / "config")
 
 
@@ -140,7 +180,7 @@ def check_artefacts(codec_dir, dataset):
     checks["best_flow_model"] = (ckpt / "best_flow_model.pt").exists()
     gin = ckpt / "inference.gin"
     text = gin.read_text() if gin.exists() else ""
-    checks["inference_gin"] = "codec.name" in text and "generation.mode" in text
+    checks["inference_gin"] = "codec = " in text and "resolved.mode" in text
     # wav of 10 s +- one unit (unit duration from the checkpoint geometry is not read here: 0.5 s tolerance bound)
     wavs = sorted((codec_dir / "gen").glob("*/generation.wav"))
     durations = []
@@ -175,6 +215,18 @@ def run_codec(args, codec, max_steps, out_dir, extra_overrides=(), stages=STAGES
                                           and not any(before[n]["status"] for n in before))
     result["artefacts"] = check_artefacts(codec_dir, args.dataset) if not failed else {}
     result["stages_ok"] = sum(1 for s in result["stages"].values() if s.get("ok"))
+    result["peak_gpu_bytes"] = {k: v.get("peak_gpu_bytes", 0) for k, v in result["stages"].items()}
+    res = {k: v.get("resolution") for k, v in result["stages"].items()}
+    result["resolution"] = res.get("dataprep")
+    result["resolutions_equal"] = bool(res.get("dataprep")) and res.get("dataprep") == res.get("training") == res.get("generation")
+    result["item_shapes_ok"] = bool(result["stages"].get("dataprep", {}).get("item_shapes_ok"))
+    result["generation_length_ok"] = bool(result["stages"].get("generation", {}).get("generation_length_ok"))
+    # one startup line "[SCAPES] <codec> (" per stage log
+    text = log_path.read_text()
+    result["startup_lines"] = {}
+    for stage in stages:
+        part = text.split(f"===== stage {stage} =====")[-1].split("===== stage ")[0] if f"===== stage {stage} =====" in text else ""
+        result["startup_lines"][stage] = part.count(f"[SCAPES] {codec} (")
 
     # step-0 loss and finiteness from the training history
     hist_path = codec_dir / "model" / "logs" / "history_steps.json"
@@ -195,7 +247,7 @@ def run_codec(args, codec, max_steps, out_dir, extra_overrides=(), stages=STAGES
 # Loss against step, one colour per codec with the step-0 band; per-file val loss (2 files = 2 colours) per codec
 def make_figures(out_dir, codecs):
     from matplotlib.figure import Figure
-    colours = {"encodec48k": "tab:blue", "codicodec": "tab:orange", "encodec24k": "tab:green", "spectrostream": "tab:red", "music2latent": "tab:purple"}
+    colours = {"encodec48": "tab:blue", "encodec24": "tab:green", "spectrostream": "tab:red", "music2latent": "tab:purple"}
     fig = Figure(figsize=(8, 4.5))
     ax = fig.subplots()
     ax.axhspan(*STEP0_BAND, color="gray", alpha=0.25, label="step-0 band [1.8, 2.2]")
@@ -236,7 +288,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset")
     ap.add_argument("--out")
-    ap.add_argument("--codecs", nargs="+", default=list(SNIPPETS))
+    ap.add_argument("--codecs", nargs="+", default=list(CODECS))
     ap.add_argument("--max-steps", type=int, default=300)
     ap.add_argument("--no-spectral-check", action="store_true")
     # worker options (internal)
@@ -260,8 +312,8 @@ def main():
 
     # D13 check: spectral_representation on encodec48k, 20 steps, training only (the representation is the same)
     spectral = None
-    if "encodec48k" in args.codecs and not args.no_spectral_check:
-        spectral = run_codec(args, "encodec48k", 20, out / "spectral_check",
+    if "encodec48" in args.codecs and not args.no_spectral_check:
+        spectral = run_codec(args, "encodec48", 20, out / "spectral_check",
                              extra_overrides=["training.spectral_representation = True"], stages=("training",))
     make_figures(out, args.codecs)
     summary = {c: {"stages_ok": r["stages_ok"], "git_unchanged_and_clean": r["git_unchanged_and_clean"],

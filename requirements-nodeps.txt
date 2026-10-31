@@ -1,6 +1,6 @@
 # Install with: pip install --no-deps -r requirements-nodeps.txt   (after pip install -r requirements.txt)
 # msclap declares numpy<2 and transformers<5, which this environment violates on purpose
-# (see requirements.txt). The magenta-rt and codicodec git dependencies are also --no-deps
+# (see requirements.txt). The magenta-rt git dependency is also --no-deps
 # (same pins as audio_codec_wrappers/requirements-git.txt).
 msclap==1.3.4
 
@@ -9,9 +9,8 @@ msclap==1.3.4
 # commit; to use newer wrappers, update the submodule and commit it.
 -e ./external/audio_codec_wrappers
 
-# SpectroStream (pip checks out the sequence-layers submodule) and CoDiCodec.
+# SpectroStream (pip checks out the sequence-layers submodule).
 magenta-rt @ git+https://github.com/magenta/magenta-realtime@694a545e4ba0b88bf1150137b129582166d3e07f
-codicodec @ git+https://github.com/SonyCSLParis/codicodec@1239148096a5b6725eeabb62eb950d064a951c64
 
 # Music2Latent (Sony CSL), used by the music2latent wrapper. Weights come from the Hugging Face hub on first use.
 music2latent==0.1.8

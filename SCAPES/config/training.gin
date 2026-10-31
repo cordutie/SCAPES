@@ -14,7 +14,7 @@ local_encoder.time_entanglement = True
 local_encoder.temporal_compression = 1
 
 # Training hyperparameters
-# The codec snippet sets training.standardize_latents and training.past_noise.
+# training.standardize_latents and training.past_noise are set per codec by the code (no codec snippet).
 # training.max_steps = 2000    # step budget; without it the run uses epochs (with V1 patience)
 # training.log_every = 50
 # training.seed = 0

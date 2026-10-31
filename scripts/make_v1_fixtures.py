@@ -20,8 +20,7 @@ sys.path.insert(0, str(REPO))
 OUT = REPO / "fixtures" / "v1"
 PROJECT = REPO.parent
 WATER = PROJECT / "datasets" / "micro_water" / "raw" / "water_fast.wav"
-MODEL_DIR = PROJECT / "models" / "micro_water"
-NAMES = ["clap_ref.pt", "encodec48_ref.pt", "v1_gen_ref.pt"]
+NAMES = ["clap_ref.pt", "encodec48_ref.pt"]
 
 
 def sha256(path):
@@ -51,18 +50,6 @@ def make_encodec():
     latent = torch.cat(latents, dim=-1).detach().float().cpu()
     scale = meta["audio_scales"][0].detach().float().cpu()
     torch.save({"audio": audio, "latent": latent, "scale": scale}, OUT / "encodec48_ref.pt")
-
-
-def make_generation():
-    from SCAPES.inference.FlowInference import FlowInference
-    engine = FlowInference(model_dir=str(MODEL_DIR), device="cuda", checkpoint="best")
-    g = torch.Generator().manual_seed(1)
-    clap = [F.normalize(torch.randn(1024, generator=g), dim=0) for _ in range(6)]
-    torch.manual_seed(0)
-    audio = engine.generate_soundscape(clap, nfe=16, cfg_scale=3.0)
-    atoms = torch.stack([s["atom_generated"].detach().float().cpu() for s in engine.timeline])
-    torch.save({"clap": torch.stack(clap), "atoms": atoms, "audio": audio.detach().float().cpu()},
-               OUT / "v1_gen_ref.pt")
 
 
 def git_out(*args):
@@ -138,7 +125,6 @@ def check():
     shapes = {
         "clap_ref.pt": {"audio": (1, 2, 48000), "embedding": None},
         "encodec48_ref.pt": {"audio": (1, 2, 15360), "latent": (1, 128, 48), "scale": (1, 1)},
-        "v1_gen_ref.pt": {"clap": (6, 1024), "atoms": (6, 1, 129, 48), "audio": (2, 39360)},
     }
     for name, spec in shapes.items():
         d = load(name)
@@ -166,6 +152,5 @@ if __name__ == "__main__":
     OUT.mkdir(parents=True, exist_ok=True)
     make_clap()
     make_encodec()
-    make_generation()
     write_meta()
     print("written", OUT)

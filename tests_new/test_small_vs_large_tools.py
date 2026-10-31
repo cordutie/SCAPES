@@ -32,7 +32,7 @@ def test_val_split_report(tmp_path):
 def test_eval_small_all_dry_and_guard(tmp_path):
     cmd = [sys.executable, str(REPO / "scripts" / "eval_small_all.py"), "--small-runs", str(tmp_path)]
     out = subprocess.run(cmd + ["--dry"], capture_output=True, text=True)
-    assert out.returncode == 0 and out.stdout.count("[a]") == 11 and "[e]" in out.stdout and "--prompt-region val" in out.stdout
+    assert out.returncode == 0 and out.stdout.count("[a]") == 9 and "[e]" in out.stdout and "--prompt-region val" in out.stdout
     assert "reserve" not in out.stdout
     guard = subprocess.run(cmd + ["--only", "d"], capture_output=True, text=True)
     assert guard.returncode != 0 and "chain has not finished" in (guard.stderr + guard.stdout)

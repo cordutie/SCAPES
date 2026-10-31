@@ -1,4 +1,4 @@
-"""rtf_bench.Decoder (the real-time decode path) equals the offline render for consistent / independent atoms (S7 tool).
+"""rtf_bench.Decoder (the real-time decode path) equals the offline render for the atoms of the V3 geometry (S7 tool).
 Toy codec on the GPU. Run from SCAPES/: ../venv_SCAPES/bin/python -m pytest scripts/tests_eval -q
 """
 import sys
@@ -12,7 +12,7 @@ sys.path.insert(0, str(HERE.parents[1]))
 sys.path.insert(0, str(HERE.parents[2]))
 sys.path.insert(0, str(HERE.parents[2] / "tests_new"))
 import rtf_bench
-from _atoms_toy import TOY_GEOM, phase2, toy_geometry
+from _atoms_toy import TOY_GEOM, toy_geometry
 
 
 class _Engine:
@@ -25,12 +25,12 @@ class _Engine:
         return z
 
 
-@pytest.mark.parametrize("kind", ["consistent", pytest.param("independent", marks=phase2)])
+@pytest.mark.parametrize("kind", ["consistent"])
 def test_decoder_stream_equals_ola_render(tmp_path, kind):
     from audio_codec_wrappers import load_codec
     from SCAPES.codecs import get_codec_info
     from SCAPES.inference.render import render_atoms
-    g = toy_geometry(tmp_path, kind, window="equal_power")
+    g = toy_geometry(tmp_path, kind)
     C, H, _ = TOY_GEOM[kind]
     codec = load_codec("toy_noncausal", device="cuda")
     engine = _Engine(g, codec, get_codec_info("toy_noncausal"))
@@ -43,7 +43,7 @@ def test_decoder_stream_equals_ola_render(tmp_path, kind):
         atoms.append(torch.cat([z, scale], dim=1).cuda())
     dec = rtf_bench.Decoder(engine, 1)
     streamed = torch.cat([dec.push(a) for a in atoms], dim=-1).cpu()
-    offline = render_atoms(codec, atoms, g, base_seed=0, smooth=[False] * K, window="equal_power").cpu()
+    offline = render_atoms(codec, atoms, g, base_seed=0, smooth=[False] * K).cpu()
     assert streamed.shape[-1] == K * H
     assert float((streamed - offline[..., :K * H]).abs().max()) <= 1e-6
     assert dec.new_seconds == H / 8000

@@ -7,13 +7,16 @@ from conftest import load_toy_dataset, make_toy_dataset, stub_clap
 
 
 def _span_s(ds, idx):
-    """[past start, max(target end, CLAP window end)] in seconds, from the geometry."""
+    """[past start, max(target end, CLAP window end)] in seconds, from the geometry (the index is a tick)."""
     g = ds.geom
     _, t = ds.all_indices[idx]
-    start = t - g.past_frames  # AR: one window of W frames; atoms: M past atoms spaced by H
-    assert g.past_frames == (g.memory_frames if g.mode == "autoregressive" else g.memory_units * g.unit_hop_frames)
-    end = max((t + g.unit_frames) / g.frame_rate, t / g.frame_rate + g.context_seconds)
-    return start / g.frame_rate, end
+    tick = g.tick_samples / g.sample_rate
+    start = (t - g.past_ticks) * tick
+    if g.atom_type == "frames":  # AR: target of B frames after the past window
+        target_end = t * tick + g.unit_frames / g.frame_rate
+    else:  # atoms: atom t covers [t * H, t * H + C)
+        target_end = (t * g.hop_samples + g.atom_samples) / g.sample_rate
+    return start, max(target_end, t * tick + g.context_seconds)
 
 
 def test_region_bounds_and_assign():

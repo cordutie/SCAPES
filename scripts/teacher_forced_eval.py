@@ -8,7 +8,7 @@ the codec's stateful streaming decoder.
 
 Usage (from SCAPES/):
     ../venv_SCAPES/bin/python scripts/teacher_forced_eval.py --model-dir ../runs/microtex_encodec48k/model \
-        --dataset ../datasets/microtex --name microtex_encodec48k_atoms --out ../runs/eval_tf --codec-roundtrip on
+        --dataset ../datasets/microtex --name <run-name> --out ../runs/eval_tf --codec-roundtrip on
     ../venv_SCAPES/bin/python scripts/teacher_forced_eval.py --out ../runs/eval_tf --summarize-only
 
 Outputs (see README.md written to --out): <out>/original_10s/*.wav, <out>/<name>/{generated,codec_roundtrip}/*.wav,
@@ -85,7 +85,7 @@ def real_units(geom, latents: dict, clap: torch.Tensor, starts: list, standardis
             z = latents["latent"][:, t:t + geom.unit_frames].float().unsqueeze(0)
             z = standardise(z)
         elif geom.encoding == "whole":
-            # atoms of a codec stored as one whole latent [d, T] (e.g. CoDiCodec): the atom is the slice [t, t + F)
+            # atoms of a codec stored as one whole latent [d, T] (codecs with a whole-file latent): the atom is the slice [t, t + F)
             z = standardise(latents["latent"][:, t:t + geom.unit_frames].float().unsqueeze(0))
         else:
             z = standardise(latents["latent"][k].float().unsqueeze(0))
@@ -111,7 +111,6 @@ def generate_teacher_forced(engine, units, claps, nfe: int, cfg: float, seed: in
 # (overlap-add with the raw stored scales for atoms, the streaming decoder for AR).
 @torch.no_grad()
 def codec_roundtrip(engine, units) -> torch.Tensor:
-    from SCAPES.data.geometry import window_for
     from SCAPES.inference.render import StreamRenderer, render_atoms
     g = engine.geom
     if g.mode == "autoregressive":
@@ -120,8 +119,7 @@ def codec_roundtrip(engine, units) -> torch.Tensor:
             renderer.push(engine._unstandardise(z[:, :g.latent_dim, :].to(engine.device)))
         return renderer.finish().cpu()
     units = [u.to(engine.device) for u in units]
-    return render_atoms(engine.codec, units, g, engine.mu, engine.std, base_seed=0, smooth=[False] * len(units),
-                        window=window_for(g, engine.info)).cpu()
+    return render_atoms(engine.codec, units, g, engine.mu, engine.std, base_seed=0, smooth=[False] * len(units)).cpu()
 
 
 # ─── audio files ───
@@ -325,8 +323,8 @@ def run_model(args):
                      "memory_units": geom.memory_units, "frame_rate": geom.frame_rate,
                      "codec_sample_rate": sr_codec, "units_per_file": len(starts), "atom_type": geom.atom_type,
                      "atom_samples": geom.atom_samples, "hop_samples": geom.hop_samples,
-                     "crossfade_samples": geom.crossfade_samples, "window": geom.window,
-                     "memory_seconds": geom.memory_seconds, "start_seconds": args.start_seconds,
+                     "crossfade_samples": geom.crossfade_samples, "window": "equal_power",
+                     "buffer_span_seconds": geom.buffer_span_seconds, "start_seconds": args.start_seconds,
                      "floor_start_seconds": floor_start},
         "duration_check": duration_checks,
         "generation": {"seed": args.seed, "nfe": args.nfe, "cfg": args.cfg, "files": stems,

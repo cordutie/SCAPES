@@ -7,6 +7,7 @@ import torch
 from SCAPES.codecs import get_codec, get_codec_info
 from SCAPES.data.config_loader import DataprepConfig
 from SCAPES.data.geometry import atom_count, resolve_geometry
+from SCAPES.generation import print_resolution
 from SCAPES.data.representations import RepresentationStore
 from audio_codec_wrappers.audio import load_audio
 
@@ -72,8 +73,11 @@ def _encode_atoms(codec, x, geom, context_seconds):
 
 # Sample-level atoms: segment k is x[0, :, kH:kH+C], encoded on its own (so the codec normalises each segment itself).
 # Segments go to the codec in batches. Returns (latent [K, d, F] float32, scale [K] float32) on the cpu.
-def _encode_segments(codec, x, geom, batch: int = 64):
+# batch None: segments per encode call from a sample budget, max(1, 2**22 // C) (design D9).
+def _encode_segments(codec, x, geom, batch=None):
     r, C, H = geom.sample_rate, geom.atom_samples, geom.hop_samples
+    if batch is None:
+        batch = max(1, 2 ** 22 // C)
     K = atom_count(x.shape[-1], C, H)
     latents, scales = [], []
     for b0 in range(0, K, batch):
@@ -100,14 +104,7 @@ def latents_maker(dataset_path, config: DataprepConfig, device="auto", codec=Non
     store = RepresentationStore(dataset_path, geom, info)
     store.ensure()
     print(f"Representation {store.key} at {store.root}")
-    if geom.atom_type != "frames":
-        print(f"  atoms ({geom.atom_type}): unit {geom.unit_frames} frames ({geom.atom_samples / geom.sample_rate:.4f} s), "
-              f"hop {geom.hop_samples} samples ({geom.hop_samples / geom.sample_rate:.4f} s), "
-              f"memory {geom.memory_units} x {geom.memory_frames} frames, stride {geom.stride_ticks} hops")
-    else:
-        print(f"  {geom.mode}: unit {geom.unit_frames} frames ({geom.unit_frames / geom.frame_rate:.4f} s), "
-              f"hop {geom.unit_hop_frames} ({geom.unit_hop_frames / geom.frame_rate:.4f} s), "
-              f"memory {geom.memory_units} x {geom.memory_frames} frames, stride {geom.stride_frames}")
+    print_resolution(geom.resolution)
 
     files = list_audio_files(dataset_path)
     index = store.read_index()

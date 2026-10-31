@@ -22,7 +22,7 @@ REPO = Path(__file__).resolve().parents[1]
 RUNS = REPO.parent / "runs"
 PY = sys.executable
 CODECS = {"encodec24k": "microtex_encodec24k_ar", "spectrostream": "microtex_spectrostream_ar",
-          "encodec48k": "microtex_encodec48k_atoms", "codicodec": "microtex_codicodec_atoms"}
+          "encodec48k": "microtex_encodec48k_atoms"}
 
 
 def commands(a):

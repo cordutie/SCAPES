@@ -1,16 +1,16 @@
 """Turning generated units into audio: overlap-add for atoms, the stateful streaming decoder for AR (design: Inference)."""
 import torch
 
-from SCAPES.data.geometry import Geometry, ola_window
+from SCAPES.data.geometry import Geometry, crossfade_window
 
 
 # Overlap-add of K unit audios [ch, C] placed H samples apart, each multiplied by the atom window.
-# Returns [C, (K-1) * H + C] with C = geom.atom_samples, H = geom.hop_samples.
-def ola_render(unit_audios: list, geom: Geometry, window: str = "hann") -> torch.Tensor:
+# Returns [ch, (K-1) * H + C] with C = geom.atom_samples, H = geom.hop_samples.
+def ola_render(unit_audios: list, geom: Geometry) -> torch.Tensor:
     C, step = geom.atom_samples, geom.hop_samples
     K = len(unit_audios)
     first = unit_audios[0]
-    window = ola_window(geom, window).to(device=first.device, dtype=first.dtype)
+    window = crossfade_window(geom).to(device=first.device, dtype=first.dtype)
     out = torch.zeros(first.shape[0], (K - 1) * step + C, device=first.device, dtype=first.dtype)
     for k, audio in enumerate(unit_audios):
         start = k * step
@@ -25,12 +25,11 @@ _ALPHA_SMOOTH, _MAX_JUMP, _MAX_DROP = 0.6, 1.15, 0.85
 
 # Decodes atoms [1, frame_dim, F] (model units) one by one and overlap-adds them.
 # mu, std: latent statistics to undo the standardisation (None = raw latents). smooth[k] False = the atom is given
-# (teacher forcing): its raw scale is used and the smoothing state is left alone. CoDiCodec-style stochastic decoders get
-# the seed base_seed + k. window: "hann" | "equal_power" (see ola_window).
+# (teacher forcing): its raw scale is used and the smoothing state is left alone. Stochastic decoders get
+# the seed base_seed + k.
 # Returns [ch, N] on the device of the codec.
 @torch.no_grad()
-def render_atoms(codec, atoms: list, geom: Geometry, mu=None, std=None, base_seed: int = 0, smooth=None,
-                 window: str = "hann") -> torch.Tensor:
+def render_atoms(codec, atoms: list, geom: Geometry, mu=None, std=None, base_seed: int = 0, smooth=None) -> torch.Tensor:
     d = geom.latent_dim
     prev_scale = None
     audios = []
@@ -52,7 +51,7 @@ def render_atoms(codec, atoms: list, geom: Geometry, mu=None, std=None, base_see
                 sm = raw
             scale = sm.reshape(-1).float()
         audios.append(codec.decode(z, scale, base_seed + k)[0])
-    return ola_render(audios, geom, window)
+    return ola_render(audios, geom)
 
 
 # Streaming decode of AR blocks: the codec's stateful decoder keeps its convolution and LSTM state between blocks.

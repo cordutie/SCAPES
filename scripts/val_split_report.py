@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 CLEAN = ["forest.wav", "park.wav", "rain.wav", "tokio.wav"]
-CODECS = ["encodec24k", "spectrostream", "encodec48k", "codicodec"]
+CODECS = ["encodec24k", "spectrostream", "encodec48k"]
 
 
 def load(p):

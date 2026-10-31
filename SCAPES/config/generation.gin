@@ -1,0 +1,3 @@
+codec = "music2latent"          # encodec24 | spectrostream (autoregressive); encodec48 | music2latent (atoms)
+conditioning_rate = 10.0        # Hz. Rounded to the nearest available rate: docs/generation_modes.html (one table per codec)
+# conditioning_memory_seconds = 0.5   # s. Default 0.5 (atoms) or 1.0 (autoregressive)

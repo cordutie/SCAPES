@@ -1,7 +1,7 @@
 """
 SCAPES Dataprep Pipeline
 
-Encodes the raw audio with the codec of dataprep.gin (codec.name, generation.mode), precomputes semantic (CLAP) and
+Encodes the raw audio with the codec of dataprep.gin (the codec of generation.gin and its mode), precomputes semantic (CLAP) and
 structure (audio features) annotations. Thin wrapper over SCAPES.pipeline.run_dataprep.
 
 Examples:

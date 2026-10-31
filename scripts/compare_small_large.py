@@ -14,9 +14,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import val_split_report as vsr
 
-CODECS = ["encodec24k", "spectrostream", "encodec48k", "codicodec"]
+CODECS = ["encodec24k", "spectrostream", "encodec48k"]
 TF_NAME = {"encodec24k": "microtex_encodec24k_ar", "spectrostream": "microtex_spectrostream_ar",
-           "encodec48k": "microtex_encodec48k_atoms", "codicodec": "microtex_codicodec_atoms"}
+           "encodec48k": "microtex_encodec48k_atoms"}
 
 CAVEATS = [
     "lr 1e-4 and batch 128 were tuned for neither size: the comparison is of two untuned configurations, not of the best small against the best large.",

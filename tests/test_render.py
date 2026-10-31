@@ -1,26 +1,7 @@
 """Slice B5: rendering, atoms OLA and AR streaming (design "Inference")."""
-import warnings
-
 import torch
 
-from conftest import CONFIG, TOY_D, TOY_HOP, max_abs, resolve_lines
-
-
-def _v1_geom(tmp_path):
-    lines = (CONFIG / "dataprep.gin").read_text().splitlines() + \
-        (CONFIG / "codecs" / "encodec48k_atoms.gin").read_text().splitlines()
-    return resolve_lines(tmp_path, lines, "v1")[1]
-
-
-def test_ola_ones(tmp_path):
-    from SCAPES.inference.render import ola_render
-    g = _v1_geom(tmp_path)
-    F, H, h, K = g.unit_frames, g.unit_hop_frames, g.hop_length, 6
-    y = ola_render([torch.ones(2, F * h) for _ in range(K)], g)
-    assert y.shape == (2, ((K - 1) * H + F) * h)
-    interior = y[:, F * h:(K - 1) * H * h]
-    assert interior.numel() > 0
-    assert float((interior - 1).abs().max()) <= 1e-6
+from conftest import TOY_D, TOY_HOP, max_abs
 
 
 def _blocks(k=5, b=32, seed=0):

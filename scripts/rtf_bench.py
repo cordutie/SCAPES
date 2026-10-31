@@ -33,7 +33,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 RUNS = REPO.parent / "runs"
 sys.path.insert(0, str(REPO))
-CODECS = ["encodec24k", "spectrostream", "encodec48k", "codicodec"]
+CODECS = ["encodec24k", "spectrostream", "encodec48k"]
 # (label, nfe, cfg scale, bf16)
 CONFIGS = [("nfe32_cfg3", 32, 3.0, False), ("nfe16_cfg3", 16, 3.0, False), ("nfe16_cfgoff", 16, 1.0, False),
            ("nfe32_cfgoff", 32, 1.0, False), ("nfe32_cfg3_bf16", 32, 3.0, True), ("nfe16_cfg3_bf16", 16, 3.0, True)]
@@ -125,12 +125,12 @@ def generate_unit(engine, past_units, clap, nfe, cfg, bf16=False):
 class Decoder:
     def __init__(self, engine, batch=1):
         import torch
-        from SCAPES.data.geometry import ola_window, window_for
+        from SCAPES.data.geometry import crossfade_window
         self.engine, self.g = engine, engine.geom
         if self.g.mode == "autoregressive":
             self.dec = engine.codec.streaming_decoder(batch)
         else:
-            self.window = ola_window(self.g, window_for(self.g, engine.info)).to(engine.device)
+            self.window = crossfade_window(self.g).to(engine.device)
             self.tail, self.k = None, 0
         self.new_samples = self.g.unit_frames * self.g.hop_length if self.g.mode == "autoregressive" else self.g.hop_samples
 
@@ -163,7 +163,7 @@ class Decoder:
 
 def g_mode_is_atoms(model_dir, args):
     name = Path(model_dir).parts
-    return any(c in ("encodec48k", "codicodec") for c in name) or any(c in str(model_dir) for c in ("encodec48k", "codicodec"))
+    return any(c == "encodec48k" for c in name) or "encodec48k" in str(model_dir)
 
 
 def bench_model(args, name, model_dir):

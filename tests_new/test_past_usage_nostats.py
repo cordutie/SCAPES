@@ -21,8 +21,8 @@ def _run(root, model, tmp_path):
 
 def test_past_usage_without_latent_stats(tmp_path):
     root = tmp_path / "toy"
-    model = train_toy(root, "atoms", steps=5)
-    assert not (model / "checkpoints" / "latent_stats.pt").exists()        # toy atoms: standardize_latents False
+    model = train_toy(root, "autoregressive", steps=5, extra_training=["training.standardize_latents = False"])
+    assert not (model / "checkpoints" / "latent_stats.pt").exists()
     r = _run(root, model, tmp_path)
     assert r["standardized"] is False and r["latent_stats_match"] is None
     assert r["L_real"] > 0 and r["L_null"] > 0 and abs(r["gain_percent"] - 100 * (1 - r["L_real"] / r["L_null"])) < 1e-9

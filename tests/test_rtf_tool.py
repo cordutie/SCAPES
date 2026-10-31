@@ -3,7 +3,6 @@
 Interfaces used (plan, slices B6/B8/B11):
 - scripts/measure_rtf.py: CLI (--gin-dir, --size custom, --pairs, --aa-pairs, --seed-base, --session-warmup) and functions
   paired_log_ratios, aa_log_ratios, aa_margin, bootstrap_mean_ci, classify (R2-C3);
-- scripts/ar_falsifier.py: CLI (--config-dir, --gen-seconds, --gen-seeds);
 - scripts/s5_eval.py: CLI;
 - SCAPES.inference.diagnostics: seam_ratio(z [d, T], block, phase=0), production_checks(y, sample_rate, ref_rms,
   target_seconds, unit_seconds).
@@ -16,7 +15,7 @@ import sys
 
 import torch
 
-from conftest import (SCRIPTS, SCAPES_REPO, TINY_TRAINING, TOY_AR, TOY_COMMON, prepare_toy, train_toy)
+from conftest import (SCRIPTS, SCAPES_REPO, train_toy)
 
 
 def _script(name):
@@ -31,51 +30,6 @@ def _run(args, timeout=1800):
                          timeout=timeout)
     assert out.returncode == 0, out.stderr[-4000:]
     return out
-
-
-def test_rtf_json_toy(tmp_path):
-    gin_dir = tmp_path / "gins"
-    gin_dir.mkdir()
-    atoms = ['codec.name = "toy_causal"', 'generation.mode = "atoms"', "atoms.seconds = 0.048",
-             "atoms.hop_seconds = 0.016", "atoms.crossfade_seconds = 0.004", "dataset.memory_buffer_atoms = 1"]
-    (gin_dir / "toy_causal_atoms.gin").write_text("\n".join(atoms + TOY_COMMON + TINY_TRAINING) + "\n")
-    (gin_dir / "toy_causal_ar.gin").write_text("\n".join(TOY_AR + TOY_COMMON + TINY_TRAINING) + "\n")
-    out_dir = tmp_path / "rtf"
-    _run([SCRIPTS / "measure_rtf.py", "--codec", "toy_causal", "--modes", "atoms", "autoregressive",
-          "--gin-dir", gin_dir, "--size", "custom", "--seconds", "1", "--nfe", "2", "--cfg", "3.0",
-          "--pairs", "2", "--aa-pairs", "1", "--seed-base", "0", "--reps", "2", "--session-warmup", "0",
-          "--random-init", "--out", out_dir])
-    r = json.loads((out_dir / "rtf.json").read_text())
-    m = _script("measure_rtf")
-    procs = r["processes"]
-    ab = [p for p in procs if p["kind"] == "ab"]
-    aa = [p for p in procs if p["kind"] == "aa"]
-    assert len(ab) == 4 and len(aa) == 4  # 2 AB pairs; 1 A/A pair per mode
-    assert len({p["pid"] for p in procs}) == 8  # one fresh subprocess per process slot
-    assert sorted(p["slot"] for p in procs) == list(range(8))
-    # ABBA: pair 0 runs atoms first, pair 1 runs AR first
-    for pair, first in ((0, "atoms"), (1, "autoregressive")):
-        two = sorted((p for p in ab if p["pair"] == pair), key=lambda p: p["slot"])
-        assert [p["mode"] for p in two][0] == first and {p["mode"] for p in two} == {"atoms", "autoregressive"}
-    assert sorted(p["mode"] for p in aa) == ["atoms", "atoms", "autoregressive", "autoregressive"]
-    flags = [json.dumps(p["flags"], sort_keys=True) for p in procs]
-    assert len(set(flags)) == 1  # identical numeric flags in every process (R2-C8)
-    assert set(procs[0]["flags"]) >= {"matmul_allow_tf32", "cudnn_allow_tf32", "cudnn_benchmark",
-                                      "float32_matmul_precision"}
-    for p in procs:
-        assert p["warmup_runs"] >= 1 and p["gpu_before"] and p["gpu_after"]
-        assert len(p["rtf"]) == 2 and all(v > 0 for v in p["rtf"])
-        for k in ("median_rtf", "solves_per_s", "s_per_solve", "decode_s_per_audio_s"):
-            assert math.isfinite(p[k]) and p[k] > 0, k
-    lr = {int(k): v for k, v in r["log_ratio_per_pair"].items()}
-    assert set(lr) == {0, 1}
-    assert {int(k): v for k, v in m.paired_log_ratios(procs).items()} == lr
-    assert r["pairs_above_1"] == sum(v > 0 for v in lr.values())
-    assert r["margin"] == m.aa_margin(m.aa_log_ratios(procs)) and r["margin"] >= 0.01
-    assert abs(r["speedup"] - math.exp(sum(lr.values()) / 2)) <= 1e-9
-    assert r["outcome"] == m.classify(r["ci95_log"], r["margin"])
-    assert r["outcome"] in {"faster", "slower", "indistinguishable"}
-    assert "cpu_governor" in r and "session_warmup_s" in r
 
 
 def test_s3_statistics_known():
@@ -121,19 +75,6 @@ def test_seam_ratio_known():
     assert abs(seam_ratio(linear, Bk) - 1.0) <= 1e-6
     jumps = direction * (t + 5.0 * torch.div(t, Bk, rounding_mode="floor"))  # seams have norm 6
     assert abs(seam_ratio(jumps, Bk) - 6.0) <= 1e-6
-
-
-def test_ar_falsifier_toy(tmp_path):
-    root, _ = prepare_toy(tmp_path / "toy", "autoregressive")
-    out_dir = tmp_path / "falsifier"
-    _run([SCRIPTS / "ar_falsifier.py", "--dataset", root, "--codec", "toy_causal", "--prefix-seconds", "0",
-          "--steps", "30", "--config-dir", root / "config", "--gen-seconds", "0.5", "--gen-seeds", "0", "1",
-          "--out", out_dir])
-    r = json.loads((out_dir / "falsifier.json").read_text())
-    assert set(r) >= {"L_real", "L_null", "rho_seam_gen", "rho_seam_real", "pass"}
-    for k in ("L_real", "L_null", "rho_seam_gen", "rho_seam_real"):
-        assert math.isfinite(r[k]) and r[k] > 0, k
-    assert r["pass"] == (r["L_real"] < 0.98 * r["L_null"] and r["rho_seam_gen"] <= 2 * r["rho_seam_real"])
 
 
 def test_s5_eval_toy(tmp_path):

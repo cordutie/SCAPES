@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Starts a V2 training run detached (setsid + nohup: it survives the terminal and SSH closing).
+# Starts a training run detached (setsid + nohup: it survives the terminal and SSH closing).
 # Usage (from SCAPES/): scripts/launch_run.sh <dataset_dir> <run_dir>
-#   <run_dir>/config/ must hold dataprep.gin and training.gin (pipeline.build_run_config) and the dataset must be prepared.
+#   <run_dir>/config/ must hold dataprep.gin and training.gin (the three generation keys codec, conditioning_rate, conditioning_memory_seconds are in dataprep.gin; pipeline.build_run_config writes them) and the dataset must be prepared.
 # Writes <run_dir>/model/ (checkpoints, loss history), <run_dir>/train.log, <run_dir>/pid and <run_dir>/command.txt.
 set -euo pipefail
 dataset=$(realpath "$1")

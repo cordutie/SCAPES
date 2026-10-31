@@ -1,4 +1,4 @@
-"""Slice B4: trainer, run logging, past dropout/noise, deterministic validation, prefix fallback (design Model, D7, D17).
+"""Slice B4: trainer, run logging, past dropout/noise, deterministic validation, (design Model, D7, D17).
 
 Interfaces used (plan "Interfaces", Phase B):
 - pipeline.build_trainer(dataset_path, save_path, config_dir=None) -> FlowTrainer (run_training = build + train);
@@ -56,10 +56,6 @@ def test_overfit_ar_toy(tmp_path):
 
 def test_overfit_atoms_toy(tmp_path):
     _overfit(tmp_path, "atoms")
-
-
-def test_overfit_ar_prefix_toy(tmp_path):
-    _overfit(tmp_path, "autoregressive", ["ar.prefix_seconds = 0.002"])
 
 
 def test_max_steps_and_logs(tmp_path):
@@ -143,11 +139,10 @@ def test_inference_gin_contents(tmp_path):
     prepare_toy(root, "autoregressive")
     model_dir = run_training(root, root / "model", config_dir=root / "config", max_steps=5)
     gin = parse_gin_config(model_dir / "checkpoints" / "inference.gin")
-    assert gin["codec"]["name"] == "toy_causal"
-    assert gin["generation"]["mode"] == "autoregressive"
-    assert (gin["ar"]["block_frames"], gin["ar"]["memory_frames"], gin["ar"]["stride_frames"],
-            gin["ar"]["prefix_frames"]) == (32, 96, 16, 0)
-    assert "memory_buffer_atoms" not in gin.get("dataset", {})  # AR has one window, no atom count
+    assert gin["codec"] == "toy_causal"
+    assert (gin["conditioning_rate"], gin["conditioning_memory_seconds"]) == (31.25, 0.096)
+    assert gin["resolved"]["mode"] == "autoregressive"
+    assert (gin["resolved"]["new_latents"], gin["resolved"]["memory_latents"]) == (32, 96)
     assert gin["training"]["standardize_latents"] is True
     stats = torch.load(model_dir / "checkpoints" / "latent_stats.pt", map_location="cpu", weights_only=True)
     assert stats["mu"].shape == (16,) and stats["std"].shape == (16,)
@@ -174,52 +169,6 @@ def test_deterministic_val(tmp_path, monkeypatch):
     assert set(round(v, 6) for v in s.tolist()) == {0.125, 0.375, 0.625, 0.875}
     n_val = len(trainer.dataset.get_splits()[1])
     assert s.numel() == 2 * 4 * n_val  # two calls x 4 stratified s per val sample
-
-
-def test_prefix_masking(tmp_path, monkeypatch):
-    """o = 2 (ar.prefix_seconds = 0.002 at 1000 Hz): the prefix given to the loss is the last o past frames, clean."""
-    import SCAPES.training.FlowModel_trainer as T
-    extra_t = NO_REG + ["training.standardize_latents = False", "training.max_steps = 1", "training.log_every = 1"]
-    trainer = _build(tmp_path / "toy", extra_dataprep=["ar.prefix_seconds = 0.002"], extra_training=extra_t)
-    assert trainer.dataset.geom.prefix_frames == 2
-    seen = {}
-    orig = T.flow_matching_loss
-
-    def spy(*a, **k):
-        seen["prefix"] = k.get("prefix")
-        return orig(*a, **k)
-
-    monkeypatch.setattr(T, "flow_matching_loss", spy)
-    batch = _fixed_batch(trainer)
-    trainer.train_loader = [batch]
-    trainer.val_loader = None
-    trainer.train(epochs=1, audio_val_freq=10 ** 9, val_nfe=4, patience=10)
-    p = seen["prefix"]
-    assert p is not None and p.shape == (8, 2, 16)
-    want = batch["memory_buffer_latent"][:, -1, :, -2:].transpose(1, 2)
-    assert max_abs(p, want) == 0.0
-
-    # R2-C5: with past noise the prefix is taken from the past AFTER apply_past_noise (same perturbation as the memory)
-    extra_n = [l for l in extra_t if not l.startswith("training.past_noise")] + ["training.past_noise = 0.1"]
-    trainer = _build(tmp_path / "toy_noise", extra_dataprep=["ar.prefix_seconds = 0.002"], extra_training=extra_n)
-    noised = {}
-    orig_noise = T.apply_past_noise
-
-    def spy_noise(past, gamma):
-        out = orig_noise(past, gamma)
-        noised["out"] = out.detach().clone()
-        return out
-
-    monkeypatch.setattr(T, "apply_past_noise", spy_noise)
-    batch = _fixed_batch(trainer)
-    trainer.train_loader = [batch]
-    trainer.val_loader = None
-    trainer.train(epochs=1, audio_val_freq=10 ** 9, val_nfe=4, patience=10)
-    p = seen["prefix"]
-    want = noised["out"][:, -1, :, -2:].transpose(1, 2)
-    assert max_abs(p, want) == 0.0
-    clean = batch["memory_buffer_latent"][:, -1, :, -2:].transpose(1, 2)
-    assert max_abs(p, clean) > 0.0  # non-vacuous: the noise did change it
 
 
 def test_past_usage_eval(tmp_path):

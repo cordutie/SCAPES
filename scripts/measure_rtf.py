@@ -114,8 +114,7 @@ def numeric_flags():
 def build_engine(args, mode, seed):
     import torch
     from SCAPES.inference import FlowInference as fi
-    fi._CODEC_CONFIG_DIR = Path(args.gin_dir)
-    engine = fi.FlowInference.from_config(args.codec, mode, size=args.size, device=args.device, seed=seed)
+    engine = fi.FlowInference.from_config(args.codec, size=args.size, device=args.device, seed=seed)
     if args.random_init:
         # output projection N(0, 0.02): the V1 zero init would make all velocities identically zero
         torch.nn.init.normal_(engine.model.transformer.output_proj.weight, mean=0.0, std=0.02)

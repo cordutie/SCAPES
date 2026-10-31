@@ -4,7 +4,7 @@ import torch
 
 from conftest import load_toy_dataset
 
-B, W, S, CTX = 32, 96, 16, 500  # toy AR geometry in frames (1000 Hz): block, ONE past window, stride; CTX = 0.5 s
+B, W, S, CTX = 32, 96, 32, 500  # toy AR geometry in frames (1000 Hz): block, ONE past window, stride; CTX = 0.5 s
 T_FILE = 10000
 
 
@@ -33,12 +33,11 @@ def test_atoms_item(toy_atoms):
     root, store = toy_atoms
     ds = load_toy_dataset(root, requested_keys=["memory_buffer_latent", "target_latent", "memory_buffer_scale",
                                                 "target_scale", "index"])
-    F, H, M = 48, 16, 1
+    F, M = 36, 3  # V3 toy atoms: A = 36 latents, K = 3 memory atoms
     assert ds.has_scale is True and ds.frame_dim == 17
     for idx in _probe_indices(len(ds)):
         fname, t = ds.all_indices[idx]
-        assert t % H == 0
-        k = t // H
+        k = t  # for atoms the index is the atom number
         d = store.load_latents(root / "raw" / fname)
         item = ds[idx]
         assert item["memory_buffer_latent"].shape == (M, 16, F)

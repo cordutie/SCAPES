@@ -1,24 +1,13 @@
-"""audio_codec_wrappers and SCAPES in one environment: the pinned checkout, the four codecs next to CLAP in one process,
-and the whole pipeline (dataprep, training, generation) for every codec on the small dataset."""
-import json
-import os
+"""audio_codec_wrappers and SCAPES in one environment: the pinned checkout and the codecs next to CLAP in one process.
+The whole pipeline for every codec is the slow run of tests_v3/test_smoke_codecs.py."""
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 import torch
 
-PHASE = int(os.environ.get("SCAPES_PHASE", "1"))
-
 REPO = Path(__file__).resolve().parents[1]
-CODECS = ["encodec24k", "spectrostream", "encodec48k", "codicodec", "music2latent"]
-PIPELINE_CASES = CODECS + (["music2latent_independent", "codicodec_independent"] if PHASE >= 2 else [])   # design D24
-# snippet of every case in scripts/s2_smoke.py ("music2latent" runs the consistent template, phase 1)
-SNIPPETS = {"encodec48k": "encodec48k_atoms.gin", "codicodec": "codicodec_atoms.gin",
-            "music2latent": "music2latent_consistent.gin", "music2latent_independent": "music2latent_independent.gin",
-            "codicodec_independent": "codicodec_independent.gin"}
-SMOKE_DATASET = REPO.parent / "datasets" / "micro_microtex"
+CODECS = ["encodec24k", "spectrostream", "encodec48k", "music2latent"]
 
 
 def _wrappers_root():
@@ -78,45 +67,3 @@ def _clap():
         from SCAPES.auxiliar.clap_wrapper import CLAPWrapper
         _CLAP.append(CLAPWrapper(version="2023", use_cuda=True))
     return _CLAP[0]
-
-
-@pytest.mark.skipif(not (SMOKE_DATASET / "raw").is_dir(), reason="datasets/micro_microtex not present")
-def test_pipeline_runs_for_every_codec(tmp_path):
-    """Dataprep, 20 training steps and 10 s of generation per codec, each stage in a fresh process (scripts/s2_smoke.py)."""
-    out = tmp_path / "s2"
-    proc = subprocess.run([sys.executable, str(REPO / "scripts" / "s2_smoke.py"), "--dataset", str(SMOKE_DATASET),
-                           "--out", str(out), "--codecs", *PIPELINE_CASES, "--max-steps", "20", "--no-spectral-check"],
-                          cwd=REPO, capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(REPO)})
-    assert proc.returncode == 0, proc.stderr[-2000:]
-    for name in PIPELINE_CASES:
-        res = json.loads((out / name / "s2_result.json").read_text())
-        assert res["stages_ok"] == 3, f"{name}: {res['stages']}"
-        art = res["artefacts"]
-        assert art["best_flow_model"] and art["inference_gin"] and art["wav_10s"], f"{name}: {art}"
-        assert res["train"]["all_finite"], name
-        if name in SNIPPETS:
-            _check_atoms_generation(out / name / "model", name)
-
-
-def _expected_window(name):
-    """hann for EnCodec 48k, the by-codec default for the legacy CoDiCodec atoms, the template's atoms.window otherwise."""
-    from SCAPES.data.config_loader import parse_gin_config
-    if name == "encodec48k":
-        return "hann"
-    if name == "codicodec":
-        return "equal_power"
-    return parse_gin_config(REPO / "SCAPES" / "config" / "codecs" / SNIPPETS[name])["atoms"]["window"]
-
-
-def _check_atoms_generation(model_dir, name):
-    """Generation with the trained atoms model: finite audio of the length the geometry gives, with the window of the codec."""
-    from SCAPES.data.geometry import window_for
-    from SCAPES.inference.FlowInference import FlowInference
-    g = torch.Generator().manual_seed(0)
-    clap = [torch.nn.functional.normalize(torch.randn(1024, generator=g), dim=0) for _ in range(5)]
-    engine = FlowInference(model_dir, device="cuda", checkpoint="last")
-    audio = engine.generate_soundscape(clap, nfe=2, cfg_scale=1.0, seed=0)
-    geom = engine.geom
-    assert torch.isfinite(audio).all()
-    assert audio.shape[-1] == (len(clap) - 1) * geom.hop_samples + geom.atom_samples
-    assert window_for(geom, engine.info) == _expected_window(name)

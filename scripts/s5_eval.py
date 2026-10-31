@@ -13,7 +13,7 @@ Usage (from SCAPES/):
         --seconds 10 --prompt-region val --out ../runs/s5_val
 
 Outputs: <out>/s5_eval.json, s5_eval.png, README.md, original/, <codec>/{generated,roundtrip}/*.wav, <codec>/s5_codec.json.
-Each codec runs in its own process (CoDiCodec flips global torch flags at import).
+Each codec runs in its own process.
 """
 import argparse
 import json
@@ -93,7 +93,7 @@ def codec_name_of(model_dir: Path):
     gin = model_dir / "checkpoints" / "inference.gin"
     if not gin.exists():
         return None
-    m = re.search(r'^\s*codec\.name\s*=\s*"([^"]+)"', gin.read_text(), re.M)
+    m = re.search(r'^\s*codec\s*=\s*"([^"]+)"', gin.read_text(), re.M)
     return m.group(1) if m else None
 
 

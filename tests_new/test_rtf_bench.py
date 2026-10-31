@@ -10,6 +10,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 from conftest import SCRIPTS, train_toy
+from _atoms_toy import TOY_GEOM
 
 sys.path.insert(0, str(SCRIPTS))
 import rtf_bench
@@ -25,9 +26,11 @@ def test_bench_ar_and_atoms_toy(tmp_path):
         model = train_toy(tmp_path / mode, mode, steps=5)
         r = _bench(model, mode)
         c = r["configs"]["nfe16_cfg3"]
-        g_unit = r["unit_frames"] if mode == "autoregressive" else r["unit_hop_frames"]
-        assert abs(c["new_audio_seconds"] - g_unit * 8 / 8000) < 1e-9          # toy codecs: hop 8 samples at 8 kHz
-        assert abs(c["generated_audio_seconds"] - r["unit_frames"] * 8 / 8000) < 1e-9
+        C, H, _ = TOY_GEOM["consistent"]                                      # atoms toy, in samples at 8 kHz
+        new = r["unit_frames"] * 8 / 8000 if mode == "autoregressive" else H / 8000    # toy codecs: hop 8 samples
+        gen = r["unit_frames"] * 8 / 8000 if mode == "autoregressive" else C / 8000
+        assert abs(c["new_audio_seconds"] - new) < 1e-9
+        assert abs(c["generated_audio_seconds"] - gen) < 1e-9
         assert abs(c["rtf_generated"]["mean"] * c["generated_audio_seconds"] - c["rtf"]["mean"] * c["new_audio_seconds"]) < 1e-9
         assert abs(c["overlap_seconds"] - (c["generated_audio_seconds"] - c["new_audio_seconds"])) < 1e-12
         if mode == "autoregressive":
@@ -44,4 +47,4 @@ def test_bench_guards(tmp_path):
     out = subprocess.run(cmd, capture_output=True, text=True)
     assert out.returncode != 0 and ("GPU" in out.stderr or "chain" in out.stderr)
     dry = subprocess.run([sys.executable, str(SCRIPTS / "rtf_bench.py"), "--dry"], capture_output=True, text=True)
-    assert dry.returncode == 0 and sum(l.split()[0].endswith("_large") for l in dry.stdout.splitlines()[:8]) == 4 and sum(l.split()[0].endswith("_small") for l in dry.stdout.splitlines()[:8]) == 4
+    assert dry.returncode == 0 and sum(l.split()[0].endswith("_large") for l in dry.stdout.splitlines()[:8]) == 3 and sum(l.split()[0].endswith("_small") for l in dry.stdout.splitlines()[:8]) == 3

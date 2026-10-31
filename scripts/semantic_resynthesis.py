@@ -31,7 +31,7 @@ import eval_metrics as em
 import teacher_forced_eval as tf
 
 CODECS = {"encodec24k": "microtex_encodec24k_ar", "spectrostream": "microtex_spectrostream_ar",
-          "encodec48k": "microtex_encodec48k_atoms", "codicodec": "microtex_codicodec_atoms"}
+          "encodec48k": "microtex_encodec48k_atoms"}
 BAND_HZ = 12000.0
 
 
@@ -213,7 +213,7 @@ def main():
         return
     Path(args.out).mkdir(parents=True, exist_ok=True)
     if not args.summarize_only:
-        for codec in CODECS:      # one process per codec (CoDiCodec flips global torch flags at import)
+        for codec in CODECS:      # one process per codec
             cmd = [sys.executable, str(Path(__file__).resolve()), "--only", codec] + \
                   [x for k in ("runs", "dataset", "eval_tf", "out", "device", "nfe", "cfg", "seed", "n_boot", "max_files")
                    for x in (f"--{k.replace('_', '-')}", str(getattr(args, k)))]

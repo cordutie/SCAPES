@@ -1,8 +1,0 @@
-# encodec24k, autoregressive: 0.1 s block, one past window of 1.6 s
-codec.name = "encodec24k"
-generation.mode = "autoregressive"
-ar.block_seconds = 0.10
-ar.memory_seconds = 1.6
-# training
-training.standardize_latents = True
-training.past_noise = 0.1

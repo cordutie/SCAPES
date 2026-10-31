@@ -5,7 +5,7 @@ import torch
 
 from conftest import load_toy_dataset
 
-STRIDE_S = 0.016  # toy AR stride: S = 16 frames at 1000 Hz
+STRIDE_S = 0.032  # toy AR stride: S = 32 frames at 1000 Hz
 CTX_S = 0.5
 
 
@@ -20,7 +20,7 @@ def test_alignment_known_answer(toy_ar):
     root, store = toy_ar
     key = _clap_key(store)
     arr = store.load_grid_array("clap", key, root / "raw" / "b.wav")
-    G = 594  # grid starts g*16 frames whose 0.5 s window fits in 10 s: g <= 593.75
+    G = 297  # grid starts g*32 frames whose 0.5 s window fits in 10 s: g <= 296.875
     assert arr.shape == (G, 1024)
     t = torch.arange(G, dtype=torch.float64) * STRIDE_S
     want = (t + CTX_S / 2) / 20.0
@@ -41,7 +41,7 @@ def test_semantics_folder_grid(toy_ar, tmp_path):
     ds = load_toy_dataset(root)
     assert build_semantics_folder(csv_path, out_dir, ds) == 1
     out = torch.load(out_dir / "ramp.pt", map_location="cpu", weights_only=True)
-    # grid starts in [1, 2): g * 0.016 in [1, 2) -> g = 63 .. 124
-    assert out.shape == (62, 1024)
+    # grid starts in [1, 2): g * 0.032 in [1, 2) -> g = 32 .. 62
+    assert out.shape == (31, 1024)
     arr = store.load_grid_array("clap", _clap_key(store), root / "raw" / "b.wav")
-    assert torch.equal(out[:, 0].cpu().float(), arr[63:125, 0].cpu().float())
+    assert torch.equal(out[:, 0].cpu().float(), arr[32:63, 0].cpu().float())

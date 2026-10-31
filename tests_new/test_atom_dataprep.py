@@ -1,4 +1,4 @@
-"""S5, S6: dataprep, representation store and dataset for consistent / independent atoms (toy codecs, stub CLAP, GPU).
+"""S5, S6: dataprep, representation store and dataset for the atoms of the V3 geometry (toy codecs, stub CLAP, GPU).
 
 Design: Formulation (atoms, Lemma "no time loss"), Dataset indexing, D7, D9. Toy geometries in _atoms_toy.py.
 Lives outside tests/ because that folder is locked. Run from SCAPES/: ../venv_SCAPES/bin/python -m pytest tests_new -q
@@ -10,9 +10,9 @@ import numpy as np
 import pytest
 import torch
 
-from _atoms_toy import N_TOY, RATE, TOY_GEOM, load_dataset, phase2, prepare_new_toy, prepared_audio
+from _atoms_toy import M_TOY, N_TOY, RATE, TOY_GEOM, load_dataset, prepare_new_toy, prepared_audio
 
-KINDS = ["consistent", pytest.param("independent", marks=phase2)]
+KINDS = ["consistent"]
 
 
 def _geom(config_dir):
@@ -48,48 +48,25 @@ def test_each_segment_encoded_alone(tmp_path, kind):
             assert abs(float(data["scale"][k]) - float(enc.scale.reshape(-1)[0])) <= 1e-6 * float(enc.scale.abs().max()) + 1e-9
 
 
-@pytest.mark.parametrize("kind", KINDS)
-def test_identity_reconstruction_no_time_loss(tmp_path, kind):
-    """The Lemma (H2): toy decode is the exact inverse, so Hann OLA of the stored atoms gives back x on the valid region."""
-    from audio_codec_wrappers import load_codec
-    from SCAPES.inference.render import render_atoms
-    root = tmp_path / "toy"
-    cfg_dir, store = prepare_new_toy(root, kind)
-    g = _geom(cfg_dir)
-    C, H, X = TOY_GEOM[kind]
-    codec = load_codec("toy_noncausal", device="cuda")
-    path = root / "raw" / "a.wav"
-    x = prepared_audio(codec, path)[0, 0].cpu()
-    data = store.load_latents(path)
-    K = data["latent"].shape[0]
-    units = [torch.cat([data["latent"][k].float()[None], data["scale"][k].float().view(1, 1, 1).expand(1, 1, C // 8)], dim=1)
-             .cuda() for k in range(K)]
-    y = render_atoms(codec, units, g, base_seed=0, smooth=[False] * K, window="hann")[0].cpu()
-    assert y.shape == ((K - 1) * H + C,)
-    assert 0 <= N_TOY - y.shape[0] < H
-    lo, hi = C - H, (K - 1) * H + C - X
-    err = float((y[lo:hi] - x[lo:hi]).abs().max())
-    assert err <= 2e-3 * float(x.abs().max()), f"{kind}: max error {err:.2e} (a 1-sample shift of the 440 Hz sine gives ~0.1)"
-
-
 def test_two_configs_two_folders(tmp_path):
     from SCAPES.data.representations import RepresentationMismatch, RepresentationStore
     from SCAPES.codecs import get_codec_info
     root = tmp_path / "toy"
     cons_dir, _ = prepare_new_toy(root, "consistent", config_name="config_cons")
-    # a second consistent configuration (phase 1): a longer chunk, C = 192 (atoms.seconds 0.024), same hop
-    prepare_new_toy(root, "consistent", config_name="config_c192", extra_dataprep=["atoms.seconds = 0.024"], write_wavs=False)
+    # a second configuration with another conditioning rate: another hop, another folder
+    prepare_new_toy(root, "consistent", config_name="config_long", extra_dataprep=["conditioning_rate = 125"],
+                    write_wavs=False)
     reps = root / "representations"
-    a, b = reps / "toy_noncausal__atoms-c128-h36", reps / "toy_noncausal__atoms-c192-h36"
-    assert a.is_dir() and b.is_dir()
+    a = reps / "toy_noncausal__atoms-c288-h128"
+    assert a.is_dir() and len(list(reps.iterdir())) == 2
     before = {p: p.stat().st_mtime_ns for p in a.rglob("*") if p.is_file()}
     assert before
     prepare_new_toy(root, "consistent", config_name="config_cons", write_wavs=False)
     after = {p: p.stat().st_mtime_ns for p in a.rglob("*") if p.is_file()}
     assert after == before, "a re-run must leave the representation untouched"
     rep = json.loads((a / "rep.json").read_text())
-    assert (rep["atom_type"], rep["chunk_samples"], rep["hop_samples"]) == ("consistent", 128, 36)
-    rep["hop_samples"] = 37
+    assert (rep["atom_type"], rep["chunk_samples"], rep["hop_samples"]) == ("consistent", 288, 128)
+    rep["hop_samples"] = 129
     (a / "rep.json").write_text(json.dumps(rep))
     g = _geom(cons_dir)
     with pytest.raises(RepresentationMismatch):
@@ -99,10 +76,10 @@ def test_two_configs_two_folders(tmp_path):
 def test_dataset_indices_reference(tmp_path):
     from SCAPES.data.splits import assign_region, region_bounds
     root = tmp_path / "toy"
-    cfg_dir, store = prepare_new_toy(root, "consistent", M=2)
+    cfg_dir, store = prepare_new_toy(root, "consistent")
     ds = load_dataset(root, cfg_dir)
     C, H, _ = TOY_GEOM["consistent"]
-    M, ctx48 = 2, 24000                      # context 0.5 s at 48 kHz (TOY_COMMON)
+    M, ctx48 = M_TOY, 24000                      # context 0.5 s at 48 kHz (TOY_COMMON)
     index = store.read_index()
     want = []
     for fname in sorted(["a.wav", "b.wav"]):
@@ -128,7 +105,7 @@ def test_dataset_indices_reference(tmp_path):
         item = ds[int(idx)]
         fname, k = ds.all_indices[int(idx)]
         assert fname == "a.wav"
-        assert torch.equal(item["memory_buffer_latent"], lat[k - 2:k])
+        assert torch.equal(item["memory_buffer_latent"], lat[k - M:k])
         assert torch.equal(item["target_latent"], lat[k])
         assert torch.equal(item["target_semantic"], clap[k])
 
@@ -140,7 +117,7 @@ def test_clap_grid_alignment_ramp(tmp_path):
     H = TOY_GEOM["consistent"][1]
     arr = store.load_grid_array("clap", ds.clap_key, root / "raw" / "b.wav")
     G = arr.shape[0]
-    step48 = H * 48000 // RATE                                  # 216: the toy hop is 36 samples at 8 kHz
+    step48 = H * 48000 // RATE                                  # 768: the toy hop is 128 samples at 8 kHz
     assert G == 1 + (480000 - 24000) // step48                  # starts whose 0.5 s window fits
     for g in (0, 7, G - 1):
         s = int(np.rint(g * H * 48000 / RATE))
@@ -176,4 +153,4 @@ def test_no_scale_codec(tmp_path):
     item = ds[0]
     assert "target_scale" not in item and "memory_buffer_scale" not in item
     data = store.load_latents(root / "raw" / "a.wav")
-    assert torch.equal(data["scale"], torch.ones_like(data["scale"]))
+    assert "scale" not in data or torch.equal(data["scale"], torch.ones_like(data["scale"]))

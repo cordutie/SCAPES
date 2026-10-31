@@ -25,11 +25,6 @@ Try the online demo to generate environmental sounds with semantic control.
 Train with default parameters and generate sounds quickly.
 
 
-### Full Tutorial
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cordutie/SCAPES/blob/main/quickstart/tutorial_full.ipynb) 
-
-Dive deep into the code and customize the training loop.
-
 ## Installation
 
 SCAPES installs together with its codec wrappers ([audio_codec_wrappers](https://github.com/cordutie/audio_codec_wrappers), included as the git submodule `external/audio_codec_wrappers/`) in a single virtual environment.
@@ -50,17 +45,17 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 # 2. Packages that must be installed without their own dependency pins:
-#    msclap, magenta-rt, codicodec, music2latent, and the wrappers (editable, from ./external/audio_codec_wrappers)
+#    msclap, magenta-rt, music2latent, and the wrappers (editable, from ./external/audio_codec_wrappers)
 pip install --no-deps -r requirements-nodeps.txt
 
-# 3. One-time download of the SpectroStream and CoDiCodec weights (EnCodec and Music2Latent download themselves on first use)
-for c in spectrostream codicodec; do python external/audio_codec_wrappers/scripts/fetch_weights.py --codec $c; done
+# 3. One-time download of the SpectroStream weights (EnCodec and Music2Latent download themselves on first use)
+python external/audio_codec_wrappers/scripts/fetch_weights.py --codec spectrostream
 ```
 
 Check the installation (needs the GPU; the last test trains 20 steps for each of the four codecs and takes a few minutes):
 
 ```bash
-python -m pytest -q tests_new/test_wrappers_integration.py
+python -m pytest -q tests_v3 -m slow
 ```
 
 Notes:
@@ -70,9 +65,19 @@ Notes:
 
 ## Codecs and overlap-add
 
-Supported codecs: `encodec24k`, `spectrostream` (causal, autoregressive mode), `encodec48k`, `codicodec`, `music2latent` (non-causal, atoms mode). Configuration templates are in `SCAPES/config/codecs/`.
+Supported codecs: `encodec24`, `spectrostream` (causal, autoregressive mode), `encodec48`, `music2latent` (non-causal, atoms mode). The generation settings are three keys in `SCAPES/config/generation.gin`:
 
-In atoms mode the generated atoms are decoded one by one and overlap-added. EnCodec 48k has a deterministic decoder: it uses a long overlap and a Hann crossfade. Music2Latent uses consistent atoms (`atoms.type = "consistent"`): the hop is exactly 0.1 s, every segment is encoded on its own, and the atoms are crossfaded over 3782 samples with the window `atoms.window` (`equal_power` for its stochastic decoder, `hann` for a deterministic one; the window can be changed after training). `atoms.seconds` 0.18 / 0.37 / 0.55 / 0.74 give 2 / 4 / 6 / 8 latents per atom. Independent atoms (`atoms.type = "independent"`, with `atoms.overlap`) are not implemented yet. The overlap-add is always done on the decoded audio. The geometry, the windows and the figures are in [docs/overlap_add.md](docs/overlap_add.md).
+| key | default | meaning |
+|---|---|---|
+| `codec` | `"music2latent"` | `encodec24`, `spectrostream` (autoregressive) or `encodec48`, `music2latent` (atoms) |
+| `conditioning_rate` | `10.0` Hz | how often the semantic condition changes; rounded to the nearest rate the codec offers |
+| `conditioning_memory_seconds` | 0.5 s (atoms), 1.0 s (autoregressive) | how much past the model attends to |
+
+The mode and the geometry are derived from these keys, and a startup line prints the resolved values and any rounding. The per-codec tables, formulas and diagrams are in [docs/generation_modes.html](docs/generation_modes.html).
+
+The keys reach a run through a merged config: `build_run_config(<dataset>/config, [SCAPES/config/generation.gin], overrides, <run>/config)` (in `SCAPES/pipeline.py`) writes `dataprep.gin` and `training.gin` with the three keys appended, and `run_dataprep` and `run_training` take that folder as `config_dir`. `python scripts/make_run_configs.py --dataset <dataset> --out <dir> codec:rate[:memory] ...` writes one such config per spec, and `quickstart/wrappers.py` does it for the notebook.
+
+In atoms mode the generated atoms are decoded one by one and overlap-added on the decoded audio. The geometry of both generation modes is in [docs/generation_modes.html](docs/generation_modes.html).
 
 ## Pipeline
 

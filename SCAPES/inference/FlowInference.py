@@ -11,7 +11,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 from SCAPES.data.config_loader import (parse_gin_config, _get_nested, _SIZE_TABLE, ConfigError, load_dataprep_config)
-from SCAPES.data.geometry import window_for, geometry_from_inference_gin, resolve_geometry
+from SCAPES.generation import print_resolution
+from SCAPES.data.geometry import geometry_from_inference_gin, resolve_geometry
 from SCAPES.data.representations import frames_to_samples_48k
 from SCAPES.data.geometry import atom_count
 from SCAPES.models.flow.FlowModel import FlowModel
@@ -329,7 +330,6 @@ def run_interpolation_pipeline(
 # FLOW INFERENCE ENGINE
 # ==========================================
 
-_CODEC_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "codecs"
 
 
 def _gin_value(v):
@@ -339,8 +339,7 @@ def _gin_value(v):
 class FlowInference:
     """
     Generation from a trained model directory, in both modes (design: Inference).
-    The codec and the geometry come from <model_dir>/checkpoints/inference.gin (V1 files need the two lines
-    codec.name and generation.mode). Latents inside the timeline are in model units (standardised if the model was).
+    The codec and the geometry come from <model_dir>/checkpoints/inference.gin. Latents inside the timeline are in model units (standardised if the model was).
     """
 
     def __init__(
@@ -360,10 +359,9 @@ class FlowInference:
                 "Run training first to generate this file."
             )
         raw = parse_gin_config(gin_path)
-        codec_name = _get_nested(raw, ["codec", "name"], None)
-        if codec_name is None or _get_nested(raw, ["generation", "mode"], None) is None:
-            raise ConfigError(f"{gin_path}: codec.name and generation.mode are required "
-                              f"(a V1 inference.gin works after adding these two lines)")
+        codec_name = raw.get("codec")
+        if not isinstance(codec_name, str):
+            raise ConfigError(f"{gin_path}: codec is required (this inference.gin was not written by this version)")
         info = scapes_codecs.get_codec_info(codec_name)
         geom = geometry_from_inference_gin(raw, info)
 
@@ -406,16 +404,15 @@ class FlowInference:
             stats = torch.load(stats_path, map_location=self.device, weights_only=True)
             self.mu, self.std = stats["mu"].float(), stats["std"].float()
 
-    # Random-init engine with the template geometry of <codec>_<mode>.gin (S3 timing); weights are not loaded and the codec
-    # is only loaded at the first decode. geometry: optional gin overrides, e.g. {"ar.block_seconds": 0.32};
-    # size "custom" reads the model.* lines from the template.
+    # Random-init engine with the default geometry of the codec (generation.py; S3 timing); weights are not loaded and the
+    # codec is only loaded at the first decode. geometry: optional gin lines, e.g. {"conditioning_rate": 10} or the
+    # model.* lines of size "custom".
     @classmethod
-    def from_config(cls, codec: str, mode: str, size: str = "large", geometry: Optional[dict] = None,
+    def from_config(cls, codec: str, size: str = "large", geometry: Optional[dict] = None,
                     device: Optional[str] = None, seed: int = 0):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        suffix = "ar" if mode == "autoregressive" else "atoms"
-        lines = (_CODEC_CONFIG_DIR / f"{codec}_{suffix}.gin").read_text().splitlines()
+        lines = [f'codec = "{scapes_codecs.canonical(codec)}"']
         lines += [f"{k} = {_gin_value(v)}" for k, v in (geometry or {}).items()]
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "dataprep.gin"
@@ -440,6 +437,7 @@ class FlowInference:
         self.info = info
         self.geom = geom
         self.mode = geom.mode
+        print_resolution(geom.resolution)
         self.sr = info.sample_rate            # output rate (codec rate)
         self.load_sr = 48000                  # rate of the audio given to CLAP, structure and the helper pipelines
         self.frame_rate = info.frame_rate
@@ -451,7 +449,7 @@ class FlowInference:
 
         # ─── Geometry in frames ───
         self.spectral_mode = bool(_get_nested(raw, ["training", "spectral_representation"], False))
-        if self.spectral_mode and geom.codec != "encodec48k":
+        if self.spectral_mode and geom.codec != "encodec48":
             raise NotImplementedError("spectral_representation is only available for encodec48k (D13)")
         if self.spectral_mode:
             frame_dim = 385  # 128*3 + 1
@@ -462,7 +460,6 @@ class FlowInference:
             self.spectral_frames = None
             model_frames = geom.unit_frames + geom.prefix_frames
         self.unit_frames = geom.unit_frames
-        self.memory_buffer_atoms = geom.memory_units
         self.segment_length = geom.memory_units
         self.context_seconds = geom.context_seconds
         self.context_samples = int(round(self.context_seconds * self.load_sr))
@@ -836,8 +833,7 @@ class FlowInference:
         else:
             if self.verbose:
                 print("\n--- Rendering Audio Timeline (Smooth Mode) ---")
-            audio = render_atoms(self.codec, units, g, self.mu, self.std, base_seed=seed, smooth=generated,
-                                 window=window_for(g, self.info))
+            audio = render_atoms(self.codec, units, g, self.mu, self.std, base_seed=seed, smooth=generated)
         final_audio_tensor = audio.cpu()
 
         if output_path:

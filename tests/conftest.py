@@ -34,19 +34,14 @@ TOY_HOP = 8
 TOY_D = 16
 
 TOY_AR = [
-    'codec.name = "toy_causal"',
-    'generation.mode = "autoregressive"',
-    "ar.block_seconds = 0.032",     # B = 32 frames (present block)
-    "ar.memory_seconds = 0.096",    # W = 96 frames: ONE past window, cross-attended (Esteban review)
-    "ar.stride_seconds = 0.016",    # S = 16
+    'codec = "toy_causal"',
+    "conditioning_rate = 31.25",            # n = 32 frames (present block)
+    "conditioning_memory_seconds = 0.096",  # W = 96 frames: ONE past window
 ]
 TOY_ATOMS = [
-    'codec.name = "toy_noncausal"',
-    'generation.mode = "atoms"',
-    "atoms.seconds = 0.048",            # F = 48
-    "atoms.hop_seconds = 0.016",        # H = 16
-    "atoms.crossfade_seconds = 0.004",  # X = 32 samples
-    "dataset.memory_buffer_atoms = 1",
+    'codec = "toy_noncausal"',
+    "conditioning_rate = 62.5",             # n = 16, x = 4, o = 16, A = 36
+    "conditioning_memory_seconds = 0.05",
 ]
 TOY_COMMON = [
     "semantic.context_seconds = 0.5",
@@ -55,7 +50,6 @@ TOY_COMMON = [
     "precompute.batch_size = 64",
     "splits.val_split_ratio = 0.1",
     "splits.reserve_ratio = 0.1",
-    "dataset.hop_atoms = 1",
     "seed = 0",
     'device = "cuda"',
 ]

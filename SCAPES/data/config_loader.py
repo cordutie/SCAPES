@@ -4,45 +4,16 @@ from pathlib import Path
 from typing import Optional
 
 
-class ConfigError(ValueError):
-    """A gin file is missing a required line, has an invalid value or uses a rejected key."""
+from SCAPES.errors import ConfigError  # noqa: F401  (re-exported; defined in errors.py so generation.py stays torch-free)
 
-
-MODES = ("atoms", "autoregressive")
-
-# V1 frame counts per second and the keys that replaced them (150 Hz, 320 samples per frame at 48 kHz).
-_V1_RATE = 150.0
-_REJECTED_FRAME_KEYS = {
-    ("atoms", "frames"): "atoms.seconds",
-    ("atoms", "hop_frames"): "atoms.hop_seconds",
-    ("atoms", "crossfade_frames"): "atoms.crossfade_seconds",
-}
-
-
-def frames_to_seconds_text(frames) -> str:
-    """V1 frames -> seconds at 150 Hz, up to 6 decimals, no trailing zeros (48 -> 0.32, 15 -> 0.1)."""
-    text = f"{float(frames) / _V1_RATE:.6f}".rstrip("0").rstrip(".")
-    return text if text else "0"
 
 
 @dataclass
 class DataprepConfig:
-    # Codec and generation mode (required)
+    # The three generation keys: the codec (canonical name, required) and the two optional conditioning keys
     codec_name: Optional[str] = None
-    generation_mode: Optional[str] = None
-    # Atoms mode geometry, in seconds
-    atoms_seconds: Optional[float] = None
-    atoms_hop_seconds: Optional[float] = None
-    atoms_crossfade_seconds: Optional[float] = None
-    atoms_type: Optional[str] = None              # consistent | independent (None = legacy frames atoms)
-    atoms_overlap: Optional[str] = None           # independent only: normal | strong | brute (phase 2)
-    atoms_window: Optional[str] = None            # hann | equal_power (new types only; None = by codec)
-    memory_buffer_atoms: Optional[int] = None
-    # Autoregressive mode geometry, in seconds (one past window and the present block)
-    ar_block_seconds: Optional[float] = None
-    ar_memory_seconds: Optional[float] = None
-    ar_stride_seconds: Optional[float] = None
-    ar_prefix_seconds: float = 0.0
+    conditioning_rate: Optional[float] = None
+    conditioning_memory_seconds: Optional[float] = None
     semantic_context_seconds: float = 1.0
     semantic_random_extension: bool = True
     structure_features: list = field(default_factory=list)
@@ -57,18 +28,9 @@ class DataprepConfig:
 
 
 _GIN_MAP = [
-    (["codec", "name"], "codec_name"),
-    (["generation", "mode"], "generation_mode"),
-    (["atoms", "seconds"], "atoms_seconds"),
-    (["atoms", "hop_seconds"], "atoms_hop_seconds"),
-    (["atoms", "crossfade_seconds"], "atoms_crossfade_seconds"),
-    (["atoms", "type"], "atoms_type"),
-    (["atoms", "overlap"], "atoms_overlap"),
-    (["atoms", "window"], "atoms_window"),
-    (["ar", "block_seconds"], "ar_block_seconds"),
-    (["ar", "memory_seconds"], "ar_memory_seconds"),
-    (["ar", "stride_seconds"], "ar_stride_seconds"),
-    (["ar", "prefix_seconds"], "ar_prefix_seconds"),
+    (["codec"], "codec_name"),
+    (["conditioning_rate"], "conditioning_rate"),
+    (["conditioning_memory_seconds"], "conditioning_memory_seconds"),
     (["semantic", "context_seconds"], "semantic_context_seconds"),
     (["semantic", "random_extension"], "semantic_random_extension"),
     (["structure", "features"], "structure_features"),
@@ -77,7 +39,6 @@ _GIN_MAP = [
     (["splits", "reserve_ratio"], "reserve_split_ratio"),
     (["splits", "train_split"], "train_split"),
     (["splits", "val_split"], "val_split"),
-    (["dataset", "memory_buffer_atoms"], "memory_buffer_atoms"),
     (["dataset", "hop_atoms"], "hop_atoms"),
     (["seed"], "seed"),
     (["device"], "device"),
@@ -162,7 +123,8 @@ def _is_value_complete(value):
     return not stack and not in_single and not in_double
 
 
-def parse_gin_config(path: Path):
+# keys: a list that receives the dotted key of every assignment in file order (so a later line cannot hide an earlier one).
+def parse_gin_config(path: Path, keys=None):
     config = {}
     current_key = None
     value_parts = []
@@ -182,6 +144,8 @@ def parse_gin_config(path: Path):
                     continue
                 current_key = key
                 value_parts = [value]
+                if keys is not None:
+                    keys.append(key)
             else:
                 value_parts.append(line.strip())
 
@@ -217,8 +181,9 @@ def load_dataprep_config(gin_path: Path) -> DataprepConfig:
     if not path.exists():
         raise FileNotFoundError(f"Gin config not found: {path}")
 
-    raw = parse_gin_config(path)
-    _check_rejected_keys(raw, path)
+    written = []
+    raw = parse_gin_config(path, written)
+    _check_rejected_keys(written, path)
     cfg = DataprepConfig()
     for keys, attr in _GIN_MAP:
         val = _get_nested(raw, keys, None)
@@ -228,55 +193,42 @@ def load_dataprep_config(gin_path: Path) -> DataprepConfig:
     return cfg
 
 
-# Frame lines and the old AR key are not accepted in user gin files; the message gives the seconds equivalent.
-def _check_rejected_keys(raw, path):
-    for keys, new_key in _REJECTED_FRAME_KEYS.items():
-        val = _get_nested(raw, list(keys), None)
-        if val is not None:
-            old_key = ".".join(keys)
-            raise ConfigError(
-                f"{path}: '{old_key}' is not accepted any more (durations are in seconds, so they do not depend on the "
-                f"codec). At V1's 150 Hz it is: {new_key} = {frames_to_seconds_text(val)}. "
-                f"scripts/migrate_v1_gin.py converts a whole file."
-            )
-    if _get_nested(raw, ["atoms", "overlap_mode"], None) is not None:
-        raise ConfigError(f"{path}: 'atoms.overlap_mode' was removed: use atoms.type = \"independent\" and "
-                          f"atoms.overlap = \"normal\" | \"strong\" | \"brute\"")
-    if _get_nested(raw, ["atoms", "crossfade_law"], None) is not None:
-        raise ConfigError(f"{path}: 'atoms.crossfade_law' was removed: use atoms.window = \"hann\" | \"equal_power\" "
-                          f"(atoms.type \"consistent\" | \"independent\" only); legacy atoms keep their window")
-    if _get_nested(raw, ["ar", "context_seconds"], None) is not None:
-        raise ConfigError(f"{path}: 'ar.context_seconds' was renamed ar.memory_seconds (one past window).")
+# Dotted keys of a parsed gin dict (for files read without the list of written keys).
+def _flatten_keys(raw, prefix=""):
+    keys = []
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            keys += _flatten_keys(v, f"{prefix}{k}.")
+        else:
+            keys.append(f"{prefix}{k}")
+    return keys
+
+
+# Keys of the earlier designs: the geometry now follows from the three generation keys.
+def _check_rejected_keys(written, path):
+    for key in written:
+        if key == "codec.name":
+            raise ConfigError(f"{path}: 'codec.name' was renamed: write codec = \"<name>\" "
+                              f"(encodec24, spectrostream, encodec48, music2latent)")
+        if key == "generation.mode":
+            raise ConfigError(f"{path}: 'generation.mode' is not a key any more: the mode follows from the codec and "
+                              f"cannot be set")
+        if key.startswith(("atoms.", "ar.")) or key == "dataset.memory_buffer_atoms":
+            raise ConfigError(f"{path}: '{key}' is derived from conditioning_rate and conditioning_memory_seconds "
+                              f"(docs/generation_modes.html)")
 
 
 def _check_required(cfg, path):
-    from audio_codec_wrappers import list_codecs
+    from SCAPES.generation import CODECS, WRAPPER_TO_CANONICAL
 
+    users = [k for k, v in CODECS.items() if v.user]
     if cfg.codec_name is None:
-        raise ConfigError(f"{path}: 'codec.name' is required, one of {list_codecs()}")
-    if cfg.generation_mode is None:
-        raise ConfigError(f"{path}: 'generation.mode' is required, one of {list(MODES)}")
-    if cfg.generation_mode not in MODES:
-        raise ConfigError(f"{path}: generation.mode = {cfg.generation_mode!r} is invalid, choose from {list(MODES)}")
-    if cfg.generation_mode == "atoms":
-        required = [("atoms.seconds", cfg.atoms_seconds), ("dataset.memory_buffer_atoms", cfg.memory_buffer_atoms)]
-        if cfg.atoms_type in (None, "consistent"):      # independent atoms derive the hop from atoms.overlap
-            required.append(("atoms.hop_seconds", cfg.atoms_hop_seconds))
-        missing = [k for k, v in required if v is None]
-        if missing:
-            raise ConfigError(f"{path}: atoms mode requires {missing}")
-        if cfg.atoms_crossfade_seconds is None and cfg.atoms_type is None:
-            cfg.atoms_crossfade_seconds = 0.0
-    else:
-        missing = [k for k, v in [("ar.block_seconds", cfg.ar_block_seconds), ("ar.memory_seconds", cfg.ar_memory_seconds)]
-                   if v is None]
-        if missing:
-            raise ConfigError(f"{path}: autoregressive mode requires {missing}")
-        if cfg.memory_buffer_atoms is not None:
-            raise ConfigError(
-                f"{path}: dataset.memory_buffer_atoms has no meaning in autoregressive mode (one past window, no atom "
-                f"count); remove it and set ar.memory_seconds."
-            )
+        raise ConfigError(f"{path}: 'codec' is required, one of {users}")
+    if cfg.codec_name not in CODECS:
+        if cfg.codec_name in WRAPPER_TO_CANONICAL:
+            raise ConfigError(f"{path}: use the canonical name {WRAPPER_TO_CANONICAL[cfg.codec_name]} "
+                              f"instead of {cfg.codec_name!r}")
+        raise ConfigError(f"{path}: unknown codec {cfg.codec_name!r}, one of {users}")
 
 
 def _get_nested(config, keys, default=None):
@@ -358,8 +310,8 @@ class TrainingConfig:
     spectral_representation: bool = False
 
     # V2: per-channel standardisation of the latents, noise on the past (gamma), step budget, logging, seed
-    standardize_latents: bool = False
-    past_noise: float = 0.0
+    standardize_latents: Optional[bool] = None   # None: the codec's default (generation.py), filled by build_trainer
+    past_noise: Optional[float] = None           # None: the codec's default
     max_steps: Optional[int] = None   # None -> epochs with V1 patience
     val_every_steps: Optional[int] = None   # None -> validate once per epoch; else every N steps, patience counts validations
     log_every: int = 50

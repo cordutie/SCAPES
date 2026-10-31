@@ -1,13 +1,8 @@
-# SCAPES dataprep template (V2)
-# Copy to <dataset>/config/dataprep.gin and edit as needed. The codec, the generation mode and the geometry come from
-# a snippet in config/codecs/ (append its lines, or let pipeline.build_run_config do it). All durations are in seconds;
-# frame counts are not accepted (they mean different times for different codecs).
-#
-# The snippet sets: codec.name, generation.mode and
-#   atoms mode:  atoms.seconds, atoms.hop_seconds, atoms.crossfade_seconds, dataset.memory_buffer_atoms, and the new keys
-#                atoms.type ("consistent"; "independent" is phase 2), atoms.window ("hann" | "equal_power"),
-#                atoms.overlap (independent only, phase 2)
-#   AR mode:     ar.block_seconds, ar.memory_seconds, (optional) ar.stride_seconds, ar.prefix_seconds
+# SCAPES dataprep template (V3)
+# Copy to <dataset>/config/dataprep.gin and edit as needed. The codec, the generation mode and the geometry do not
+# appear here: they come from the three keys of config/generation.gin (codec, conditioning_rate,
+# conditioning_memory_seconds); see docs/generation_modes.html. All durations are in seconds; frame counts are not
+# accepted (they mean different times for different codecs).
 
 # Semantic conditioning
 semantic.context_seconds = 1.0

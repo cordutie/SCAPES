@@ -39,7 +39,7 @@ def test_two_codecs_coexist(tmp_path):
     s2 = run_dataprep(root, config_dir=root / "config_atoms", device="cuda", clap_embedder=stub_clap)
     assert s1.root != s2.root
     assert sorted(p.name for p in (root / "representations").iterdir()) == ["toy_causal__whole",
-                                                                             "toy_noncausal__atoms-f48-h16"]
+                                                                             "toy_noncausal__atoms-c288-h128"]
     f1, f2 = set(_all_files(s1.root)), set(_all_files(s2.root))
     assert f1 and f2 and not (f1 & f2)
     assert len(load_toy_dataset(root, config_dir=root / "config_ar")) > 0
@@ -95,12 +95,12 @@ def test_whole_file_slicing_exact(toy_ar):
 
 
 def test_per_atom_counts(toy_atoms):
-    """K = V1 _compute_atom_counts allowed_count, at the codec rate, with the CLAP window as context."""
+    """K = every full atom of the file at the codec rate (the CLAP window is applied by the dataset, not the store)."""
     root, store = toy_atoms
-    F, H, ctx = 48, 16, int(0.5 * TOY_RATE)
+    F, H = 36, 16
     seg, hop = F * TOY_HOP, H * TOY_HOP
     full = 1 + (N_TOY - seg) // hop
-    allowed = min(full, 1 + (N_TOY - ctx) // hop)
+    allowed = full
     for stem in ("a", "b"):
         d = store.load_latents(root / "raw" / f"{stem}.wav")
         assert d["latent"].shape == (allowed, TOY_D, F)

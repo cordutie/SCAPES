@@ -1,4 +1,4 @@
-"""Training, inference.gin, generation and validation audio for consistent / independent atoms (toy, GPU).
+"""Training, inference.gin, generation and validation audio for the atoms of the V3 geometry (toy, GPU).
 
 test_overfit_one_batch_new_type replaces the plan's weaker "loss decreases" check: it is the locked one-batch overfit
 protocol of tests/test_trainer.py (1000 steps on one fixed batch, last-20 mean <= 0.35 x first-5 mean; the 0.35 bound was
@@ -14,9 +14,9 @@ import soundfile as sf
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from _atoms_toy import RATE, TOY_GEOM, phase2, prepare_new_toy, toy_geometry
+from _atoms_toy import RATE, TOY_GEOM, prepare_new_toy, toy_geometry
 
-KINDS = ["consistent", pytest.param("independent", marks=phase2)]
+KINDS = ["consistent"]
 NO_REG = ["training.past_dropout = 0.0", "training.conditioning_dropout = 0.0", "training.past_noise = 0.0"]
 
 
@@ -40,8 +40,8 @@ def test_train_and_generate(tmp_path, kind):
     assert hist and all(math.isfinite(h["loss"]) for h in hist)
     C, H, X = TOY_GEOM[kind]
     gin = parse_gin_config(model_dir / "checkpoints" / "inference.gin")
-    assert gin["atoms"]["type"] == kind
-    assert (gin["atoms"]["chunk_samples"], gin["atoms"]["hop_samples"], gin["atoms"]["crossfade_samples"]) == (C, H, X)
+    res = gin["resolved"]
+    assert (res["atom_latents"], res["new_latents"], res["crossfade_latents"]) == (C // 8, H // 8, X // 8)
     engine = FlowInference(model_dir, device="cuda", checkpoint="last")
     assert engine.geom == _geom(cfg_dir)
     g = torch.Generator().manual_seed(0)
@@ -71,7 +71,7 @@ def test_overfit_one_batch_new_type(tmp_path):
     assert last <= 0.35 * first, f"{first:.3f} -> {last:.3f}"
 
 
-@pytest.mark.parametrize("kind", ["consistent", pytest.param("independent", marks=phase2), pytest.param("brute", marks=phase2)])
+@pytest.mark.parametrize("kind", ["consistent"])
 def test_units_for_seconds_new_types(tmp_path, kind):
     from SCAPES.pipeline import units_for_seconds
     g = toy_geometry(tmp_path, kind)
