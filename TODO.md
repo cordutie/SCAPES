@@ -16,7 +16,7 @@ Things left after the V3 redesign (two generation modes, one gin with three keys
 9. **Memory test (M).** The earlier plan to test how many past atoms are needed was deferred; memory is now chosen in seconds.
 
 ## Housekeeping
-10. **Push the submodule branch.** `external/audio_codec_wrappers` has a local branch `remove-codicodec` (CoDiCodec removed); the main repo points to its commit.
+10. **Merge the submodule branch.** `external/audio_codec_wrappers` has a branch `remove-codicodec` on its remote (CoDiCodec removed); the main repo points to its commit. Merge it into that repository's main branch.
 11. **Uninstall the `codicodec` pip package** (still installed in `venv_SCAPES`, unused) when convenient.
 12. **Old run folders** under `runs/` (phase-1 reports, evaluations and configs) are history; clean them together when sure they are not needed. The pruned checkpoints of phase 1 were already deleted.
 13. **Stale names in scripts.** Some study scripts keep old run-folder names (`microtex_encodec24k_ar`, ...) because they point to folders on disk. Rename or delete them with the old runs.
