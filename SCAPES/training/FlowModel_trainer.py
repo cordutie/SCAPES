@@ -336,7 +336,12 @@ class FlowTrainer:
         ]
         lines += g.to_gin_lines()
         f = g.frame_rate
-        if g.mode == "atoms":
+        if g.mode == "atoms" and g.atom_type != "frames":
+            r = g.sample_rate
+            lines += [f"# atoms.type = {g.atom_type}", f"# atoms.seconds = {g.atom_samples / r:.6g}",
+                      f"# atoms.hop_seconds = {g.hop_samples / r:.6g}",
+                      f"# atoms.crossfade_seconds = {g.crossfade_samples / r:.6g}"]
+        elif g.mode == "atoms":
             lines += [f"# atoms.seconds = {g.unit_frames / f:.6g}", f"# atoms.hop_seconds = {g.unit_hop_frames / f:.6g}",
                       f"# atoms.crossfade_seconds = {g.crossfade_samples / g.sample_rate:.6g}"]
         else:
@@ -751,15 +756,20 @@ class FlowTrainer:
             return
         import soundfile as sf
         from SCAPES.codecs import get_codec, get_codec_info
-        from SCAPES.data.geometry import crossfade_law_for
+        from SCAPES.data.geometry import window_for
         from SCAPES.inference.render import StreamRenderer, render_atoms
 
         self.model.eval()
         self.local_encoder.eval()
         g = self.geom
         codec = get_codec(g.codec, self.device)
-        step = g.unit_frames if self.mode == "autoregressive" else g.unit_hop_frames
-        num_units = max(1, int(self.val_duration * g.frame_rate // step))
+        if g.atom_type != "frames":
+            # sample-level atoms: the start key is the atom index k, consecutive atoms differ by one tick
+            step = g.hop_ticks
+            num_units = max(1, int(self.val_duration * g.sample_rate // g.hop_samples))
+        else:
+            step = g.unit_frames if self.mode == "autoregressive" else g.unit_hop_frames
+            num_units = max(1, int(self.val_duration * g.frame_rate // step))
         regions = self.dataset._regions
 
         for target_file in self.val_audio_files:
@@ -808,7 +818,7 @@ class FlowTrainer:
                     renderer.push(z)
                 audio = renderer.finish()
             else:
-                audio = render_atoms(codec, atoms, g, self.mu, self.std, law=crossfade_law_for(g, get_codec_info(g.codec)))
+                audio = render_atoms(codec, atoms, g, self.mu, self.std, window=window_for(g, get_codec_info(g.codec)))
 
             file_stem = Path(target_file).stem
             sf.write(self.val_dir / f"epoch_{epoch}_{file_stem}_TF.wav", audio.cpu().T.numpy(), g.sample_rate)

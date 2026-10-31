@@ -144,7 +144,9 @@ def _extend_row(audio, random_extension, expected_length, sample_rate, overlap_r
             segment = audio
         # === RANDOM MODE ===
         else:
-            min_length = T // 2
+            # every random segment must be longer than the overlap (no stalled iterations)
+            min_length = max(T // 2, overlap + 1)
+            min_length = min(min_length, T)
             max_length = T
             segment_length = np.random.randint(min_length, max_length + 1)
 
@@ -162,7 +164,8 @@ def _extend_row(audio, random_extension, expected_length, sample_rate, overlap_r
         if first_segment:
             use_length = min(seg_len, remaining)
             output[:, :, pos:pos + use_length] = segment[:, :, :use_length]
-            pos += use_length
+            # the last `overlap` samples stay open so the next junction blends written audio
+            pos += use_length if use_length == remaining else use_length - overlap
             first_segment = False
             continue
 

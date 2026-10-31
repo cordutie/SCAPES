@@ -34,8 +34,9 @@ class DataprepConfig:
     atoms_seconds: Optional[float] = None
     atoms_hop_seconds: Optional[float] = None
     atoms_crossfade_seconds: Optional[float] = None
-    atoms_overlap_mode: Optional[str] = None      # normal | strong | brute (stochastic decoders): derives the hop
-    atoms_crossfade_law: Optional[str] = None     # hann | equal_power (None = by codec)
+    atoms_type: Optional[str] = None              # consistent | independent (None = legacy frames atoms)
+    atoms_overlap: Optional[str] = None           # independent only: normal | strong | brute (phase 2)
+    atoms_window: Optional[str] = None            # hann | equal_power (new types only; None = by codec)
     memory_buffer_atoms: Optional[int] = None
     # Autoregressive mode geometry, in seconds (one past window and the present block)
     ar_block_seconds: Optional[float] = None
@@ -61,8 +62,9 @@ _GIN_MAP = [
     (["atoms", "seconds"], "atoms_seconds"),
     (["atoms", "hop_seconds"], "atoms_hop_seconds"),
     (["atoms", "crossfade_seconds"], "atoms_crossfade_seconds"),
-    (["atoms", "overlap_mode"], "atoms_overlap_mode"),
-    (["atoms", "crossfade_law"], "atoms_crossfade_law"),
+    (["atoms", "type"], "atoms_type"),
+    (["atoms", "overlap"], "atoms_overlap"),
+    (["atoms", "window"], "atoms_window"),
     (["ar", "block_seconds"], "ar_block_seconds"),
     (["ar", "memory_seconds"], "ar_memory_seconds"),
     (["ar", "stride_seconds"], "ar_stride_seconds"),
@@ -237,6 +239,12 @@ def _check_rejected_keys(raw, path):
                 f"codec). At V1's 150 Hz it is: {new_key} = {frames_to_seconds_text(val)}. "
                 f"scripts/migrate_v1_gin.py converts a whole file."
             )
+    if _get_nested(raw, ["atoms", "overlap_mode"], None) is not None:
+        raise ConfigError(f"{path}: 'atoms.overlap_mode' was removed: use atoms.type = \"independent\" and "
+                          f"atoms.overlap = \"normal\" | \"strong\" | \"brute\"")
+    if _get_nested(raw, ["atoms", "crossfade_law"], None) is not None:
+        raise ConfigError(f"{path}: 'atoms.crossfade_law' was removed: use atoms.window = \"hann\" | \"equal_power\" "
+                          f"(atoms.type \"consistent\" | \"independent\" only); legacy atoms keep their window")
     if _get_nested(raw, ["ar", "context_seconds"], None) is not None:
         raise ConfigError(f"{path}: 'ar.context_seconds' was renamed ar.memory_seconds (one past window).")
 
@@ -252,12 +260,12 @@ def _check_required(cfg, path):
         raise ConfigError(f"{path}: generation.mode = {cfg.generation_mode!r} is invalid, choose from {list(MODES)}")
     if cfg.generation_mode == "atoms":
         required = [("atoms.seconds", cfg.atoms_seconds), ("dataset.memory_buffer_atoms", cfg.memory_buffer_atoms)]
-        if cfg.atoms_overlap_mode is None:      # with an overlap mode the hop is derived from it
+        if cfg.atoms_type in (None, "consistent"):      # independent atoms derive the hop from atoms.overlap
             required.append(("atoms.hop_seconds", cfg.atoms_hop_seconds))
         missing = [k for k, v in required if v is None]
         if missing:
             raise ConfigError(f"{path}: atoms mode requires {missing}")
-        if cfg.atoms_crossfade_seconds is None and cfg.atoms_overlap_mode is None:
+        if cfg.atoms_crossfade_seconds is None and cfg.atoms_type is None:
             cfg.atoms_crossfade_seconds = 0.0
     else:
         missing = [k for k, v in [("ar.block_seconds", cfg.ar_block_seconds), ("ar.memory_seconds", cfg.ar_memory_seconds)]

@@ -18,6 +18,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -39,23 +40,47 @@ CLAP_WINDOW_SECONDS = 8.0     # the CLAP wrapper pads or trims every input to 8 
 
 # ─── units, real past and real CLAP ───
 
-# Start frames (codec frames) of the units of the model that fit in the first `seconds`: an atom [t, t+F) with t = k H,
-# an AR block [t, t+B) with t = k B.
-def unit_starts(geom, seconds: float) -> list:
-    total = int(np.floor(seconds * geom.frame_rate + 1e-6))
+# Start ticks of the units of the model that fit in [start, start + seconds): codec frames for legacy (an atom [t, t+F)
+# with t = k H, an AR block [t, t+B) with t = k B), atom indices k for the sample-level types (atom k covers
+# [kH, kH + C) samples). Legacy with start_seconds = 0 is the original rule.
+def unit_starts(geom, seconds: float, start_seconds: float = 0.0) -> list:
+    if geom.atom_type != "frames":
+        r, C, H = geom.sample_rate, geom.atom_samples, geom.hop_samples
+        k0 = math.ceil(start_seconds * r / H - 1e-9)
+        end = (start_seconds + seconds) * r
+        ks = []
+        k = k0
+        while k * H + C <= end + 1e-6:
+            ks.append(k)
+            k += 1
+        return ks
     step = geom.unit_hop_frames
-    return [k * step for k in range((total - geom.unit_frames) // step + 1)] if total >= geom.unit_frames else []
+    first = math.ceil(start_seconds * geom.frame_rate / step - 1e-9) * step
+    total = int(np.floor((start_seconds + seconds) * geom.frame_rate + 1e-6))
+    return list(range(first, total - geom.unit_frames + 1, step))
+
+
+# Check that the rendered length is the overlap-add length of n_units atoms, (n-1) H + C, and that the audio missing
+# against `seconds` is less than one hop (no atom is missing). AR geometries: None.
+def duration_check(geom, n_units: int, out_len: int, seconds: float):
+    if geom.mode == "autoregressive":
+        return None
+    C, H = geom.atom_samples, geom.hop_samples
+    expected = (n_units - 1) * H + C
+    shortfall = seconds * geom.sample_rate - out_len
+    return {"expected": expected, "got": out_len, "shortfall_samples": shortfall,
+            "ok": bool(out_len == expected and 0 <= shortfall < H)}
 
 
 # Real units of one file as the timeline wants them (model units, [1, frame_dim, U] each) and the real CLAP embedding of
 # every unit. latents: the stored dict of the representation; clap: the stored [G, 1024] array of the grid
 # g * stride_frames; standardise: engine._standardise (identity when the model is not standardised).
 def real_units(geom, latents: dict, clap: torch.Tensor, starts: list, standardise=lambda z: z):
-    if geom.stride_frames != geom.unit_hop_frames:
+    if geom.stride_ticks != geom.hop_ticks:
         raise NotImplementedError("the CLAP grid has a stride different from the unit hop: not supported by this tool")
     units, claps = [], []
     for t in starts:
-        k = t // geom.unit_hop_frames
+        k = t // geom.hop_ticks
         if geom.mode == "autoregressive":
             z = latents["latent"][:, t:t + geom.unit_frames].float().unsqueeze(0)
             z = standardise(z)
@@ -68,7 +93,7 @@ def real_units(geom, latents: dict, clap: torch.Tensor, starts: list, standardis
                 scale = latents["scale"][k].float().reshape(1, 1, 1).expand(1, 1, geom.unit_frames)
                 z = torch.cat([z, scale], dim=1)
         units.append(z)
-        claps.append(clap[t // geom.stride_frames].float())
+        claps.append(clap[t // geom.stride_ticks].float())
     return units, claps
 
 
@@ -86,7 +111,7 @@ def generate_teacher_forced(engine, units, claps, nfe: int, cfg: float, seed: in
 # (overlap-add with the raw stored scales for atoms, the streaming decoder for AR).
 @torch.no_grad()
 def codec_roundtrip(engine, units) -> torch.Tensor:
-    from SCAPES.data.geometry import crossfade_law_for
+    from SCAPES.data.geometry import window_for
     from SCAPES.inference.render import StreamRenderer, render_atoms
     g = engine.geom
     if g.mode == "autoregressive":
@@ -96,7 +121,7 @@ def codec_roundtrip(engine, units) -> torch.Tensor:
         return renderer.finish().cpu()
     units = [u.to(engine.device) for u in units]
     return render_atoms(engine.codec, units, g, engine.mu, engine.std, base_seed=0, smooth=[False] * len(units),
-                        law=crossfade_law_for(g, engine.info)).cpu()
+                        window=window_for(g, engine.info)).cpu()
 
 
 # ─── audio files ───
@@ -163,7 +188,7 @@ def mean_over_files(per_file: dict) -> dict:
 def run_model(args):
     from SCAPES.auxiliar.clap_wrapper import CLAPWrapper
     from SCAPES.data.dataprep.semantic import load_audio_48k
-    from SCAPES.data.representations import RepresentationStore
+    from SCAPES.data.representations import RepresentationStore, ticks_to_samples_48k
     from SCAPES.inference.FlowInference import FlowInference
 
     out_root = Path(args.out)
@@ -181,7 +206,7 @@ def run_model(args):
     ckpt_names = engine._resolve_checkpoint_names(args.checkpoint, model_dir)
     ckpt_paths = [model_dir / "checkpoints" / n for n in ckpt_names]
     print(f"model {args.name}: codec {geom.codec}, mode {geom.mode}, unit {geom.unit_frames} frames, hop "
-          f"{geom.unit_hop_frames}, checkpoint {ckpt_names[0]} (sha256 {file_sha(ckpt_paths[0])})", flush=True)
+          f"{geom.unit_hop_frames} frames ({geom.hop_samples} samples), checkpoint {ckpt_names[0]} (sha256 {file_sha(ckpt_paths[0])})", flush=True)
 
     store = RepresentationStore(dataset, geom, info)
     store.ensure()      # raises if the stored representation was built with another codec or geometry
@@ -189,8 +214,13 @@ def run_model(args):
     files = sorted((dataset / "raw").glob("*.wav"))
     if args.max_files:
         files = files[:args.max_files]
-    starts = unit_starts(geom, SECONDS)
+    starts = unit_starts(geom, SECONDS, args.start_seconds)
     print(f"{len(files)} files, {len(starts)} units of {geom.unit_frames} frames per file, CLAP key {clap_key}", flush=True)
+    # the reference starts where the first unit starts (48 kHz); the KAD floor is another region of the same files
+    a0 = int(ticks_to_samples_48k(np.array([starts[0]]), geom)[0])
+    floor_start = args.start_seconds + SECONDS if args.floor_start_seconds is None else args.floor_start_seconds
+    f0 = int(round(floor_start * em.SR))
+    duration_checks = {}
 
     sr_codec = info.sample_rate
     a = int(em.EXCLUDE_SECONDS * em.SR)
@@ -204,22 +234,25 @@ def run_model(args):
         stem = path.stem
         audio = load_audio_48k(path).numpy()
         n10 = int(SECONDS * em.SR)
-        write_wav(out_root / "original_10s" / f"{stem}.wav", audio[:, :n10], em.SR)
-        ref[stem] = em.to_mono(audio[:, :n10])
-        ref_next[stem] = em.to_mono(audio[:, n10:2 * n10])
+        write_wav(out_root / "original_10s" / f"{stem}.wav", audio[:, a0:a0 + n10], em.SR)
+        ref[stem] = em.to_mono(audio[:, a0:a0 + n10])
+        ref_next[stem] = em.to_mono(audio[:, f0:f0 + n10])
 
         latents = store.load_latents(path)
         clap = store.load_grid_array("clap", clap_key, path)
         units, claps = real_units(geom, latents, clap, starts, engine._standardise)
         t1 = time.time()
         g_audio = generate_teacher_forced(engine, units, claps, args.nfe, args.cfg, args.seed)
-        write_wav(model_out / "generated" / f"{stem}.wav", g_audio.numpy(), sr_codec)
+        if not args.no_wav:
+            write_wav(model_out / "generated" / f"{stem}.wav", g_audio.numpy(), sr_codec)
+        duration_checks[stem] = duration_check(geom, len(starts), g_audio.shape[-1], SECONDS)
         peaks[(stem, "generated")] = float(g_audio.abs().max())
         gen[stem] = em.to_mono(em.resample_to_48k(g_audio.numpy(), sr_codec))
         msg = f"  [{i + 1}/{len(files)}] {stem}: generated {g_audio.shape[-1] / sr_codec:.2f} s in {time.time() - t1:.1f} s"
         if args.codec_roundtrip == "on":
             r_audio = codec_roundtrip(engine, units)
-            write_wav(model_out / "codec_roundtrip" / f"{stem}.wav", r_audio.numpy(), sr_codec)
+            if not args.no_wav:
+                write_wav(model_out / "codec_roundtrip" / f"{stem}.wav", r_audio.numpy(), sr_codec)
             peaks[(stem, "codec_roundtrip")] = float(r_audio.abs().max())
             rt[stem] = em.to_mono(em.resample_to_48k(r_audio.numpy(), sr_codec))
             msg += f", round trip {r_audio.shape[-1] / sr_codec:.2f} s"
@@ -290,7 +323,12 @@ def run_model(args):
                        "flow_sha256_12": file_sha(ckpt_paths[0])},
         "geometry": {"unit_frames": geom.unit_frames, "unit_hop_frames": geom.unit_hop_frames,
                      "memory_units": geom.memory_units, "frame_rate": geom.frame_rate,
-                     "codec_sample_rate": sr_codec, "units_per_file": len(starts)},
+                     "codec_sample_rate": sr_codec, "units_per_file": len(starts), "atom_type": geom.atom_type,
+                     "atom_samples": geom.atom_samples, "hop_samples": geom.hop_samples,
+                     "crossfade_samples": geom.crossfade_samples, "window": geom.window,
+                     "memory_seconds": geom.memory_seconds, "start_seconds": args.start_seconds,
+                     "floor_start_seconds": floor_start},
+        "duration_check": duration_checks,
         "generation": {"seed": args.seed, "nfe": args.nfe, "cfg": args.cfg, "files": stems,
                        "dataset": str(dataset), "clap_key": clap_key, "seconds": SECONDS,
                        "resampled_to_48k": sr_codec != em.SR, "peak_gpu_gb": gen_gpu_peak_gb},
@@ -512,6 +550,9 @@ def main():
     ap.add_argument("--n-boot", type=int, default=200)
     ap.add_argument("--note", default="", help="free text kept in metrics.json and shown in the summary")
     ap.add_argument("--max-files", type=int, default=0, help="debug: only the first N files")
+    ap.add_argument("--start-seconds", type=float, default=0.0, help="the 10 s region starts at the first unit at or after S")
+    ap.add_argument("--floor-start-seconds", type=float, default=None, help="KAD floor region start (default start + 10)")
+    ap.add_argument("--no-wav", action="store_true", help="do not write generated or round-trip wavs")
     ap.add_argument("--summarize-only", action="store_true")
     args = ap.parse_args()
     if not args.summarize_only:

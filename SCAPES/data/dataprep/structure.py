@@ -1,6 +1,7 @@
 import math
 from typing import List, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -193,6 +194,8 @@ def _compute_structure_features(
     return stacked
 
 def structure_key(features, geom) -> str:
+    if geom.atom_type != "frames":
+        return f"{'+'.join(features)}__c{geom.atom_samples}__stride{geom.stride_samples}s"
     return f"{'+'.join(features)}__u{geom.unit_frames}__stride{geom.stride_frames}"
 
 
@@ -214,7 +217,10 @@ def precompute_structure_annotations(dataset, batch_size: int = 1, device: str =
     # V1 analysis settings, with the frame length of the codec at 48 kHz
     hop48 = int(round(geom.hop_length * 48000 / geom.sample_rate))
     n_fft = max(256, hop48 * 4)
-    window = int(frames_to_samples_48k(geom.unit_frames, geom))
+    if geom.atom_type != "frames":
+        window = int(np.rint(geom.atom_samples * 48000 / geom.sample_rate))
+    else:
+        window = int(frames_to_samples_48k(geom.unit_frames, geom))
 
     print(f"\n--- Structure pre-computation ({key}) ---")
     for fname in tqdm(dataset.filenames, desc="Processing structure"):

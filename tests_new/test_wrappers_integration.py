@@ -9,9 +9,15 @@ from pathlib import Path
 import pytest
 import torch
 
+PHASE = int(os.environ.get("SCAPES_PHASE", "1"))
+
 REPO = Path(__file__).resolve().parents[1]
 CODECS = ["encodec24k", "spectrostream", "encodec48k", "codicodec", "music2latent"]
-PIPELINE_CASES = CODECS + ["codicodec_grains"]
+PIPELINE_CASES = CODECS + (["music2latent_independent", "codicodec_independent"] if PHASE >= 2 else [])   # design D24
+# snippet of every case in scripts/s2_smoke.py ("music2latent" runs the consistent template, phase 1)
+SNIPPETS = {"encodec48k": "encodec48k_atoms.gin", "codicodec": "codicodec_atoms.gin",
+            "music2latent": "music2latent_consistent.gin", "music2latent_independent": "music2latent_independent.gin",
+            "codicodec_independent": "codicodec_independent.gin"}
 SMOKE_DATASET = REPO.parent / "datasets" / "micro_microtex"
 
 
@@ -88,13 +94,23 @@ def test_pipeline_runs_for_every_codec(tmp_path):
         art = res["artefacts"]
         assert art["best_flow_model"] and art["inference_gin"] and art["wav_10s"], f"{name}: {art}"
         assert res["train"]["all_finite"], name
-        if name in ("encodec48k", "codicodec", "music2latent", "codicodec_grains"):
+        if name in SNIPPETS:
             _check_atoms_generation(out / name / "model", name)
 
 
+def _expected_window(name):
+    """hann for EnCodec 48k, the by-codec default for the legacy CoDiCodec atoms, the template's atoms.window otherwise."""
+    from SCAPES.data.config_loader import parse_gin_config
+    if name == "encodec48k":
+        return "hann"
+    if name == "codicodec":
+        return "equal_power"
+    return parse_gin_config(REPO / "SCAPES" / "config" / "codecs" / SNIPPETS[name])["atoms"]["window"]
+
+
 def _check_atoms_generation(model_dir, name):
-    """Generation with the trained atoms model: finite audio of the length the geometry gives, with the crossfade law of the codec."""
-    from SCAPES.data.geometry import crossfade_law_for
+    """Generation with the trained atoms model: finite audio of the length the geometry gives, with the window of the codec."""
+    from SCAPES.data.geometry import window_for
     from SCAPES.inference.FlowInference import FlowInference
     g = torch.Generator().manual_seed(0)
     clap = [torch.nn.functional.normalize(torch.randn(1024, generator=g), dim=0) for _ in range(5)]
@@ -102,5 +118,5 @@ def _check_atoms_generation(model_dir, name):
     audio = engine.generate_soundscape(clap, nfe=2, cfg_scale=1.0, seed=0)
     geom = engine.geom
     assert torch.isfinite(audio).all()
-    assert audio.shape[-1] == (len(clap) - 1) * geom.audio_hop_samples + geom.unit_frames * geom.hop_length
-    assert crossfade_law_for(geom, engine.info) == ("hann" if name == "encodec48k" else "equal_power")
+    assert audio.shape[-1] == (len(clap) - 1) * geom.hop_samples + geom.atom_samples
+    assert window_for(geom, engine.info) == _expected_window(name)

@@ -61,6 +61,8 @@ def main():
     scratch = Path(args.scratch)
     shutil.rmtree(scratch, ignore_errors=True)
     trainer = build_trainer(args.dataset, scratch, config_dir=args.config_dir)
+    if trainer.geom.atom_type != "frames":
+        raise NotImplementedError("past_usage_eval.py supports frame-based geometries only")
     ck = Path(args.model_dir) / "checkpoints"
     trainer.model.load_state_dict(torch.load(ck / f"{args.checkpoint}_flow_model.pt", map_location=trainer.device)["model_state_dict"])
     trainer.local_encoder.load_state_dict(

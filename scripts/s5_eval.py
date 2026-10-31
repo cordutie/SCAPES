@@ -162,6 +162,8 @@ def evaluate_codec(args, name: str, run_dir: Path) -> dict:
         cfg_dir = Path(args.dataset) / "config"
     engine = FlowInference(model_dir, device=device, checkpoint=args.checkpoint)
     geom = engine.geom
+    if geom.atom_type != "frames":
+        raise NotImplementedError("s5_eval.py supports frame-based geometries only")
     cfg = load_dataprep_config(cfg_dir / "dataprep.gin")
     dataset = AtomSequenceDataset(args.dataset, cfg, requested_keys={"target_semantic"}, device="cpu", verbose=False)
     if (dataset.geom.mode, dataset.geom.codec, dataset.geom.unit_frames, dataset.geom.unit_hop_frames,

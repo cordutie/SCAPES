@@ -12,7 +12,7 @@ import torch
 
 # rep.json fields that must match for a folder to be reused (created and scapes_git are bookkeeping)
 _IDENTITY = ("key", "codec", "codec_weights", "sample_rate", "hop_length", "latent_dim", "frame_quantum", "encoding",
-             "unit_frames", "unit_hop_frames")
+             "unit_frames", "unit_hop_frames", "atom_type", "chunk_samples", "hop_samples")
 
 
 class RepresentationMismatch(RuntimeError):
@@ -26,11 +26,17 @@ def frames_to_samples_48k(frames, geom):
     return out.astype(np.int64)
 
 
-# Start samples (48 kHz) of the grid g * stride_frames whose window of `window_samples` fits in the file.
+# Ticks (a codec frame for legacy atoms, the hop for the sample-level types) -> samples at 48 kHz, rounded half-to-even.
+def ticks_to_samples_48k(ticks, geom):
+    out = np.rint(np.asarray(ticks, dtype=np.float64) * geom.tick_samples * 48000.0 / geom.sample_rate)
+    return out.astype(np.int64)
+
+
+# Start samples (48 kHz) of the grid g * stride_ticks whose window of `window_samples` fits in the file.
 def grid_starts_48k(num_samples_48k: int, geom, window_samples: int) -> np.ndarray:
-    step = geom.stride_frames * geom.hop_length * 48000.0 / geom.sample_rate
+    step = geom.stride_samples * 48000.0 / geom.sample_rate
     guess = int(max(0, (num_samples_48k - window_samples) / step)) + 3
-    starts = frames_to_samples_48k(np.arange(guess) * geom.stride_frames, geom)
+    starts = ticks_to_samples_48k(np.arange(guess) * geom.stride_ticks, geom)
     return starts[starts + window_samples <= num_samples_48k]
 
 
@@ -62,7 +68,10 @@ class RepresentationStore:
         rep = {"key": self.key, "codec": g.codec, "codec_weights": info.weights, "sample_rate": g.sample_rate,
                "hop_length": g.hop_length, "latent_dim": g.latent_dim, "frame_quantum": g.frame_quantum,
                "encoding": g.encoding}
-        if g.encoding != "whole":
+        if g.atom_type != "frames":
+            rep.update({"atom_type": g.atom_type, "chunk_samples": g.atom_samples, "hop_samples": g.hop_samples,
+                        "unit_frames": g.unit_frames})
+        elif g.encoding != "whole":
             rep["unit_frames"] = g.unit_frames
             rep["unit_hop_frames"] = g.unit_hop_frames
         return rep
@@ -109,6 +118,8 @@ class RepresentationStore:
         return torch.load(self.latent_path(audio_path), map_location="cpu", weights_only=True)
 
     def clap_key(self, clap_version: str, context_seconds: float, random_extension: bool) -> str:
+        if self.geom.atom_type != "frames":
+            return f"{clap_version}__ctx{context_seconds:g}__rext{int(random_extension)}__stride{self.geom.stride_samples}s"
         return f"{clap_version}__ctx{context_seconds:g}__rext{int(random_extension)}__stride{self.geom.stride_frames}"
 
     def grid_path(self, kind: str, key: str, audio_path) -> Path:

@@ -86,6 +86,42 @@ def write_meta():
     (OUT / "SHA256SUMS").write_text(sums)
 
 
+# Regenerate only clap_ref.pt after the audio_extender fix; the stored audio must be the same.
+def regenerate_clap():
+    import datetime
+    from SCAPES.auxiliar.clap_wrapper import CLAPWrapper
+    path = OUT / "clap_ref.pt"
+    old = torch.load(path, map_location="cpu", weights_only=True)
+    audio = load_water(48000)
+    if not torch.equal(audio, old["audio"]):
+        print("FAIL  load_water(48000) differs from the stored audio")
+        sys.exit(1)
+    clap = CLAPWrapper(version="2023", use_cuda=True)
+    emb = clap.compute_embedding(audio.cuda(), og_sr=48000, random_extension=False)[0]
+    emb = emb.detach().float().cpu()
+    cos = F.cosine_similarity(old["embedding"].flatten(), emb.flatten(), dim=0).item()
+    print(f"cosine(old, new) = {cos:.6f}")
+    torch.save({"audio": audio, "embedding": emb}, path)
+    # Rewrite only the clap_ref.pt line of SHA256SUMS.
+    sums_path = OUT / "SHA256SUMS"
+    lines = []
+    for line in sums_path.read_text().splitlines():
+        if line.split()[1] == "clap_ref.pt":
+            line = f"{sha256(path)}  clap_ref.pt"
+        lines.append(line)
+    sums_path.write_text("\n".join(lines) + "\n")
+    meta_path = OUT / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["clap_ref_regenerated"] = {
+        "date": datetime.date.today().isoformat(),
+        "git_head": git_out("rev-parse", "HEAD"),
+        "reason": "audio_extender first-junction fix (pos = use_length - overlap)",
+        "cos_old_new": cos,
+    }
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+    print("regenerated", path)
+
+
 def check():
     ok = True
 
@@ -120,9 +156,13 @@ def check():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--only", choices=["clap"], help="regenerate only this fixture")
     args = ap.parse_args()
     if args.check:
         sys.exit(0 if check() else 1)
+    if args.only == "clap":
+        regenerate_clap()
+        sys.exit(0)
     OUT.mkdir(parents=True, exist_ok=True)
     make_clap()
     make_encodec()

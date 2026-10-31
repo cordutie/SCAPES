@@ -11,8 +11,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 
 from SCAPES.data.config_loader import (parse_gin_config, _get_nested, _SIZE_TABLE, ConfigError, load_dataprep_config)
-from SCAPES.data.geometry import crossfade_law_for, geometry_from_inference_gin, resolve_geometry
+from SCAPES.data.geometry import window_for, geometry_from_inference_gin, resolve_geometry
 from SCAPES.data.representations import frames_to_samples_48k
+from SCAPES.data.geometry import atom_count
 from SCAPES.models.flow.FlowModel import FlowModel
 from SCAPES.models.factorization.LocalEncoder import LocalEncoder
 from SCAPES.data.dataprep.structure import _compute_structure_features
@@ -551,6 +552,12 @@ class FlowInference:
     # Start samples (48 kHz) of the generation units that fit in `total_samples`, and the unit length in 48 kHz samples
     def _unit_starts(self, total_samples):
         g = self.geom
+        if g.atom_type != "frames":
+            # sample-level atoms: K atoms of C samples every H samples at the codec rate, positions mapped to 48 kHz
+            N = int(total_samples * g.sample_rate // self.load_sr)
+            K = atom_count(N, g.atom_samples, g.hop_samples)
+            starts = [int(round(k * g.hop_samples * self.load_sr / g.sample_rate)) for k in range(K)]
+            return starts, int(round(g.atom_samples * self.load_sr / g.sample_rate))
         seg = int(frames_to_samples_48k(g.unit_frames, g))
         starts = []
         k = 0
@@ -576,6 +583,18 @@ class FlowInference:
             z = self._standardise(enc.z)
             for k in range(len(starts)):
                 units.append(z[:, :, k * g.unit_frames:(k + 1) * g.unit_frames])
+            return units
+        if g.atom_type != "frames":
+            # segments are cut at the codec rate and encoded on their own, in batches of 64
+            x = self.codec.prepare(audio_tensor, self.load_sr)
+            C, H = g.atom_samples, g.hop_samples
+            for b0 in range(0, len(starts), 64):
+                segs = torch.stack([x[0, :, k * H:k * H + C] for k in range(b0, min(len(starts), b0 + 64))])
+                enc = self.codec.encode(segs, g.sample_rate)
+                z = self._standardise(enc.z)
+                if g.has_scale:
+                    z = torch.cat([z, enc.scale.reshape(-1, 1, 1).expand(-1, 1, z.shape[-1])], dim=1)
+                units += [z[i:i + 1] for i in range(z.shape[0])]
             return units
         for start in starts:
             enc = self.codec.encode(audio_tensor[:, :, start:start + seg], self.load_sr)
@@ -818,7 +837,7 @@ class FlowInference:
             if self.verbose:
                 print("\n--- Rendering Audio Timeline (Smooth Mode) ---")
             audio = render_atoms(self.codec, units, g, self.mu, self.std, base_seed=seed, smooth=generated,
-                                 law=crossfade_law_for(g, self.info))
+                                 window=window_for(g, self.info))
         final_audio_tensor = audio.cpu()
 
         if output_path:

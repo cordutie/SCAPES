@@ -74,6 +74,8 @@ def evaluate(args, trainer, model_dir, out_dir):
     engine = FlowInference(model_dir, checkpoint="last")
     g = engine.geom
     B = g.unit_frames
+    if g.atom_type != "frames":
+        raise NotImplementedError("ar_falsifier.py supports frame-based geometries only")
     n_blocks = max(2, math.ceil(args.gen_seconds * g.frame_rate / B))
     dataset = trainer.dataset
     regions = dataset._regions

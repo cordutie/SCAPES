@@ -121,6 +121,8 @@ def build_engine(args, mode, seed):
         torch.nn.init.normal_(engine.model.transformer.output_proj.weight, mean=0.0, std=0.02)
     if args.cfg_batch:
         patch_cfg_batch(engine.model)
+    if engine.geom.atom_type != "frames":
+        raise NotImplementedError("measure_rtf.py supports frame-based geometries only")
     return engine
 
 

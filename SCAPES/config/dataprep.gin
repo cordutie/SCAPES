@@ -4,7 +4,9 @@
 # frame counts are not accepted (they mean different times for different codecs).
 #
 # The snippet sets: codec.name, generation.mode and
-#   atoms mode:  atoms.seconds, atoms.hop_seconds, atoms.crossfade_seconds, dataset.memory_buffer_atoms
+#   atoms mode:  atoms.seconds, atoms.hop_seconds, atoms.crossfade_seconds, dataset.memory_buffer_atoms, and the new keys
+#                atoms.type ("consistent"; "independent" is phase 2), atoms.window ("hann" | "equal_power"),
+#                atoms.overlap (independent only, phase 2)
 #   AR mode:     ar.block_seconds, ar.memory_seconds, (optional) ar.stride_seconds, ar.prefix_seconds
 
 # Semantic conditioning

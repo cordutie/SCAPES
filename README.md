@@ -72,7 +72,7 @@ Notes:
 
 Supported codecs: `encodec24k`, `spectrostream` (causal, autoregressive mode), `encodec48k`, `codicodec`, `music2latent` (non-causal, atoms mode). Configuration templates are in `SCAPES/config/codecs/`.
 
-In atoms mode the generated atoms are decoded one by one and overlap-added. EnCodec 48k has a deterministic decoder: it uses a long overlap and a Hann crossfade. CoDiCodec and Music2Latent have stochastic decoders, so their atoms overlap only as much as the crossfade needs: `atoms.overlap_mode` (`normal`, `strong` = 25 %, `brute` = 50 %) sets the overlap, the hop follows from it, and the crossfade is equal power. CoDiCodec generates one atom at a time (grains, overlapped in the audio only); Music2Latent overlaps by a few shared latent frames. The overlap-add is always done on the decoded audio. The geometry, the two crossfade laws and diagrams for every codec and mode are in [docs/overlap_add.md](docs/overlap_add.md).
+In atoms mode the generated atoms are decoded one by one and overlap-added. EnCodec 48k has a deterministic decoder: it uses a long overlap and a Hann crossfade. Music2Latent uses consistent atoms (`atoms.type = "consistent"`): the hop is exactly 0.1 s, every segment is encoded on its own, and the atoms are crossfaded over 3782 samples with the window `atoms.window` (`equal_power` for its stochastic decoder, `hann` for a deterministic one; the window can be changed after training). `atoms.seconds` 0.18 / 0.37 / 0.55 / 0.74 give 2 / 4 / 6 / 8 latents per atom. Independent atoms (`atoms.type = "independent"`, with `atoms.overlap`) are not implemented yet. The overlap-add is always done on the decoded audio. The geometry, the windows and the figures are in [docs/overlap_add.md](docs/overlap_add.md).
 
 ## Pipeline
 

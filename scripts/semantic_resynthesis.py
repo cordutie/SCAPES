@@ -66,6 +66,8 @@ def run_codec(args, codec: str):
     tf_dir = Path(args.eval_tf) / CODECS[codec]
     engine = FlowInference(Path(args.runs) / codec / "model", device=args.device, checkpoint="best")
     geom, info = engine.geom, engine.info
+    if geom.atom_type != "frames":
+        raise NotImplementedError("semantic_resynthesis.py supports frame-based geometries only")
     store = RepresentationStore(args.dataset, geom, info)
     store.ensure()
     clap_key = store.clap_key("2023", geom.context_seconds, engine.semantic_random_extension)

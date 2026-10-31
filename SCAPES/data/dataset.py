@@ -12,7 +12,7 @@ from SCAPES.data.config_loader import DataprepConfig
 from SCAPES.data.dataprep.semantic import CLAP_VERSION, load_audio_48k
 from SCAPES.data.dataprep.structure import structure_key
 from SCAPES.data.geometry import resolve_geometry
-from SCAPES.data.representations import RepresentationStore, frames_to_samples_48k, grid_starts_48k
+from SCAPES.data.representations import RepresentationStore, frames_to_samples_48k, grid_starts_48k, ticks_to_samples_48k
 from SCAPES.data.splits import assign_region, region_bounds
 from audio_codec_wrappers.audio import adapt_audio
 
@@ -80,7 +80,11 @@ class AtomSequenceDataset(Dataset):
         self.semantic_random_extension = config.semantic_random_extension
         self.structure_feature_names = list(config.structure_features or [])
         self.context_samples = int(round(geom.context_seconds * SR))
-        self.target_samples = int(frames_to_samples_48k(geom.unit_frames, geom))
+        self.new_type = geom.atom_type != "frames"
+        if self.new_type:
+            self.target_samples = int(round(geom.atom_samples * SR / geom.sample_rate))
+        else:
+            self.target_samples = int(frames_to_samples_48k(geom.unit_frames, geom))
         self.clap_key = self.store.clap_key(CLAP_VERSION, geom.context_seconds, config.semantic_random_extension)
         self.structure_key = (structure_key(self.structure_feature_names, geom)
                               if self.structure_feature_names else None)
@@ -123,6 +127,8 @@ class AtomSequenceDataset(Dataset):
     # Valid target start frames t = g * stride: a full past, a target inside the file, a CLAP window that fits, and the
     # whole span [past start, max(target end, CLAP window end)] inside one region.
     def _enumerate(self):
+        if self.new_type:
+            return self._enumerate_new()
         g = self.geom
         f = g.frame_rate
         past = g.past_frames
@@ -151,10 +157,43 @@ class AtomSequenceDataset(Dataset):
                 regions.append(region)
         return indices, regions
 
+    # Sample-level atoms: grid start g is the atom k = g * stride_ticks. Needs k >= M (a full past) and k <= K - 1, a CLAP
+    # window that fits, and the span [(k - M) H, max(k H + C, k H + ctx)] inside one region.
+    def _enumerate_new(self):
+        g = self.geom
+        r, C, H, M = g.sample_rate, g.atom_samples, g.hop_samples, g.memory_units
+        ctx = g.context_seconds
+        indices, regions = [], []
+        for fname in self.filenames:
+            n48 = self._entries[fname]["num_samples_48k"]
+            count = len(grid_starts_48k(n48, g, self.context_samples))
+            if self.structure_feature_names:
+                count = min(count, len(grid_starts_48k(n48, g, self.target_samples)))
+            units = self._units[fname]
+            for gi in range(count):
+                k = gi * g.stride_ticks
+                if k < M:
+                    continue
+                if k > units - 1:
+                    break
+                span = ((k - M) * H / r, max((k * H + C) / r, k * H / r + ctx))
+                region = assign_region(span, self._bounds[fname])
+                if region is None:
+                    continue
+                indices.append((fname, k))
+                regions.append(region)
+        return indices, regions
+
     def _print_summary(self):
         g = self.geom
         print("\nDataset summary ---------------------------------------------------------------")
         print(f"    {len(self.filenames)} files, representation {self.store.key}")
+        if self.new_type:
+            counts = {r: self._regions.count(r) for r in ("train", "val", "reserve")}
+            print(f"    atom {g.atom_samples} samples, hop {g.hop_samples}, stride {g.stride_ticks} hops, past {g.memory_units} atoms")
+            print(f"    {len(self.all_indices)} samples: {counts}")
+            print(f"    Requested keys: {sorted(self.requested_keys)}")
+            return
         print(f"    unit {g.unit_frames} frames ({g.unit_frames / g.frame_rate:.4f} s), stride {g.stride_frames} frames, "
               f"past {g.past_frames} frames, conditioning rate {g.frame_rate / g.stride_frames:.2f} Hz")
         counts = {r: self._regions.count(r) for r in ("train", "val", "reserve")}
@@ -178,6 +217,8 @@ class AtomSequenceDataset(Dataset):
 
     # Start of the target in seconds
     def target_time(self, idx) -> float:
+        if self.new_type:
+            return self.all_indices[idx][1] * self.geom.hop_samples / self.geom.sample_rate
         return self.all_indices[idx][1] / self.geom.frame_rate
 
     # Per-channel mean and population std of the frames inside the region of the subset, over all files.
@@ -187,6 +228,8 @@ class AtomSequenceDataset(Dataset):
         region = getattr(subset, "region", None)
         if region is None:
             raise ValueError("latent_stats needs a subset from get_splits() or get_reserve()")
+        if self.new_type:
+            return self._latent_stats_new(region)
         f, H = self.geom.frame_rate, self.geom.unit_hop_frames
         total = torch.zeros(self.latent_dim, dtype=torch.float64)
         total_sq = torch.zeros(self.latent_dim, dtype=torch.float64)
@@ -203,6 +246,29 @@ class AtomSequenceDataset(Dataset):
             if t1 <= t0:
                 continue
             x = u[:, t0:t1].double()
+            total += x.sum(dim=1)
+            total_sq += (x * x).sum(dim=1)
+            n += x.shape[1]
+        if n == 0:
+            raise ValueError(f"no frames in region {region!r}")
+        mu = total / n
+        var = (total_sq / n - mu * mu).clamp_min(0.0)
+        return mu.float(), var.sqrt().clamp_min(1e-5).float()
+
+    # Sample-level atoms: every frame of every atom k with [kH/r, (kH+C)/r] inside the region (D9).
+    def _latent_stats_new(self, region):
+        g = self.geom
+        r, C, H = g.sample_rate, g.atom_samples, g.hop_samples
+        total = torch.zeros(self.latent_dim, dtype=torch.float64)
+        total_sq = torch.zeros(self.latent_dim, dtype=torch.float64)
+        n = 0
+        for fname in self.filenames:
+            u = self._latent[fname]
+            lo, hi = self._bounds[fname][region]
+            keep = [k for k in range(u.shape[0]) if lo - 1e-9 <= k * H / r and (k * H + C) / r <= hi + 1e-9]
+            if not keep:
+                continue
+            x = u[keep].double().permute(1, 0, 2).reshape(self.latent_dim, -1)
             total += x.sum(dim=1)
             total_sq += (x * x).sum(dim=1)
             n += x.shape[1]
@@ -234,7 +300,7 @@ class AtomSequenceDataset(Dataset):
         item = {"index": idx, "label": fname, "start_frame": t}
         u, scale = self._latent[fname], self._scale[fname]
         U, F, H, M = g.unit_frames, g.memory_frames, g.unit_hop_frames, g.memory_units
-        k = t // H
+        k = t if self.new_type else t // H
 
         if "memory_buffer_latent" in req or "memory_buffer_scale" in req:
             if g.mode == "autoregressive":
@@ -254,13 +320,13 @@ class AtomSequenceDataset(Dataset):
             item["target_scale"] = scale[k:k + 1].float().to(self.device)
 
         if "target_audio" in req or "target_context_audio" in req:
-            start = int(frames_to_samples_48k(t, g))
+            start = int(ticks_to_samples_48k(t, g)) if self.new_type else int(frames_to_samples_48k(t, g))
             if "target_audio" in req:
                 item["target_audio"] = self._raw_slice(fname, start, self.target_samples).to(self.device)
             if "target_context_audio" in req:
                 item["target_context_audio"] = self._raw_slice(fname, start, self.context_samples).to(self.device)
 
-        gi = t // g.stride_frames
+        gi = t // g.stride_ticks if self.new_type else t // g.stride_frames
         if "target_semantic" in req:
             item["target_semantic"] = self._clap[fname][gi].to(self.device)
         if "target_structure" in req:

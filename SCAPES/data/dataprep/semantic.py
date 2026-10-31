@@ -125,7 +125,7 @@ def build_semantics_folder(csv_path, output_dir, dataset, overwrite: bool = Fals
 
         # grid vectors whose start time lies in [start_sec, end_sec)
         arr = store.load_grid_array("clap", key, dataset.audio_path(name))
-        times = torch.arange(arr.shape[0], dtype=torch.float64) * geom.stride_frames / geom.frame_rate
+        times = torch.arange(arr.shape[0], dtype=torch.float64) * geom.stride_samples / geom.sample_rate
         chosen = (times >= start_sec) & (times < end_sec)
         if not bool(chosen.any()):
             print(f"  No semantic embeddings for '{raw_name}' [{start_sec}, {end_sec}]s; skipping.")

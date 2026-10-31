@@ -1,8 +1,19 @@
-"""Watchdog for a sequential training chain (senior abort rules: non-finite, traceback/OOM, ratio rule). Usage: watch_chain.py <runs dir> <codec> [<codec> ...]; the runs dir holds chain.pid and <codec>/{pid,train.log,model}; writes <codec>/watch_summary.json."""
-import json, math, os, signal, time, pathlib, re
+"""Watchdog for a sequential training chain (senior abort rules: non-finite, traceback/OOM, ratio rule).
+Usage: watch_chain.py <runs dir> <name> [<name> ...] [--step-rule] [--max-hours H]; the runs dir holds chain.pid and
+<name>/{pid,train.log,model}; writes <name>/watch_summary.json.
+--step-rule: replaces the epoch-ratio rule; once history_steps.json has entries with step >= 1000, kill if
+  mean(loss, steps 900-1000) / mean(loss, steps 50-150) > 0.9.
+--max-hours H: kill a run whose wall time exceeds H hours. A kill writes "KILLED: <why>" into watch_summary.json."""
+import argparse, json, math, os, signal, time, pathlib, re
 import sys
-P = pathlib.Path(sys.argv[1]).resolve()
-CODECS = sys.argv[2:]
+ap = argparse.ArgumentParser()
+ap.add_argument("runs")
+ap.add_argument("names", nargs="+")
+ap.add_argument("--step-rule", action="store_true")
+ap.add_argument("--max-hours", type=float, default=None)
+ARGS = ap.parse_args()
+P = pathlib.Path(ARGS.runs).resolve()
+CODECS = ARGS.names
 CHAIN = int(open(P / "chain.pid").read())
 
 def alive(pid):
@@ -21,12 +32,24 @@ def load(p):
 def entries(h):
     return h if isinstance(h, list) else (h or {}).get("entries", (h or {}).get("history", []))
 
+# mean loss over steps 900-1000 divided by mean loss over steps 50-150; None until an entry with step >= 1000 exists
+def step_ratio(es):
+    es = [e for e in es if isinstance(e, dict) and "step" in e and "loss" in e]
+    if not any(e["step"] >= 1000 for e in es):
+        return None
+    late = [e["loss"] for e in es if 900 <= e["step"] <= 1000]
+    early = [e["loss"] for e in es if 50 <= e["step"] <= 150]
+    if not late or not early:
+        return None
+    return (sum(late) / len(late)) / (sum(early) / len(early))
+
 def watch(c):
     r = P / c
     while not (r / "pid").exists():
         if not alive(CHAIN): return
         time.sleep(20)
     pid = int(open(r / "pid").read()); notes = []; done_ratio = False
+    t_start = time.time()
     def kill(why):
         notes.append("KILLED: " + why)
         try: os.kill(pid, signal.SIGTERM)
@@ -47,7 +70,15 @@ def watch(c):
         if re.search(r"Val \|[^\n]*nan", log, re.I): kill("nan on Val line")
         lh = load(r / "model/loss/loss_history.json") or {}
         tr = (lh.get("train") or {}).get("total") or []
-        if c != "codicodec" and not done_ratio and len(tr) >= 28:
+        if ARGS.max_hours is not None and (time.time() - t_start) / 3600 > ARGS.max_hours:
+            kill(f"wall time above {ARGS.max_hours} h")
+        if ARGS.step_rule and not done_ratio:
+            ratio = step_ratio(entries(load(r / "model/logs/history_steps.json")))
+            if ratio is not None:
+                done_ratio = True
+                notes.append(f"step ratio (loss 900-1000 / loss 50-150) {ratio:.3f} (kill > 0.9)")
+                if ratio > 0.9: kill(f"ratio {ratio:.3f} > 0.9")
+        if not ARGS.step_rule and c != "codicodec" and not done_ratio and len(tr) >= 28:
             ratio = tr[27] / tr[4]; done_ratio = True
             notes.append(f"epoch28/epoch5 train ratio {ratio:.3f} (kill > 0.9)")
             if ratio > 0.9: kill(f"ratio {ratio:.3f} > 0.9")
