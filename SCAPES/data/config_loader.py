@@ -370,18 +370,6 @@ def _resolve_size_table(cfg: TrainingConfig) -> TrainingConfig:
     return cfg
 
 
-# Options that were removed: a config that still sets one is refused, so that its effect is not silently lost
-REMOVED_TRAINING_KEYS = [["training", "spectral_representation"]]
-
-
-def refuse_removed_keys(raw, path):
-    """Raises NotImplementedError when a removed option is set in the parsed config."""
-    for keys in REMOVED_TRAINING_KEYS:
-        if _get_nested(raw, keys, None) is not None:
-            name = ".".join(keys)
-            raise NotImplementedError(f"{path}: {name} was removed; delete that line from the config")
-
-
 def load_training_config(gin_path: Path) -> TrainingConfig:
     path = Path(gin_path)
     if path.is_dir():
@@ -394,7 +382,6 @@ def load_training_config(gin_path: Path) -> TrainingConfig:
         raise FileNotFoundError(f"Gin config not found: {path}")
 
     raw = parse_gin_config(path)
-    refuse_removed_keys(raw, path)
     cfg = TrainingConfig()
     for keys, attr in _TRAINING_GIN_MAP:
         val = _get_nested(raw, keys, None)

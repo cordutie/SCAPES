@@ -10,8 +10,7 @@ from IPython.display import Audio, display
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-from SCAPES.data.config_loader import (parse_gin_config, _get_nested, _SIZE_TABLE, ConfigError, load_dataprep_config,
-                                       refuse_removed_keys)
+from SCAPES.data.config_loader import parse_gin_config, _get_nested, _SIZE_TABLE, ConfigError, load_dataprep_config
 from SCAPES.generation import print_resolution
 from SCAPES.data.geometry import geometry_from_inference_gin, resolve_geometry
 from SCAPES.data.representations import frames_to_samples_48k
@@ -326,7 +325,6 @@ class FlowInference:
                 "Run training first to generate this file."
             )
         raw = parse_gin_config(gin_path)
-        refuse_removed_keys(raw, gin_path)
         codec_name = raw.get("codec")
         if not isinstance(codec_name, str):
             raise ConfigError(f"{gin_path}: codec is required (this inference.gin was not written by this version)")

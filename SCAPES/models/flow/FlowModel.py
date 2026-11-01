@@ -205,10 +205,7 @@ class FlowModel(nn.Module):
     def prepare_memory(self, encoded_past: torch.Tensor) -> torch.Tensor:
         return self.memory_pos_enc(encoded_past)
 
-    # structure_vector is no longer used. It stays in the signature only because a locked test passes it.
-    def forward(self, x_t, s, context_vector, encoded_past, structure_vector=None):
-        if structure_vector is not None:
-            raise ValueError("structure features were removed: structure_vector must be None")
+    def forward(self, x_t, s, context_vector, encoded_past):
         precomputed_memory = self.prepare_memory(encoded_past)
         return self.transformer(x_t, precomputed_memory, context_vector, s)
 
