@@ -106,6 +106,15 @@ class Resolution:
         return self.atom + (self.memory_atoms - 1) * self.n
 
 
+def rate_range(spec: CodecSpec, n: int) -> tuple:
+    """(low, high) in Hz: the requested rates that resolve to n, as [low, high). The bounds are the midpoints in Hz
+    to the neighbouring rates (a midpoint goes to the smaller n, as in resolve_generation). None means no bound."""
+    r = spec.latent_rate
+    low = None if n == n_max(spec) else (r / n + r / (n + 1)) / 2
+    high = None if n == spec.n_min else (r / (n - 1) + r / n) / 2
+    return low, high
+
+
 def resolve_generation(codec, conditioning_rate=None, conditioning_memory_seconds=None) -> Resolution:
     if codec not in CODECS:
         users = [k for k, v in CODECS.items() if v.user]
@@ -126,13 +135,7 @@ def resolve_generation(codec, conditioning_rate=None, conditioning_memory_second
         d = abs(r / k - c)
         if d < best - 1e-12 * c:
             n, best = k, d
-    notes = []
-    if c > r / spec.n_min:
-        notes.append("clipped_fast")
-    elif c < r / hi:
-        notes.append("clipped_slow")
-    elif best > 1e-9 * c:
-        notes.append("snapped")
+    notes = ["snapped"] if best > 1e-9 * c else []
 
     m_l = math.ceil(r * m_s - 1e-9)
     common = dict(codec=codec, mode=spec.mode, latent_rate=r, requested_rate=c, requested_memory_seconds=m_s,
@@ -158,7 +161,9 @@ def rate_table(codec: str) -> list:
     spec = CODECS[codec]
     rows = []
     for n in range(spec.n_min, n_max(spec) + 1):
-        row = {"n": n, "rate_hz": spec.latent_rate / n, "step_seconds": n / spec.latent_rate}
+        low, high = rate_range(spec, n)
+        row = {"n": n, "rate_hz": spec.latent_rate / n, "range_low_hz": low, "range_high_hz": high,
+               "step_seconds": n / spec.latent_rate}
         if spec.mode == _AT:
             x, o, A = atom_geometry(spec, n)
             row.update(crossfade=x, overlapped=o, atom_latents=A, atom_seconds=A / spec.latent_rate,
@@ -179,13 +184,16 @@ def describe(res: Resolution) -> list:
     else:
         line = (head + f"block {res.n} latents = {res.hop_seconds:.3f} s | memory {mem} = {res.memory_latents} latents"
                 f" | attended {res.attended} latents (cap {CAP})")
+    low, high = rate_range(CODECS[res.codec], res.n)
+    if low is None:
+        span = f"range below {high:.2f} Hz"
+    elif high is None:
+        span = f"range above {low:.2f} Hz"
+    else:
+        span = f"range {low:.2f} to {high:.2f} Hz"
     texts = {
-        "snapped": f"conditioning_rate {res.requested_rate:g} Hz snapped to {res.rate:.2f} Hz "
-                   f"(nearest available rate, n = {res.n})",
-        "clipped_fast": f"conditioning_rate {res.requested_rate:g} Hz is above the fastest available rate, "
-                        f"clipped to {res.rate:.2f} Hz (n = {res.n})",
-        "clipped_slow": f"conditioning_rate {res.requested_rate:g} Hz is below the slowest available rate, "
-                        f"clipped to {res.rate:.2f} Hz (n = {res.n})",
+        "snapped": f"conditioning_rate {res.requested_rate:g} Hz is in the range of {res.rate:.2f} Hz "
+                   f"(n = {res.n}, {span})",
         "cap": f"memory {mem} needs more than {CAP} attended latents, reduced to {res.attended} latents",
         "memory_raised": f"memory {mem} is shorter than one block, raised to {res.memory_window} latents",
     }
