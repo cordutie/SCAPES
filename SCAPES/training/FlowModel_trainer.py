@@ -9,9 +9,8 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
 from SCAPES.auxiliar.losses_flow import (
-    flow_matching_loss, spectral_flow_matching_loss,
+    flow_matching_loss,
     time_phase_regularizer, fft_phase_regularizer,
-    time_to_spectral, spectral_to_time,
 )
 from SCAPES.data.config_loader import TrainingConfig
 from SCAPES.models.factorization.AtomDiscriminator import AtomDiscriminator
@@ -104,17 +103,8 @@ class FlowTrainer:
         self.atom_frames = geom.unit_frames
         self.context_vector_dim = 1024
 
-        self.spectral_mode = config.spectral_representation
-        if self.spectral_mode:
-            if geom.codec != "encodec48":
-                raise NotImplementedError("spectral_representation is only available for encodec48k (D13)")
-            self.spectral_frames = self.unit_frames // 2 + 1
-            self.frame_dim = 385  # 128*3 + 1
-            model_frames = self.spectral_frames
-        else:
-            self.spectral_frames = self.unit_frames
-            self.frame_dim = geom.frame_dim
-            model_frames = self.unit_frames + self.prefix_frames
+        self.frame_dim = geom.frame_dim
+        model_frames = self.unit_frames + self.prefix_frames
         if config.use_discriminator and geom.codec != "encodec48":
             raise NotImplementedError("use_discriminator is only available for encodec48k (D13)")
 
@@ -143,14 +133,8 @@ class FlowTrainer:
             raise NotImplementedError("autoregressive mode needs local_encoder.temporal_compression = 1 "
                                       "(one encoded frame per latent frame)")
 
-        # ─── Regularizers — incompatible with spectral representation ───
+        # ─── Regularizers (time_phase, fft_phase) ───
         self.regularizers_and_weights = config.regularizers_and_weights
-        if self.spectral_mode and self.regularizers_and_weights:
-            raise ValueError(
-                "Regularizers (time_phase, fft_phase) are incompatible with spectral_representation=True. "
-                "Phase is learned explicitly in the spectral domain. "
-                "Set training.regularizers_and_weights = [] or remove them from training.gin."
-            )
 
         # ─── Adversarial discriminator (optional, 2-stage) ───
         self.use_discriminator = config.use_discriminator
@@ -221,12 +205,8 @@ class FlowTrainer:
         self._save_inference_gin()
         self.logger = RunLogger(self.model_path / "logs", self.log_every)
 
-        if self.spectral_mode:
-            self.train_losses = {"total": [], "mag": [], "cos": [], "sin": [], "scale": []}
-            self.val_losses   = {"total": [], "mag": [], "cos": [], "sin": [], "scale": []}
-        else:
-            self.train_losses = {"total": [], "latent": [], "scale": []}
-            self.val_losses   = {"total": [], "latent": [], "scale": []}
+        self.train_losses = {"total": [], "latent": [], "scale": []}
+        self.val_losses   = {"total": [], "latent": [], "scale": []}
 
         # Epochs without improvement at the end of the saved history (restored on resume, so patience counts exactly)
         self.resume_no_improve = 0
@@ -331,14 +311,6 @@ class FlowTrainer:
             f"training.standardize_latents = {self.standardize}",
         ]
 
-        if self.spectral_mode:
-            lines.extend([
-                "",
-                "# ─── Spectral representation ───",
-                "training.spectral_representation = True",
-                f"atoms.spectral_frames = {self.spectral_frames}",
-            ])
-
         lines.extend([
             "",
             "# ─── Inference defaults ───",
@@ -365,19 +337,7 @@ class FlowTrainer:
         else:
             past_scale = present_scale = None
 
-        if self.spectral_mode:
-            # Transform past latents to spectral domain
-            B, N = past_latent.shape[:2]
-            past_latent_flat = past_latent.reshape(B * N, 128, self.atom_frames).transpose(1, 2)
-            past_spec_flat = time_to_spectral(past_latent_flat)
-            past_spec = past_spec_flat.reshape(B, N, self.spectral_frames, 384).transpose(2, 3)
-
-            past_scale_exp = past_scale.unsqueeze(-1).expand(
-                -1, -1, -1, self.spectral_frames
-            )
-
-            past_memory = torch.cat([past_spec, past_scale_exp], dim=2)
-        elif self.has_scale:
+        if self.has_scale:
             past_scale_exp = past_scale.unsqueeze(-1).expand(
                 -1, -1, -1, past_latent.size(-1)
             )
@@ -443,20 +403,11 @@ class FlowTrainer:
     def _plot_and_save_losses(self, current_epoch):
         has_val = self.val_loader is not None
 
-        if self.spectral_mode:
-            loss_types = [
-                ("total", "Total Loss", "tab:purple"),
-                ("mag", "Magnitude Loss", "tab:blue"),
-                ("cos", "Cos-Phase Loss", "tab:orange"),
-                ("sin", "Sin-Phase Loss", "tab:red"),
-                ("scale", "Scale Loss", "tab:green"),
-            ]
-        else:
-            loss_types = [
-                ("total", "Total Loss", "tab:purple"),
-                ("latent", "Latent Loss", "tab:blue"),
-                ("scale", "Scale Loss", "tab:green"),
-            ]
+        loss_types = [
+            ("total", "Total Loss", "tab:purple"),
+            ("latent", "Latent Loss", "tab:blue"),
+            ("scale", "Scale Loss", "tab:green"),
+        ]
 
         cols = len(loss_types)
         rows = 2 if has_val else 1
@@ -494,7 +445,7 @@ class FlowTrainer:
         self.local_encoder.train()
         zero = torch.zeros((), device=self.device)
         # epoch sums (tensors on the device, no sync per step) and sums since the last log line
-        keys = ("total", "lat", "cos", "sin", "scale", "adv", "reg", "grad")
+        keys = ("total", "lat", "scale", "adv", "reg", "grad")
         ep = {k: zero.clone() for k in keys}
         win = {k: zero.clone() for k in keys}
         n_steps = n_win = 0
@@ -535,22 +486,14 @@ class FlowTrainer:
 
             encoded_past, prefix = self._encode_past(past_memory, train=True)
 
-            if self.spectral_mode:
-                noise = torch.randn(present_target.size(0), self.spectral_frames, self.frame_dim,
-                                    device=self.device)
-                loss, l_mag, l_cos, l_sin, l_scale, X_hat, s = spectral_flow_matching_loss(
-                    self.model, noise, present_target, context, encoded_past
-                )
-                parts = {"lat": l_mag, "cos": l_cos, "sin": l_sin, "scale": l_scale}
-            else:
-                noise = torch.randn_like(present_target)
-                loss, l_lat, l_scale, X_hat, s = flow_matching_loss(
-                    self.model, noise, present_target, context, encoded_past,
-                    n_latent=self.n_latent, has_scale=self.has_scale, prefix=prefix
-                )
-                parts = {"lat": l_lat, "scale": l_scale}
+            noise = torch.randn_like(present_target)
+            loss, l_lat, l_scale, X_hat, s = flow_matching_loss(
+                self.model, noise, present_target, context, encoded_past,
+                n_latent=self.n_latent, has_scale=self.has_scale, prefix=prefix
+            )
+            parts = {"lat": l_lat, "scale": l_scale}
 
-            # Regularizers (only used in non-spectral mode; blocked by validation in __init__)
+            # Regularizers (time_phase, fft_phase), weighted as in training.regularizers_and_weights
             reg_loss = torch.tensor(0.0, device=self.device)
             for fn, weight in active_regularizers:
                 reg_loss += weight * fn(X_hat, present_target, s, self.n_latent)
@@ -623,10 +566,7 @@ class FlowTrainer:
 
         n = max(n_steps, 1)
         e = {k: v.item() / n for k, v in ep.items()}
-        if self.spectral_mode:
-            return e["total"], e["lat"], e["cos"], e["sin"], e["scale"], e["adv"], e["reg"]
-        else:
-            return e["total"], e["lat"], e["scale"], e["adv"], e["reg"]
+        return e["total"], e["lat"], e["scale"], e["adv"], e["reg"]
 
     # Deterministic validation loss (design D17). Sample i gets x0 from a generator seeded with its dataset index and is
     # evaluated at 4 stratified s values; the loss is the mean over samples and s. Returns
@@ -676,30 +616,9 @@ class FlowTrainer:
         per_file = {k: file_sum[k].item() / (file_n[k] * len(VAL_S_VALUES)) for k in file_sum}
         return tot.item() / n, lat.item() / n, sca.item() / n, per_file
 
-    # Spectral mode (encodec48k only): V1's validation, random x0 and s, with the RNG states restored afterwards
-    @torch.no_grad()
-    def _eval_spectral(self, loader):
-        self.model.eval()
-        self.local_encoder.eval()
-        sums = [0.0] * 5
-        with torch.random.fork_rng():
-            for batch in loader:
-                past_memory, present_target, context = self._prepare_batch(batch)
-                encoded_past, _ = self._encode_past(past_memory, train=False)
-                noise = torch.randn(present_target.size(0), self.spectral_frames, self.frame_dim, device=self.device)
-                _, l_mag, l_cos, l_sin, l_scale, _, _ = spectral_flow_matching_loss(
-                    self.model, noise, present_target, context, encoded_past
-                )
-                for i, v in enumerate((l_mag + l_cos + l_sin + l_scale, l_mag, l_cos, l_sin, l_scale)):
-                    sums[i] += v.item()
-        n = len(loader)
-        return tuple(v / n for v in sums)
-
     def val_epoch(self):
         if self.val_loader is None:
             return 0.0, 0.0, 0.0
-        if self.spectral_mode:
-            return self._eval_spectral(self.val_loader)
         total, lat, sca, per_file = self._eval_loss(self.val_loader)
         self._last_val_per_file = per_file
         return total, lat, sca
@@ -757,18 +676,10 @@ class FlowTrainer:
                         raw_batch[k] = raw_batch[k].unsqueeze(0)
                 gt_past, _, context = self._prepare_batch(raw_batch)
                 encoded_past, prefix = self._encode_past(gt_past)
-                if self.spectral_mode:
-                    x0 = torch.randn(1, self.spectral_frames, self.frame_dim, device=self.device)
-                else:
-                    x0 = torch.randn(1, self.unit_frames, self.frame_dim, device=self.device)
+                x0 = torch.randn(1, self.unit_frames, self.frame_dim, device=self.device)
                 pred_raw = self.model.generate(x0, encoded_past, context, max_nfe=NFE,
                                                cfg_scale=self.model_config['cfg_scale'], prefix=prefix)
-                if self.spectral_mode:
-                    latent_time = spectral_to_time(pred_raw[:, :, :384], self.atom_frames)
-                    scale_time = pred_raw[:, :, 384:].mean(dim=1, keepdim=True).expand(-1, self.atom_frames, -1)
-                    pred = torch.cat([latent_time, scale_time], dim=-1).transpose(1, 2)
-                else:
-                    pred = pred_raw.transpose(1, 2)
+                pred = pred_raw.transpose(1, 2)
                 atoms.append(pred)
 
             if self.mode == "autoregressive":
@@ -885,21 +796,12 @@ class FlowTrainer:
             return self._last_val_metric
         val_out = self.val_epoch()
         self._last_val_step = self.global_step
-        if self.spectral_mode:
-            avg_v_total, avg_v_mag, avg_v_cos, avg_v_sin, avg_v_scale = val_out
-            self.val_losses["total"].append(avg_v_total)
-            self.val_losses["mag"].append(avg_v_mag)
-            self.val_losses["cos"].append(avg_v_cos)
-            self.val_losses["sin"].append(avg_v_sin)
-            self.val_losses["scale"].append(avg_v_scale)
-            print(f"Val   | Total: {avg_v_total:.4f} (Mag: {avg_v_mag:.4f}, Cos: {avg_v_cos:.4f}, Sin: {avg_v_sin:.4f}, Sca: {avg_v_scale:.4f})")
-        else:
-            avg_v_total, avg_v_lat, avg_v_scale = val_out
-            self.val_losses["total"].append(avg_v_total)
-            self.val_losses["latent"].append(avg_v_lat)
-            self.val_losses["scale"].append(avg_v_scale)
-            print(f"Val   | step {self.global_step} | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
-            self.logger.log_val(self.global_step, self._last_val_per_file)
+        avg_v_total, avg_v_lat, avg_v_scale = val_out
+        self.val_losses["total"].append(avg_v_total)
+        self.val_losses["latent"].append(avg_v_lat)
+        self.val_losses["scale"].append(avg_v_scale)
+        print(f"Val   | step {self.global_step} | Total: {avg_v_total:.4f} (Lat: {avg_v_lat:.4f}, Sca: {avg_v_scale:.4f})")
+        self.logger.log_val(self.global_step, self._last_val_per_file)
 
         self._last_val_metric = avg_v_total
         self._val_count += 1
@@ -922,25 +824,13 @@ class FlowTrainer:
         return avg_v_total
 
     def _record_train(self, train_out):
-        if self.spectral_mode:
-            (avg_t_total, avg_t_mag, avg_t_cos, avg_t_sin,
-             avg_t_scale, avg_t_adv, avg_t_reg) = train_out
-            self.train_losses["total"].append(avg_t_total)
-            self.train_losses["mag"].append(avg_t_mag)
-            self.train_losses["cos"].append(avg_t_cos)
-            self.train_losses["sin"].append(avg_t_sin)
-            self.train_losses["scale"].append(avg_t_scale)
-            self.train_losses.setdefault("adv", []).append(avg_t_adv)
-            self.train_losses.setdefault("reg", []).append(avg_t_reg)
-            parts = [f"Train | Total: {avg_t_total:.4f} (Mag: {avg_t_mag:.4f}, Cos: {avg_t_cos:.4f}, Sin: {avg_t_sin:.4f}, Sca: {avg_t_scale:.4f}"]
-        else:
-            avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = train_out
-            self.train_losses["total"].append(avg_t_total)
-            self.train_losses["latent"].append(avg_t_lat)
-            self.train_losses["scale"].append(avg_t_scale)
-            self.train_losses.setdefault("adv", []).append(avg_t_adv)
-            self.train_losses.setdefault("reg", []).append(avg_t_reg)
-            parts = [f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}"]
+        avg_t_total, avg_t_lat, avg_t_scale, avg_t_adv, avg_t_reg = train_out
+        self.train_losses["total"].append(avg_t_total)
+        self.train_losses["latent"].append(avg_t_lat)
+        self.train_losses["scale"].append(avg_t_scale)
+        self.train_losses.setdefault("adv", []).append(avg_t_adv)
+        self.train_losses.setdefault("reg", []).append(avg_t_reg)
+        parts = [f"Train | Total: {avg_t_total:.4f} (Lat: {avg_t_lat:.4f}, Sca: {avg_t_scale:.4f}"]
         if avg_t_reg > 0:
             parts.append(f"Reg: {avg_t_reg:.6f}")
         if avg_t_adv > 0:

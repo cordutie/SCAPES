@@ -293,7 +293,7 @@ class TrainingConfig:
     val_duration: float = 5.0
 
     # Inference defaults
-    cfg_scale: float = 3.0
+    cfg_scale: float = 1.0      # classifier-free guidance: 1.0 = off; above 1 it applies to every step and codec
 
     # Adversarial discriminator (True = enable 2-stage training)
     use_discriminator: bool = False
@@ -302,10 +302,6 @@ class TrainingConfig:
 
     # Regularizers: list of [name, weight] pairs, e.g. [["time_phase", 0.1], ["fft_phase", 0.05]]
     regularizers_and_weights: Optional[list] = None
-
-    # Spectral representation: if True, latents are transformed to log-mag / cos / sin
-    # in the frequency domain before flow matching, and iFFT'd back at inference time.
-    spectral_representation: bool = False
 
     # V2: per-channel standardisation of the latents, noise on the past (gamma), step budget, logging, seed
     standardize_latents: Optional[bool] = None   # None: the codec's default (generation.py), filled by build_trainer
@@ -341,7 +337,6 @@ _TRAINING_GIN_MAP = [
     (["training", "use_discriminator"], "use_discriminator"),
     (["training", "stage2_epochs"], "stage2_epochs"),
     (["training", "regularizers_and_weights"], "regularizers_and_weights"),
-    (["training", "spectral_representation"], "spectral_representation"),
     (["training", "standardize_latents"], "standardize_latents"),
     (["training", "past_noise"], "past_noise"),
     (["training", "max_steps"], "max_steps"),
@@ -375,6 +370,18 @@ def _resolve_size_table(cfg: TrainingConfig) -> TrainingConfig:
     return cfg
 
 
+# Options that were removed: a config that still sets one is refused, so that its effect is not silently lost
+REMOVED_TRAINING_KEYS = [["training", "spectral_representation"]]
+
+
+def refuse_removed_keys(raw, path):
+    """Raises NotImplementedError when a removed option is set in the parsed config."""
+    for keys in REMOVED_TRAINING_KEYS:
+        if _get_nested(raw, keys, None) is not None:
+            name = ".".join(keys)
+            raise NotImplementedError(f"{path}: {name} was removed; delete that line from the config")
+
+
 def load_training_config(gin_path: Path) -> TrainingConfig:
     path = Path(gin_path)
     if path.is_dir():
@@ -387,6 +394,7 @@ def load_training_config(gin_path: Path) -> TrainingConfig:
         raise FileNotFoundError(f"Gin config not found: {path}")
 
     raw = parse_gin_config(path)
+    refuse_removed_keys(raw, path)
     cfg = TrainingConfig()
     for keys, attr in _TRAINING_GIN_MAP:
         val = _get_nested(raw, keys, None)

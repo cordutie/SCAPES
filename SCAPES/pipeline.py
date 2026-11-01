@@ -95,8 +95,8 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
         training_config = dataclasses.replace(training_config, past_noise=spec.past_noise)
 
     # Features that only exist for encodec48k (D13) and what the AR window assumes (R2-C4)
-    if geom.codec != "encodec48" and (training_config.spectral_representation or training_config.use_discriminator):
-        raise NotImplementedError("spectral_representation and use_discriminator are only available for encodec48k (D13)")
+    if geom.codec != "encodec48" and training_config.use_discriminator:
+        raise NotImplementedError("use_discriminator is only available for encodec48k (D13)")
     if geom.mode == "autoregressive" and training_config.local_encoder_temporal_compression != 1:
         raise NotImplementedError("autoregressive mode needs local_encoder.temporal_compression = 1 "
                                   "(one encoded frame per latent frame, R2-C4)")
@@ -131,10 +131,7 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
         print("No validation split: training without validation.")
 
     # Models. AR: one past window (num_past_atoms = 1, memory of W frames), target of B + o frames (R2-C4).
-    if training_config.spectral_representation:
-        frame_dim, frames_per_atom = 385, geom.unit_frames // 2 + 1
-    else:
-        frame_dim, frames_per_atom = geom.frame_dim, geom.unit_frames + geom.prefix_frames
+    frame_dim, frames_per_atom = geom.frame_dim, geom.unit_frames + geom.prefix_frames
     local_encoder = LocalEncoder(config=training_config, in_channels=frame_dim)
     flow_model = FlowModel(
         config=training_config,
@@ -180,22 +177,18 @@ PROBE_UNIT = 64
 
 
 # One training step (loss and backward, no optimizer step); the gradients are cleared after it.
-# The same loss as FlowTrainer.train, for the batch of the spectral or the time representation.
+# The same loss as FlowTrainer.train, for one batch.
 def _training_probe(trainer, split):
     from torch.utils.data import default_collate
-    from SCAPES.auxiliar.losses_flow import flow_matching_loss, spectral_flow_matching_loss
+    from SCAPES.auxiliar.losses_flow import flow_matching_loss
 
     def step(b):
         batch = default_collate([split[i % len(split)] for i in range(PROBE_UNIT * b)])
         past, present, context = trainer._prepare_batch(batch)
         encoded_past, prefix = trainer._encode_past(past, train=True)
-        if trainer.spectral_mode:
-            noise = torch.randn(present.size(0), trainer.spectral_frames, trainer.frame_dim, device=trainer.device)
-            loss = spectral_flow_matching_loss(trainer.model, noise, present, context, encoded_past)[0]
-        else:
-            noise = torch.randn_like(present)
-            loss = flow_matching_loss(trainer.model, noise, present, context, encoded_past,
-                                      n_latent=trainer.n_latent, has_scale=trainer.has_scale, prefix=prefix)[0]
+        noise = torch.randn_like(present)
+        loss = flow_matching_loss(trainer.model, noise, present, context, encoded_past,
+                                  n_latent=trainer.n_latent, has_scale=trainer.has_scale, prefix=prefix)[0]
         loss.backward()
         trainer.optimizer.zero_grad(set_to_none=True)
     return step
@@ -254,7 +247,7 @@ def units_for_seconds(geom, seconds: float) -> int:
 # enough for `seconds`, or len(prompts). out_path without a suffix is a folder and the file is generation.wav in it.
 # checkpoint "best" falls back to "last" when training had no validation split. Returns the path of the wav.
 def run_generation(model_dir, out_path, prompts: list, unit_count=None, seconds=None, seed: int = 0, nfe: int = 16,
-                   cfg_scale: float = 3.0, checkpoint="best") -> Path:
+                   cfg_scale: float = 1.0, checkpoint="best") -> Path:
     import soundfile as sf
     from SCAPES.inference.FlowInference import FlowInference
 

@@ -215,7 +215,7 @@ class FlowModel(nn.Module):
     def vector_field(self, x, s, context_dict):
         precomputed_memory = context_dict['memory']
         clap_context       = context_dict['clap']
-        cfg_scale          = context_dict.get('cfg_scale', 3.0)
+        cfg_scale          = context_dict.get('cfg_scale', 1.0)   # 1.0: guidance off
         prefix             = context_dict.get('prefix', None)
 
         # With a prefix the transformer sees cat([prefix, x]) and only the last positions (those of x) are used

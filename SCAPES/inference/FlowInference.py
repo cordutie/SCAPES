@@ -10,14 +10,14 @@ from IPython.display import Audio, display
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-from SCAPES.data.config_loader import (parse_gin_config, _get_nested, _SIZE_TABLE, ConfigError, load_dataprep_config)
+from SCAPES.data.config_loader import (parse_gin_config, _get_nested, _SIZE_TABLE, ConfigError, load_dataprep_config,
+                                       refuse_removed_keys)
 from SCAPES.generation import print_resolution
 from SCAPES.data.geometry import geometry_from_inference_gin, resolve_geometry
 from SCAPES.data.representations import frames_to_samples_48k
 from SCAPES.data.geometry import atom_count
 from SCAPES.models.flow.FlowModel import FlowModel
 from SCAPES.models.factorization.LocalEncoder import LocalEncoder
-from SCAPES.auxiliar.losses_flow import time_to_spectral, spectral_to_time
 from SCAPES.inference.render import StreamRenderer, render_atoms
 from SCAPES import codecs as scapes_codecs
 
@@ -45,7 +45,7 @@ def run_resynthesis_pipeline(
     save_path=None,
     TF=False, 
     NFE = 32,
-    cfg_scale = 3.0,       
+    cfg_scale = 1.0,       
     context_static=False,  
     decode_method="ola_smooth"
 ):
@@ -92,7 +92,7 @@ def run_batch_resynthesis_pipeline(
     output_dir="reconstructed",
     duration=None,
     NFE=32,
-    cfg_scale=3.0,
+    cfg_scale=1.0,
     TF=False,
     decode_method="ola_smooth",
     extensions=(".wav", ".flac", ".mp3"),
@@ -192,7 +192,7 @@ def run_interpolation_pipeline(
     play=True,
     save_path=None,
     NFE = 32,
-    cfg_scale = 3.0,       
+    cfg_scale = 1.0,       
     context_static=True,  
     decode_method="ola_smooth",
     cache=True
@@ -326,6 +326,7 @@ class FlowInference:
                 "Run training first to generate this file."
             )
         raw = parse_gin_config(gin_path)
+        refuse_removed_keys(raw, gin_path)
         codec_name = raw.get("codec")
         if not isinstance(codec_name, str):
             raise ConfigError(f"{gin_path}: codec is required (this inference.gin was not written by this version)")
@@ -415,17 +416,8 @@ class FlowInference:
         self.standardize = bool(_get_nested(raw, ["training", "standardize_latents"], False))
 
         # ─── Geometry in frames ───
-        self.spectral_mode = bool(_get_nested(raw, ["training", "spectral_representation"], False))
-        if self.spectral_mode and geom.codec != "encodec48":
-            raise NotImplementedError("spectral_representation is only available for encodec48k (D13)")
-        if self.spectral_mode:
-            frame_dim = 385  # 128*3 + 1
-            self.spectral_frames = int(_get_nested(raw, ["atoms", "spectral_frames"], geom.unit_frames // 2 + 1))
-            model_frames = self.spectral_frames
-        else:
-            frame_dim = geom.frame_dim
-            self.spectral_frames = None
-            model_frames = geom.unit_frames + geom.prefix_frames
+        frame_dim = geom.frame_dim
+        model_frames = geom.unit_frames + geom.prefix_frames
         self.unit_frames = geom.unit_frames
         self.segment_length = geom.memory_units
         self.context_seconds = geom.context_seconds
@@ -614,7 +606,7 @@ class FlowInference:
         self,
         clap_embeddings: List[torch.Tensor],
         nfe: int = 16,
-        cfg_scale: float = 3.0,
+        cfg_scale: float = 1.0,
         output_path: Optional[str] = None,
         seed: Optional[int] = None,
     ) -> torch.Tensor:
@@ -651,17 +643,6 @@ class FlowInference:
         past_atoms = [dummy_atom if i < 0 else self._unit_at(timeline, i) for i in range(t - M, t)]
         past_buffer = torch.cat(past_atoms, dim=0).unsqueeze(0)
 
-        if self.spectral_mode:
-            B_past, N_past, C_past, T_past = past_buffer.shape
-            past_lat = past_buffer[:, :, :128, :]
-            past_scl = past_buffer[:, :, 128:, :]
-            past_lat_flat = past_lat.reshape(-1, 128, T_past).transpose(1, 2)
-            past_spec_flat = time_to_spectral(past_lat_flat)
-            past_spec = past_spec_flat.reshape(B_past, N_past, self.spectral_frames, 384).transpose(2, 3)
-            past_scl_val = past_scl.mean(dim=-1, keepdim=True)
-            past_scl_exp = past_scl_val.expand(-1, -1, -1, self.spectral_frames)
-            past_buffer = torch.cat([past_spec, past_scl_exp], dim=2)
-
         encoded_past = self.local_encoder(past_buffer)
         num_nulls = max(0, M - t)
         if num_nulls > 0:
@@ -686,7 +667,7 @@ class FlowInference:
         return encoded_past, prefix
 
     @torch.no_grad()
-    def generate(self, timeline: List[Dict[str, Any]], NFE: int = 32, cfg_scale: float = 3.0) -> List[Dict[str, Any]]:
+    def generate(self, timeline: List[Dict[str, Any]], NFE: int = 32, cfg_scale: float = 1.0) -> List[Dict[str, Any]]:
         self.model.eval()
         self.local_encoder.eval()
 
@@ -708,10 +689,7 @@ class FlowInference:
             if context.dim() == 1:
                 context = context.unsqueeze(0)
 
-            if self.spectral_mode:
-                x0 = torch.randn(1, self.spectral_frames, 385, device=self.device)
-            else:
-                x0 = torch.randn(1, g.unit_frames, g.frame_dim, device=self.device)
+            x0 = torch.randn(1, g.unit_frames, g.frame_dim, device=self.device)
 
             pred = self.model.generate(
                 x0=x0,
@@ -722,16 +700,7 @@ class FlowInference:
                 prefix=prefix,
             )
 
-            if self.spectral_mode:
-                latent_spec = pred[:, :, :384]
-                latent_time = spectral_to_time(latent_spec, g.unit_frames).to(self.device)
-                scale_spec = pred[:, :, 384:]
-                scale_val = scale_spec.mean(dim=1, keepdim=True)
-                scale_time = scale_val.expand(-1, g.unit_frames, -1)
-                pred_time = torch.cat([latent_time, scale_time], dim=-1)
-                timeline[t]["atom_generated"] = pred_time.transpose(1, 2)
-            else:
-                timeline[t]["atom_generated"] = pred.transpose(1, 2)
+            timeline[t]["atom_generated"] = pred.transpose(1, 2)
 
         if self.verbose:
             print("✅ Generation Complete!")
