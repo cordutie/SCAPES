@@ -1,7 +1,7 @@
 import ast
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 
 from SCAPES.errors import ConfigError  # noqa: F401  (re-exported; defined in errors.py so generation.py stays torch-free)
@@ -278,7 +278,7 @@ class TrainingConfig:
 
     # Training loop
     epochs: int = 75
-    batch_size: int = 128
+    batch_size: Union[int, str] = "auto"   # "auto": from the free GPU memory (on CPU: 128)
     learning_rate: float = 1e-4
     past_dropout: float = 0.25
     conditioning_dropout: float = 0.2
@@ -395,4 +395,7 @@ def load_training_config(gin_path: Path) -> TrainingConfig:
         if val is not None:
             setattr(cfg, attr, val)
     _resolve_size_table(cfg)
+    # batch_size is "auto" or a positive integer
+    if cfg.batch_size != "auto" and (not isinstance(cfg.batch_size, int) or cfg.batch_size < 1):
+        raise ValueError(f'{path}: training.batch_size must be "auto" or a positive integer, got {cfg.batch_size!r}')
     return cfg

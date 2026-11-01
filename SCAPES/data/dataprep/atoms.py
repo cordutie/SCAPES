@@ -94,6 +94,22 @@ def _encode_segments(codec, x, geom, batch=None):
     return torch.cat(latents), torch.cat(scales)
 
 
+# Segments per encode call on the GPU: the largest batch whose measured memory fits in the free memory (TODO 2).
+# Segment size depends on the codec only, not on the file, so one measurement serves the whole run.
+def _auto_encode_batch(codec, x, geom):
+    from SCAPES.auxiliar.gpu_batch import auto_batch
+    seg = x[0, :, :geom.atom_samples]
+
+    def step(b):
+        with torch.no_grad():
+            codec.encode(torch.stack([seg] * b), geom.sample_rate)
+
+    batch, free, fixed, per_item = auto_batch(step)
+    print(f"encode batch auto -> {batch} segments (free {free / 2**30:.2f} GiB, fixed {fixed / 2**20:.0f} MiB, "
+          f"per segment {per_item / 2**20:.1f} MiB)")
+    return batch
+
+
 # Encodes every raw file that has no latents yet and writes index.json. Returns the store.
 def latents_maker(dataset_path, config: DataprepConfig, device="auto", codec=None) -> RepresentationStore:
     dataset_path = Path(dataset_path)
@@ -109,6 +125,7 @@ def latents_maker(dataset_path, config: DataprepConfig, device="auto", codec=Non
     files = list_audio_files(dataset_path)
     index = store.read_index()
     per_atom = geom.encoding != "whole"
+    encode_batch = None   # on CUDA: segments per encode call, measured once on the first file long enough
     for path in files:
         stem = path.stem
         entry = index.get(stem)
@@ -130,7 +147,9 @@ def latents_maker(dataset_path, config: DataprepConfig, device="auto", codec=Non
             if per_atom:
                 x = codec.prepare(audio, sr)
                 if geom.atom_type != "frames":
-                    latent, scale = _encode_segments(codec, x, geom)
+                    if device == "cuda" and encode_batch is None and x.shape[-1] >= geom.atom_samples:
+                        encode_batch = _auto_encode_batch(codec, x, geom)
+                    latent, scale = _encode_segments(codec, x, geom, batch=encode_batch)
                 else:
                     latent, scale = _encode_atoms(codec, x, geom, config.semantic_context_seconds)
                 store.save_latents(path, latent, scale)

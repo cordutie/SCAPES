@@ -122,9 +122,15 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
     dataset = AtomSequenceDataset(dataset_path=dataset_path, config=dataprep_config, requested_keys=requested_keys,
                                   device="cpu", verbose=True)
     train_split, val_split = dataset.get_splits()
-    train_loader = DataLoader(train_split, batch_size=training_config.batch_size, shuffle=True, drop_last=True,
-                              generator=loader_generator)
-    val_loader = DataLoader(val_split, batch_size=training_config.batch_size, shuffle=False) if len(val_split) > 0 else None
+    # "auto" starts at 128 (the value without CUDA) and is replaced by the measured batch after the trainer is built
+    auto_batch_size = training_config.batch_size == "auto"
+
+    def make_loaders(batch):
+        train = DataLoader(train_split, batch_size=batch, shuffle=True, drop_last=True, generator=loader_generator)
+        val = DataLoader(val_split, batch_size=batch, shuffle=False) if len(val_split) > 0 else None
+        return train, val
+
+    train_loader, val_loader = make_loaders(128 if auto_batch_size else training_config.batch_size)
     if val_loader is None:
         print("No validation split: training without validation.")
 
@@ -152,7 +158,7 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
 
     optimizer = AdamW(list(flow_model.parameters()) + list(local_encoder.parameters()), lr=training_config.learning_rate)
 
-    return FlowTrainer(
+    trainer = FlowTrainer(
         model=flow_model,
         local_encoder=local_encoder,
         train_loader=train_loader,
@@ -164,6 +170,56 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
         model_path=save_path,
         resume_from=resume,
     )
+    if auto_batch_size:
+        if torch.cuda.is_available():
+            trainer.batch_size = _auto_training_batch(trainer, train_split)
+            trainer.train_loader, trainer.val_loader = make_loaders(trainer.batch_size)
+        else:
+            trainer.batch_size = 128   # the loaders already use 128
+    return trainer
+
+
+# Items per probe unit: step(b) runs PROBE_UNIT * b items. At 2 to 4 items the peak is dominated by fixed allocations
+# (measured on the smoke dataset: flat at 311 MiB, against about 3.4 MiB per item from 128 to 486 items).
+PROBE_UNIT = 64
+
+
+# One training step (loss and backward, no optimizer step); the gradients are cleared after it.
+# The same loss as FlowTrainer.train, for the batch of the spectral or the time representation.
+def _training_probe(trainer, split):
+    from torch.utils.data import default_collate
+    from SCAPES.auxiliar.losses_flow import flow_matching_loss, spectral_flow_matching_loss
+
+    def step(b):
+        batch = default_collate([split[i % len(split)] for i in range(PROBE_UNIT * b)])
+        past, present, context, structure = trainer._prepare_batch(batch)
+        encoded_past, prefix = trainer._encode_past(past, train=True)
+        if trainer.spectral_mode:
+            noise = torch.randn(present.size(0), trainer.spectral_frames, trainer.frame_dim, device=trainer.device)
+            loss = spectral_flow_matching_loss(trainer.model, noise, present, context, encoded_past,
+                                               structure_vector=structure)[0]
+        else:
+            noise = torch.randn_like(present)
+            loss = flow_matching_loss(trainer.model, noise, present, context, encoded_past, structure_vector=structure,
+                                      n_latent=trainer.n_latent, has_scale=trainer.has_scale, prefix=prefix)[0]
+        loss.backward()
+        trainer.optimizer.zero_grad(set_to_none=True)
+    return step
+
+
+# Batch size of "auto" on a CUDA device. Prints the choice; the random state is restored, so the seed still applies.
+def _auto_training_batch(trainer, split):
+    from SCAPES.auxiliar.gpu_batch import auto_batch
+    # AdamW keeps two float states per parameter; they are allocated at the first optimizer step, not by the probe
+    params = [p for group in trainer.optimizer.param_groups for p in group["params"]]
+    adam_bytes = 2 * sum(p.numel() * p.element_size() for p in params)
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        # capped at the split: a larger batch gives no step at all (drop_last)
+        batch, free, fixed, per_item = auto_batch(_training_probe(trainer, split), cap=len(split),
+                                                  extra_fixed_bytes=adam_bytes, items_per_call=PROBE_UNIT)
+    print(f"batch_size auto -> {batch} (free {free / 2**30:.2f} GiB, fixed {fixed / 2**20:.0f} MiB, "
+          f"per item {per_item / 2**20:.1f} MiB)")
+    return batch
 
 
 # build_trainer + train. max_steps overrides training.max_steps. Returns save_path.
