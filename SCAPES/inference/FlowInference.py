@@ -17,7 +17,6 @@ from SCAPES.data.representations import frames_to_samples_48k
 from SCAPES.data.geometry import atom_count
 from SCAPES.models.flow.FlowModel import FlowModel
 from SCAPES.models.factorization.LocalEncoder import LocalEncoder
-from SCAPES.data.dataprep.structure import _compute_structure_features
 from SCAPES.auxiliar.losses_flow import time_to_spectral, spectral_to_time
 from SCAPES.inference.render import StreamRenderer, render_atoms
 from SCAPES import codecs as scapes_codecs
@@ -36,13 +35,7 @@ def load_and_encode(engine, audio_path, max_duration=None):
     
     print(f"--- Computing context for audio: {audio_path}")
     contexts = engine.compute_context_track(audio_tensor)
-    
-    structures = None
-    if engine.use_structure:
-        print(f"--- Computing structure for audio: {audio_path}")
-        structures = engine.compute_structure_track(audio_tensor)
-        
-    return atoms, contexts, structures
+    return atoms, contexts
 
 def run_resynthesis_pipeline(
     engine,
@@ -56,16 +49,13 @@ def run_resynthesis_pipeline(
     context_static=False,  
     decode_method="ola_smooth"
 ):
-    atoms_src, contexts_src, structures_src = load_and_encode(engine, audio_path, max_duration=duration)
+    atoms_src, contexts_src = load_and_encode(engine, audio_path, max_duration=duration)
 
     atoms = atoms_src
     contexts = contexts_src
-    structures = structures_src
 
     if context_static:  
         contexts = [contexts_src[0] for _ in range(len(atoms))]    
-        if structures is not None:
-            structures = [structures_src[0] for _ in range(len(atoms))]
 
     cold_start = True
     if TF != True and TF != False:
@@ -75,7 +65,6 @@ def run_resynthesis_pipeline(
     timeline = engine.build_base_timeline(
         atoms_129D=atoms,
         context_embeddings=contexts,
-        structure_embeddings=structures, 
         default_TF=TF
     )
 
@@ -126,11 +115,10 @@ def run_batch_resynthesis_pipeline(
 
     for audio_path in tqdm(audio_files, desc="Batch Resynthesis"):
         save_path = output_path / f"{audio_path.stem}_reconstructed.wav"
-        atoms_src, contexts_src, structures_src = load_and_encode(engine, str(audio_path), max_duration=duration)
+        atoms_src, contexts_src = load_and_encode(engine, str(audio_path), max_duration=duration)
 
         atoms = atoms_src
         contexts = contexts_src
-        structures = structures_src
 
         cold_start = True
         if TF is not True and TF is not False:
@@ -142,7 +130,6 @@ def run_batch_resynthesis_pipeline(
         timeline = engine.build_base_timeline(
             atoms_129D=atoms,
             context_embeddings=contexts,
-            structure_embeddings=structures,
             default_TF=tf_actual
         )
 
@@ -229,41 +216,35 @@ def run_interpolation_pipeline(
     
     atoms_1_path    = filename_1 + "_atoms.pt"
     contexts_1_path = filename_1 + "_contexts.pt"
-    struct_1_path   = filename_1 + "_structures.pt"
     
     atoms_2_path    = filename_2 + "_atoms.pt"
     contexts_2_path = filename_2 + "_contexts.pt"
-    struct_2_path   = filename_2 + "_structures.pt"
 
     if cache:
         if Path(atoms_1_path).exists() and Path(contexts_1_path).exists():
             print(f"Loading cached encodings for {audio_path_1}...")
             atoms_1    = torch.load(atoms_1_path)
             contexts_1 = torch.load(contexts_1_path)
-            structures_1 = torch.load(struct_1_path) if Path(struct_1_path).exists() else None
             cache_1_found = True
 
         if Path(atoms_2_path).exists() and Path(contexts_2_path).exists():
             print(f"Loading cached encodings for {audio_path_2}...")
             atoms_2    = torch.load(atoms_2_path)
             contexts_2 = torch.load(contexts_2_path)
-            structures_2 = torch.load(struct_2_path) if Path(struct_2_path).exists() else None
             cache_2_found = True
 
     if not cache_1_found:
-        atoms_1, contexts_1, structures_1 = load_and_encode(engine, audio_path_1, max_duration=31)
+        atoms_1, contexts_1 = load_and_encode(engine, audio_path_1, max_duration=31)
     if not cache_2_found:
-        atoms_2, contexts_2, structures_2 = load_and_encode(engine, audio_path_2, max_duration=31)
+        atoms_2, contexts_2 = load_and_encode(engine, audio_path_2, max_duration=31)
 
     if cache:
         if not cache_1_found:
             torch.save(atoms_1, atoms_1_path)
             torch.save(contexts_1, contexts_1_path)
-            if structures_1 is not None: torch.save(structures_1, struct_1_path)
         if not cache_2_found:
             torch.save(atoms_2, atoms_2_path)
             torch.save(contexts_2, contexts_2_path)
-            if structures_2 is not None: torch.save(structures_2, struct_2_path)
 
     if stay_time < 0 or not isinstance(stay_time, int):
         raise ValueError("Stay time must be a non-negative integer.")
@@ -273,17 +254,12 @@ def run_interpolation_pipeline(
             raise ValueError("Audio does not have enough context embeddings for the timeline size.")
         contexts_1 = contexts_1[:timeline_size]
         contexts_2 = contexts_2[:timeline_size]
-        
-        if engine.use_structure:
-            structures_1 = structures_1[:timeline_size]
-            structures_2 = structures_2[:timeline_size]
 
     c0 = contexts_1[0]
     c1 = contexts_2[0]
 
     atoms = [None] * timeline_size
     contexts = [] 
-    structures = [] if engine.use_structure else None
 
     alpha_values_full = alpha_values_full.to(c0.device)
 
@@ -296,19 +272,10 @@ def run_interpolation_pipeline(
         else:
             ctx = slerp(contexts_1[t], contexts_2[t], alpha)
         contexts.append(ctx)
-        
-        # 2. Lerp Structure Embeddings (Scalars interpolate linearly)
-        if engine.use_structure:
-            if context_static:
-                s_interp = (1 - alpha) * structures_1[0] + alpha * structures_2[0]
-            else:
-                s_interp = (1 - alpha) * structures_1[t] + alpha * structures_2[t]
-            structures.append(s_interp)
 
     timeline = engine.build_base_timeline(
         atoms_129D=atoms,
         context_embeddings=contexts,
-        structure_embeddings=structures,
         default_TF=False
     )
 
@@ -439,7 +406,7 @@ class FlowInference:
         self.mode = geom.mode
         print_resolution(geom.resolution)
         self.sr = info.sample_rate            # output rate (codec rate)
-        self.load_sr = 48000                  # rate of the audio given to CLAP, structure and the helper pipelines
+        self.load_sr = 48000                  # rate of the audio given to CLAP and the helper pipelines
         self.frame_rate = info.frame_rate
         self.latent_dim = geom.latent_dim
         self._codec = None
@@ -464,9 +431,6 @@ class FlowInference:
         self.context_seconds = geom.context_seconds
         self.context_samples = int(round(self.context_seconds * self.load_sr))
         self.semantic_random_extension = _get_nested(raw, ["dataset", "semantic_random_extension"], True)
-        self.structure_feature_names = _get_nested(raw, ["structure", "features"], None)
-        structure_dim = len(self.structure_feature_names) if self.structure_feature_names else 0
-        self.use_structure = structure_dim > 0
 
         # ─── Models ───
         hidden = int(_get_nested(raw, ["local_encoder", "hidden_dim"], 256))
@@ -490,7 +454,6 @@ class FlowInference:
             nhead=arch["nhead"],
             num_layers=arch["num_layers"],
             dim_feedforward=arch["dim_feedforward"],
-            structure_dim=structure_dim,
             memory_frames=geom.memory_frames if geom.mode == "autoregressive" else None,
             device=device,
         ).to(device).eval()
@@ -629,28 +592,7 @@ class FlowInference:
                 raise ValueError("Audio file is too short to compute even one context window!")
         return context_embeddings
 
-    @torch.no_grad()
-    def compute_structure_track(self, audio_tensor: torch.Tensor) -> List[torch.Tensor]:
-        """Extracts 1D Structure Features using the exact matching Sliding Window."""
-        audio_tensor = audio_tensor.to(self.device)
-        starts, seg = self._unit_starts(audio_tensor.shape[-1])
-        hop48 = int(round(self.info.hop_length * self.load_sr / self.info.sample_rate))
-        n_fft = max(256, hop48 * 4)
-        structures = []
-        for start in starts:
-            struct = _compute_structure_features(
-                audio=audio_tensor[:, :, start:start + seg],
-                sr=self.load_sr,
-                atoms_frames=self.geom.unit_frames,
-                n_fft=n_fft,
-                hop_length=hop48,
-                feature_names=self.structure_feature_names,
-                mean_pooling=True
-            )
-            structures.append(struct.to(self.device))
-        return structures
-
-    def build_base_timeline(self, atoms_129D, context_embeddings, structure_embeddings=None, default_TF=False):
+    def build_base_timeline(self, atoms_129D, context_embeddings, default_TF=False):
         if len(atoms_129D) != len(context_embeddings):
             raise ValueError("Length mismatch!")
 
@@ -660,7 +602,6 @@ class FlowInference:
                 "step": t,
                 "atom_given": atoms_129D[t],
                 "context_embedding": context_embeddings[t],
-                "structure_embedding": structure_embeddings[t] if structure_embeddings else None,
                 "atom_generated": None,
                 "TF": default_TF
             }
@@ -692,7 +633,6 @@ class FlowInference:
         timeline = self.build_base_timeline(
             atoms_129D=[None] * len(clap_embeddings),
             context_embeddings=clap_embeddings,
-            structure_embeddings=None,
             default_TF=False,
         )
         timeline = self.generate(timeline, NFE=nfe, cfg_scale=cfg_scale)
@@ -768,12 +708,6 @@ class FlowInference:
             if context.dim() == 1:
                 context = context.unsqueeze(0)
 
-            structure = timeline[t].get("structure_embedding")
-            if structure is not None:
-                structure = structure.to(self.device)
-                if structure.dim() == 1:
-                    structure = structure.unsqueeze(0)
-
             if self.spectral_mode:
                 x0 = torch.randn(1, self.spectral_frames, 385, device=self.device)
             else:
@@ -783,7 +717,6 @@ class FlowInference:
                 x0=x0,
                 encoded_past=encoded_past,
                 clap_context=context,
-                structure_vector=structure,
                 max_nfe=NFE,
                 cfg_scale=cfg_scale,
                 prefix=prefix,

@@ -103,7 +103,6 @@ class FlowTrainer:
         self.memory_frames = geom.memory_frames      # F (atoms) | W (AR)
         self.atom_frames = geom.unit_frames
         self.context_vector_dim = 1024
-        self.structure_dim = len(dataset.structure_feature_names)
 
         self.spectral_mode = config.spectral_representation
         if self.spectral_mode:
@@ -131,7 +130,6 @@ class FlowTrainer:
             "nhead": config.nhead,
             "num_layers": config.num_layers,
             "dim_feedforward": config.dim_feedforward,
-            "structure_dim": self.structure_dim,
             "cfg_scale": config.cfg_scale,
         }
         self.encoder_config = {
@@ -144,14 +142,6 @@ class FlowTrainer:
         if self.mode == "autoregressive" and config.local_encoder_temporal_compression != 1:
             raise NotImplementedError("autoregressive mode needs local_encoder.temporal_compression = 1 "
                                       "(one encoded frame per latent frame)")
-
-        self.use_structure = self.structure_dim > 0
-
-        if self.use_structure and "target_structure" not in self.dataset.requested_keys:
-            raise ValueError("Model expects structure but dataset does not request it")
-
-        if self.use_structure:
-            self.model_config["structure_feature_names"] = getattr(self.dataset, "structure_feature_names", None)
 
         # ─── Regularizers — incompatible with spectral representation ───
         self.regularizers_and_weights = config.regularizers_and_weights
@@ -341,12 +331,6 @@ class FlowTrainer:
             f"training.standardize_latents = {self.standardize}",
         ]
 
-        struct_names = self.model_config.get("structure_feature_names")
-        if struct_names:
-            lines.append("")
-            lines.append("# ─── Structure features ───")
-            lines.append(f"structure.features = {struct_names}")
-
         if self.spectral_mode:
             lines.extend([
                 "",
@@ -365,7 +349,7 @@ class FlowTrainer:
         with open(gin_path, "w") as f:
             f.write("\n".join(lines) + "\n")
 
-    # Batch -> (past [B, M, C, T], target [B, U, C], context, structure) on the device, latents standardised if asked.
+    # Batch -> (past [B, M, C, T], target [B, U, C], context) on the device, latents standardised if asked.
     # C = frame_dim (latents + scale channel). Deterministic: noise and dropout are applied in _encode_past.
     def _prepare_batch(self, batch):
         past_latent = batch["memory_buffer_latent"].to(self.device)
@@ -419,15 +403,7 @@ class FlowTrainer:
             )
 
         context = batch["target_semantic"].to(self.device)
-
-        structure = batch.get("target_structure", None)
-        if structure is not None:
-            structure = structure.to(self.device)
-
-        if self.use_structure and structure is None:
-            raise ValueError("Model expects structure_vector but dataset did not provide it")
-
-        return past_memory, present_target, context, structure
+        return past_memory, present_target, context
 
     # Past -> (encoded past [B, M, T', d_model], prefix [B, o, C] or None).
     # train=True: past noise (latent channels), then past dropout (AR: frames zeroed before LocalEncoder; atoms: V1 rule),
@@ -549,7 +525,7 @@ class FlowTrainer:
 
         pbar = tqdm(self.train_loader, desc="Training")
         for batch in pbar:
-            past_memory, present_target, context, structure = self._prepare_batch(batch)
+            past_memory, present_target, context = self._prepare_batch(batch)
 
             if self.conditioning_dropout > 0.0:
                 mask = torch.rand(context.shape[0], 1, device=self.device) < self.conditioning_dropout
@@ -563,15 +539,14 @@ class FlowTrainer:
                 noise = torch.randn(present_target.size(0), self.spectral_frames, self.frame_dim,
                                     device=self.device)
                 loss, l_mag, l_cos, l_sin, l_scale, X_hat, s = spectral_flow_matching_loss(
-                    self.model, noise, present_target, context, encoded_past,
-                    structure_vector=structure
+                    self.model, noise, present_target, context, encoded_past
                 )
                 parts = {"lat": l_mag, "cos": l_cos, "sin": l_sin, "scale": l_scale}
             else:
                 noise = torch.randn_like(present_target)
                 loss, l_lat, l_scale, X_hat, s = flow_matching_loss(
                     self.model, noise, present_target, context, encoded_past,
-                    structure_vector=structure, n_latent=self.n_latent, has_scale=self.has_scale, prefix=prefix
+                    n_latent=self.n_latent, has_scale=self.has_scale, prefix=prefix
                 )
                 parts = {"lat": l_lat, "scale": l_scale}
 
@@ -667,7 +642,7 @@ class FlowTrainer:
 
         with torch.random.fork_rng():
             for batch in loader:
-                past_memory, present_target, context, structure = self._prepare_batch(batch)
+                past_memory, present_target, context = self._prepare_batch(batch)
                 encoded_past, prefix = self._encode_past(past_memory, train=False, null_past=null_past)
 
                 # x0 per sample, from its own seed
@@ -687,7 +662,6 @@ class FlowTrainer:
                         s = torch.full((b, 1, 1), s_val, device=self.device)
                         loss, l_lat, l_sca, _, _ = flow_matching_loss(
                             self.model, x0[sel], present_target[sel], context[sel], encoded_past[sel],
-                            structure_vector=None if structure is None else structure[sel],
                             n_latent=self.n_latent, has_scale=self.has_scale,
                             prefix=None if prefix is None else prefix[sel], s=s
                         )
@@ -710,11 +684,11 @@ class FlowTrainer:
         sums = [0.0] * 5
         with torch.random.fork_rng():
             for batch in loader:
-                past_memory, present_target, context, structure = self._prepare_batch(batch)
+                past_memory, present_target, context = self._prepare_batch(batch)
                 encoded_past, _ = self._encode_past(past_memory, train=False)
                 noise = torch.randn(present_target.size(0), self.spectral_frames, self.frame_dim, device=self.device)
                 _, l_mag, l_cos, l_sin, l_scale, _, _ = spectral_flow_matching_loss(
-                    self.model, noise, present_target, context, encoded_past, structure_vector=structure
+                    self.model, noise, present_target, context, encoded_past
                 )
                 for i, v in enumerate((l_mag + l_cos + l_sin + l_scale, l_mag, l_cos, l_sin, l_scale)):
                     sums[i] += v.item()
@@ -781,13 +755,13 @@ class FlowTrainer:
                 for k in raw_batch:
                     if isinstance(raw_batch[k], torch.Tensor):
                         raw_batch[k] = raw_batch[k].unsqueeze(0)
-                gt_past, _, context, structure = self._prepare_batch(raw_batch)[:4]
+                gt_past, _, context = self._prepare_batch(raw_batch)
                 encoded_past, prefix = self._encode_past(gt_past)
                 if self.spectral_mode:
                     x0 = torch.randn(1, self.spectral_frames, self.frame_dim, device=self.device)
                 else:
                     x0 = torch.randn(1, self.unit_frames, self.frame_dim, device=self.device)
-                pred_raw = self.model.generate(x0, encoded_past, context, structure_vector=structure, max_nfe=NFE,
+                pred_raw = self.model.generate(x0, encoded_past, context, max_nfe=NFE,
                                                cfg_scale=self.model_config['cfg_scale'], prefix=prefix)
                 if self.spectral_mode:
                     latent_time = spectral_to_time(pred_raw[:, :, :384], self.atom_frames)

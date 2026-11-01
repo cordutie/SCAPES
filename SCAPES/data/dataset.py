@@ -10,7 +10,6 @@ from torch.utils.data import Dataset, Subset
 from SCAPES.codecs import get_codec_info
 from SCAPES.data.config_loader import DataprepConfig
 from SCAPES.data.dataprep.semantic import CLAP_VERSION, load_audio_48k
-from SCAPES.data.dataprep.structure import structure_key
 from SCAPES.data.geometry import resolve_geometry
 from SCAPES.data.representations import RepresentationStore, frames_to_samples_48k, grid_starts_48k, ticks_to_samples_48k
 from SCAPES.data.splits import assign_region, region_bounds
@@ -20,7 +19,7 @@ SR = 48000
 VALID_KEYS = {
     "memory_buffer_latent", "target_latent",
     "memory_buffer_scale", "target_scale",
-    "target_semantic", "target_structure",
+    "target_semantic",
     "target_audio", "target_context_audio",
     "index", "label", "start_frame",
 }
@@ -78,7 +77,6 @@ class AtomSequenceDataset(Dataset):
         self.latent_dim = geom.latent_dim
         self.per_atom = geom.encoding != "whole"
         self.semantic_random_extension = config.semantic_random_extension
-        self.structure_feature_names = list(config.structure_features or [])
         self.context_samples = int(round(geom.context_seconds * SR))
         self.is_atoms = geom.atom_type != "frames"
         if self.is_atoms:
@@ -86,8 +84,6 @@ class AtomSequenceDataset(Dataset):
         else:
             self.target_samples = int(frames_to_samples_48k(geom.unit_frames, geom))
         self.clap_key = self.store.clap_key(CLAP_VERSION, geom.context_seconds, config.semantic_random_extension)
-        self.structure_key = (structure_key(self.structure_feature_names, geom)
-                              if self.structure_feature_names else None)
 
         index = self.store.read_index()
         if not index:
@@ -107,15 +103,11 @@ class AtomSequenceDataset(Dataset):
                                          config.reserve_split_ratio) for f in self.filenames}
         self.all_indices, self._regions = self._enumerate()
 
-        # CLAP and structure arrays, only for the keys that are requested
-        self._clap, self._structure = {}, {}
+        # CLAP arrays, only when they are requested
+        self._clap = {}
         if "target_semantic" in self.requested_keys:
             for fname in self.filenames:
                 self._clap[fname] = self.store.load_grid_array("clap", self.clap_key, self.audio_path(fname))
-        if "target_structure" in self.requested_keys and self.structure_key:
-            for fname in self.filenames:
-                self._structure[fname] = self.store.load_grid_array("structure", self.structure_key,
-                                                                    self.audio_path(fname))
         self._audio_cache = {}
 
         if verbose:
@@ -137,8 +129,6 @@ class AtomSequenceDataset(Dataset):
             entry = self._entries[fname]
             n48 = entry["num_samples_48k"]
             count = len(grid_starts_48k(n48, g, self.context_samples))
-            if self.structure_feature_names:
-                count = min(count, len(grid_starts_48k(n48, g, self.target_samples)))
             units = self._units[fname]
             for gi in range(count):
                 t = gi * g.stride_frames
@@ -167,8 +157,6 @@ class AtomSequenceDataset(Dataset):
         for fname in self.filenames:
             n48 = self._entries[fname]["num_samples_48k"]
             count = len(grid_starts_48k(n48, g, self.context_samples))
-            if self.structure_feature_names:
-                count = min(count, len(grid_starts_48k(n48, g, self.target_samples)))
             units = self._units[fname]
             for gi in range(count):
                 k = gi * g.stride_ticks
@@ -329,9 +317,4 @@ class AtomSequenceDataset(Dataset):
         gi = t // g.stride_ticks if self.is_atoms else t // g.stride_frames
         if "target_semantic" in req:
             item["target_semantic"] = self._clap[fname][gi].to(self.device)
-        if "target_structure" in req:
-            if self.structure_key:
-                item["target_structure"] = self._structure[fname][gi].to(self.device)
-            else:
-                item["target_structure"] = torch.zeros(0, device=self.device)
         return item

@@ -16,7 +16,6 @@ class DataprepConfig:
     conditioning_memory_seconds: Optional[float] = None
     semantic_context_seconds: float = 1.0
     semantic_random_extension: bool = True
-    structure_features: list = field(default_factory=list)
     precompute_batch_size: int = 128
     val_split_ratio: float = 0.1
     reserve_split_ratio: float = 0.1
@@ -33,7 +32,6 @@ _GIN_MAP = [
     (["conditioning_memory_seconds"], "conditioning_memory_seconds"),
     (["semantic", "context_seconds"], "semantic_context_seconds"),
     (["semantic", "random_extension"], "semantic_random_extension"),
-    (["structure", "features"], "structure_features"),
     (["precompute", "batch_size"], "precompute_batch_size"),
     (["splits", "val_split_ratio"], "val_split_ratio"),
     (["splits", "reserve_ratio"], "reserve_split_ratio"),
@@ -264,7 +262,7 @@ class TrainingConfig:
     size: Optional[str] = None
 
     # FlowModel architecture (architecture only — data-derived params like
-    # frame_dim, frames_per_atom, num_past_atoms, structure_dim etc. are
+    # frame_dim, frames_per_atom, num_past_atoms etc. are
     # read from the dataset at runtime)
     d_model: Optional[int] = None
     nhead: Optional[int] = None

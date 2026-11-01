@@ -150,11 +150,7 @@ from tqdm import tqdm
 
 class LatentSpaceExplorer:
     """
-    Visualizes semantic + structure signals from AtomSequenceDataset.
-
-    STRUCTURE MODEL:
-        [F, T] per sample
-        → expanded into F independent samples of dimension T
+    Visualizes the semantic (CLAP) signal from AtomSequenceDataset.
     """
 
     def __init__(
@@ -167,25 +163,11 @@ class LatentSpaceExplorer:
 
         self.requested_keys = getattr(dataset, "requested_keys", [])
 
-        self.has_semantic = "target_semantic" in self.requested_keys
-        self.has_structure = "target_structure" in self.requested_keys
+        if "target_semantic" not in self.requested_keys:
+            raise ValueError("Dataset must request target_semantic.")
 
-        if not self.has_semantic and not self.has_structure:
-            raise ValueError(
-                "Dataset must request target_semantic or target_structure."
-            )
-
-        self.embeddings = {}
+        self.embeddings = {"semantic": []}
         self.labels = []
-
-        # IMPORTANT: separate labels for structure expansion
-        self.structure_labels = []
-
-        if self.has_semantic:
-            self.embeddings["semantic"] = []
-
-        if self.has_structure:
-            self.embeddings["structure"] = []
 
         self._gather_data()
 
@@ -232,42 +214,19 @@ class LatentSpaceExplorer:
             # ======================================================
             # SEMANTIC (1 sample → 1 embedding)
             # ======================================================
-            if self.has_semantic:
-                semantic = sample["target_semantic"]
+            semantic = sample["target_semantic"]
 
-                emb = (
-                    semantic
-                    .view(-1, semantic.shape[-1])
-                    .mean(dim=0)
-                    .cpu()
-                    .numpy()
-                )
+            emb = (
+                semantic
+                .view(-1, semantic.shape[-1])
+                .mean(dim=0)
+                .cpu()
+                .numpy()
+            )
 
-                self.embeddings["semantic"].append(emb)
+            self.embeddings["semantic"].append(emb)
 
-            # ======================================================
-            # STRUCTURE (EXPANDED: F samples per item)
-            # ======================================================
-            if self.has_structure:
-
-                structure = sample["target_structure"]  # [F, T]
-
-                if structure.ndim != 1:
-                    for i in range(structure.shape[1]):
-
-                        vec = structure[:,i].cpu().numpy()
-
-                        self.embeddings["structure"].append(vec)
-
-                        # IMPORTANT: duplicate label per feature-vector
-                        self.structure_labels.append(sample["label"])
-                else:
-                    # Handle case where structure is already 1D (e.g., mean-pooled)
-                    vec = structure.cpu().numpy()
-                    self.embeddings["structure"].append(vec)
-                    self.structure_labels.append(sample["label"])
-                    
-        print(f"Collected {len(self.embeddings.get('semantic', []))} semantic and {len(self.embeddings.get('structure', []))} structure samples.")
+        print(f"Collected {len(self.embeddings.get('semantic', []))} semantic samples.")
 
         # Convert to numpy arrays
         for key in self.embeddings:
@@ -330,9 +289,6 @@ class LatentSpaceExplorer:
 
     def plot_semantic(self, method="pca", show_legend=True):
 
-        if not self.has_semantic:
-            raise ValueError("No semantic embeddings available.")
-
         reduced = self._reduce_dimensions(
             self.embeddings["semantic"],
             method=method
@@ -342,23 +298,6 @@ class LatentSpaceExplorer:
             reduced,
             self.labels,
             title=f"Semantic ({method.upper()})",
-            show_legend=show_legend
-        )
-
-    def plot_structure(self, method="pca", show_legend=True):
-
-        if not self.has_structure:
-            raise ValueError("No structure embeddings available.")
-
-        reduced = self._reduce_dimensions(
-            self.embeddings["structure"],
-            method=method
-        )
-
-        self._plot(
-            reduced,
-            self.structure_labels,
-            title=f"Structure ({method.upper()})",
             show_legend=show_legend
         )
 

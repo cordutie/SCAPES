@@ -1,6 +1,6 @@
-"""On-disk store of the representations of a dataset: latents, CLAP and structure arrays (design D9).
+"""On-disk store of the representations of a dataset: latents and CLAP arrays (design D9).
 
-<dataset>/representations/<codec>__<encoding>/{rep.json, index.json, latents/, clap/<key>/, structure/<key>/}
+<dataset>/representations/<codec>__<encoding>/{rep.json, index.json, latents/, clap/<key>/}
 """
 import json
 import subprocess
@@ -123,8 +123,8 @@ class RepresentationStore:
         return f"{clap_version}__ctx{context_seconds:g}__rext{int(random_extension)}__stride{self.geom.stride_frames}"
 
     def grid_path(self, kind: str, key: str, audio_path) -> Path:
-        if kind not in ("clap", "structure"):
-            raise ValueError(f"kind must be 'clap' or 'structure', got {kind!r}")
+        if kind != "clap":
+            raise ValueError(f"kind must be 'clap', got {kind!r}")
         return self.root / kind / key / self._rel(audio_path)
 
     def has_grid_array(self, kind: str, key: str, audio_path) -> bool:

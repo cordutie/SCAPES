@@ -64,7 +64,7 @@ def Dt_psi_conditioned(s, X0, X1, sigma_min=0.01, sigma_max=1.0):
     """
     return (sigma_max - sigma_min) * (X1 - X0)
 
-def flow_matching_loss(model, x0, x1, context, encoded_past, structure_vector=None, *, n_latent, has_scale,
+def flow_matching_loss(model, x0, x1, context, encoded_past, *, n_latent, has_scale,
                        scale_weight=3.0, sigma_min=0.01, sigma_max=1.0, prefix=None, s=None):
     """
     x0, x1: [B, U, frame_dim], frame_dim = n_latent + has_scale.
@@ -86,7 +86,7 @@ def flow_matching_loss(model, x0, x1, context, encoded_past, structure_vector=No
     # 3. Predict Velocity (with a prefix the model sees o + U positions, only the last U are used)
     s_model = s.squeeze(-1)
     x_in = xs if prefix is None else torch.cat([prefix, xs], dim=1)
-    u_model = model(x_t=x_in, s=s_model, context_vector=context, encoded_past=encoded_past, structure_vector=structure_vector)
+    u_model = model(x_t=x_in, s=s_model, context_vector=context, encoded_past=encoded_past)
     if prefix is not None:
         u_model = u_model[:, prefix.size(1):]
 
@@ -156,7 +156,7 @@ def fft_phase_regularizer(x1_hat: torch.Tensor, x1_true: torch.Tensor, s: torch.
     return weighted_mse.mean()
 
 
-def spectral_flow_matching_loss(model, x0, x1_time, context, encoded_past, structure_vector=None,
+def spectral_flow_matching_loss(model, x0, x1_time, context, encoded_past,
                                  scale_weight=3.0, sigma_min=0.01, sigma_max=1.0, epsilon=1e-6):
     """
     Flow matching loss computed in the spectral domain.
@@ -195,8 +195,7 @@ def spectral_flow_matching_loss(model, x0, x1_time, context, encoded_past, struc
 
     # 3. Predict velocity (model expects spectral-dim input)
     s_model = s.squeeze(-1)
-    u_model = model(x_t=xs, s=s_model, context_vector=context,
-                    encoded_past=encoded_past, structure_vector=structure_vector)
+    u_model = model(x_t=xs, s=s_model, context_vector=context, encoded_past=encoded_past)
 
     # 4. Split velocity into 4 components
     u_model_mag   = u_model[:, :, :128]

@@ -21,7 +21,6 @@ def load_flow_model(checkpoint_path, json_path, device="cpu"):
         nhead=config.get("nhead", 8),
         num_layers=config.get("num_layers", 6),
         dim_feedforward=config.get("dim_feedforward", 1024),
-        structure_dim=config.get("structure_dim", 0),
         memory_frames=config.get("memory_frames", None),
         device=device
     )
@@ -95,7 +94,6 @@ class VectorField(nn.Module):
         num_layers: int = 6,
         dim_feedforward: int = 1024,
         context_dim: int = 1024,
-        structure_dim: int = 0,
         max_atom_frames: int = 21,
         device=None
     ):
@@ -104,19 +102,6 @@ class VectorField(nn.Module):
 
         self.target_proj = nn.Linear(frame_dim, d_model, device=device)
         self.target_rope = RotaryEmbedding(d_model, max_position=max_atom_frames+1)
-
-        if structure_dim > 0:
-            self.use_structure = True
-        else:
-            self.use_structure = False
-
-        if self.use_structure:
-            self.structure_proj = nn.Sequential(
-                nn.BatchNorm1d(structure_dim, device=device),
-                nn.Linear(structure_dim, context_dim, device=device),
-                nn.GELU(),
-                nn.Linear(context_dim, context_dim, device=device),
-            )
 
         cond_dim = d_model
         self.time_mlp = nn.Sequential(
@@ -147,16 +132,10 @@ class VectorField(nn.Module):
         precomputed_memory: torch.Tensor,
         context_vector: torch.Tensor,
         s: torch.Tensor,
-        structure_vector: torch.Tensor = None
     ) -> torch.Tensor:
         B, T_new, _ = noisy_target.shape
 
         t_emb = self.time_mlp(s)
-        if self.use_structure:
-            if structure_vector is None:
-                raise ValueError("structure_vector must be provided when structure_dim > 0")
-            structure_emb = self.structure_proj(structure_vector)
-            context_vector = context_vector + structure_emb
         c_emb = self.context_mlp(context_vector)
         cond = t_emb + c_emb
 
@@ -186,7 +165,6 @@ class FlowModel(nn.Module):
         nhead: int = 8,
         num_layers: int = 6,
         dim_feedforward: int = 1024,
-        structure_dim: int = 0,
         memory_frames: Optional[int] = None,
         device=None,
         **kwargs
@@ -221,21 +199,22 @@ class FlowModel(nn.Module):
             dim_feedforward=dim_feedforward,
             context_dim=context_vector_dim,
             max_atom_frames=frames_per_atom,
-            structure_dim=structure_dim,
             device=device
         )
 
     def prepare_memory(self, encoded_past: torch.Tensor) -> torch.Tensor:
         return self.memory_pos_enc(encoded_past)
 
+    # structure_vector is no longer used. It stays in the signature only because a locked test passes it.
     def forward(self, x_t, s, context_vector, encoded_past, structure_vector=None):
+        if structure_vector is not None:
+            raise ValueError("structure features were removed: structure_vector must be None")
         precomputed_memory = self.prepare_memory(encoded_past)
-        return self.transformer(x_t, precomputed_memory, context_vector, s, structure_vector)
+        return self.transformer(x_t, precomputed_memory, context_vector, s)
 
     def vector_field(self, x, s, context_dict):
         precomputed_memory = context_dict['memory']
         clap_context       = context_dict['clap']
-        structure_vector   = context_dict.get('structure', None)
         cfg_scale          = context_dict.get('cfg_scale', 3.0)
         prefix             = context_dict.get('prefix', None)
 
@@ -247,25 +226,24 @@ class FlowModel(nn.Module):
             o = 0
 
         if cfg_scale == 1.0:
-            return self.transformer(x, precomputed_memory, clap_context, s, structure_vector)[:, o:]
+            return self.transformer(x, precomputed_memory, clap_context, s)[:, o:]
 
-        v_cond = self.transformer(x, precomputed_memory, clap_context, s, structure_vector)[:, o:]
+        v_cond = self.transformer(x, precomputed_memory, clap_context, s)[:, o:]
 
         null_clap = torch.zeros_like(clap_context)
-        v_uncond = self.transformer(x, precomputed_memory, null_clap, s, structure_vector)[:, o:]
+        v_uncond = self.transformer(x, precomputed_memory, null_clap, s)[:, o:]
 
         return v_uncond + cfg_scale * (v_cond - v_uncond)
 
     # prefix: None or [B, o, frame_dim], clean frames fed before x at every vector-field evaluation (AR fallback).
     # x0 and the result are [B, U, frame_dim]; prefix=None is V1's behaviour.
     @torch.no_grad()
-    def generate(self, x0, encoded_past, clap_context, structure_vector=None, max_nfe=16, cfg_scale=1.0, prefix=None):
+    def generate(self, x0, encoded_past, clap_context, max_nfe=16, cfg_scale=1.0, prefix=None):
         memory = self.prepare_memory(encoded_past)
 
         context_dict = {
             'memory': memory,
             'clap': clap_context,
-            'structure': structure_vector,
             'cfg_scale': cfg_scale,
             'prefix': prefix
         }

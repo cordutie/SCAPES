@@ -32,12 +32,12 @@ def build_run_config(dataset_config_dir, snippets: list[Path], overrides: list[s
     return out
 
 
-# Dataprep: latents, CLAP and structure arrays of every raw file into <dataset>/representations/<key>/.
+# Dataprep: latents and CLAP arrays of every raw file into <dataset>/representations/<key>/.
 # config_dir defaults to <dataset>/config and must hold dataprep.gin. clap_embedder replaces the CLAP model (tests).
 # Returns the RepresentationStore.
 def run_dataprep(dataset_path, config_dir=None, device=None, clap_embedder=None):
     from SCAPES.data.config_loader import load_dataprep_config
-    from SCAPES.data.dataprep import latents_maker, precompute_semantic_annotations, precompute_structure_annotations
+    from SCAPES.data.dataprep import latents_maker, precompute_semantic_annotations
     from SCAPES.data.dataset import AtomSequenceDataset
 
     dataset_path = Path(dataset_path)
@@ -54,15 +54,13 @@ def run_dataprep(dataset_path, config_dir=None, device=None, clap_embedder=None)
     torch.manual_seed(config.seed)
 
     print(f"Dataset: {dataset_path}\nConfig:  {config_dir}\nDevice:  {device}")
-    print("\n[1/3] Latents...")
+    print("\n[1/2] Latents...")
     store = latents_maker(dataset_path, config, device=device)
 
     dataset = AtomSequenceDataset(dataset_path, config, requested_keys=["index"], device="cpu", verbose=True)
-    print(f"\n[2/3] CLAP annotations (batch_size={config.precompute_batch_size})...")
+    print(f"\n[2/2] CLAP annotations (batch_size={config.precompute_batch_size})...")
     precompute_semantic_annotations(dataset, embedder=clap_embedder, batch_size=config.precompute_batch_size,
                                     device=device)
-    print("\n[3/3] Structure annotations...")
-    precompute_structure_annotations(dataset, batch_size=config.precompute_batch_size, device=device)
     print("\nDone!")
     return store
 
@@ -117,8 +115,6 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
     # Dataset (CPU, the trainer moves the batches to the GPU)
     requested_keys = ["memory_buffer_latent", "target_latent", "memory_buffer_scale", "target_scale",
                       "target_semantic", "index"]
-    if dataprep_config.structure_features:
-        requested_keys.insert(-1, "target_structure")
     dataset = AtomSequenceDataset(dataset_path=dataset_path, config=dataprep_config, requested_keys=requested_keys,
                                   device="cpu", verbose=True)
     train_split, val_split = dataset.get_splits()
@@ -147,7 +143,6 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
         num_past_atoms=geom.memory_units,
         frames_per_atom=frames_per_atom,
         memory_frames=geom.memory_frames if geom.mode == "autoregressive" else None,
-        structure_dim=len(dataset.structure_feature_names),
         device=device,
     )
 
@@ -192,15 +187,14 @@ def _training_probe(trainer, split):
 
     def step(b):
         batch = default_collate([split[i % len(split)] for i in range(PROBE_UNIT * b)])
-        past, present, context, structure = trainer._prepare_batch(batch)
+        past, present, context = trainer._prepare_batch(batch)
         encoded_past, prefix = trainer._encode_past(past, train=True)
         if trainer.spectral_mode:
             noise = torch.randn(present.size(0), trainer.spectral_frames, trainer.frame_dim, device=trainer.device)
-            loss = spectral_flow_matching_loss(trainer.model, noise, present, context, encoded_past,
-                                               structure_vector=structure)[0]
+            loss = spectral_flow_matching_loss(trainer.model, noise, present, context, encoded_past)[0]
         else:
             noise = torch.randn_like(present)
-            loss = flow_matching_loss(trainer.model, noise, present, context, encoded_past, structure_vector=structure,
+            loss = flow_matching_loss(trainer.model, noise, present, context, encoded_past,
                                       n_latent=trainer.n_latent, has_scale=trainer.has_scale, prefix=prefix)[0]
         loss.backward()
         trainer.optimizer.zero_grad(set_to_none=True)
@@ -215,7 +209,7 @@ def _auto_training_batch(trainer, split):
     adam_bytes = 2 * sum(p.numel() * p.element_size() for p in params)
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         # capped at 128, and at the split: a larger batch gives no step at all (drop_last);
-        # floor 2: a batch of 1 fails in the batch-norm layer with structure features
+        # floor 2: a batch of 1 is not a useful probe of the memory
         batch, free, fixed, per_item = auto_batch(_training_probe(trainer, split), cap=min(128, len(split)),
                                                   extra_fixed_bytes=adam_bytes, items_per_call=PROBE_UNIT, floor=2)
     print(f"batch_size auto -> {batch} (free {free / 2**30:.2f} GiB, fixed {fixed / 2**20:.0f} MiB, "
