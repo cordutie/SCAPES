@@ -35,3 +35,7 @@ recurrentgemma[jax]==1.0.1
 orbax-checkpoint==0.12.7
 safetensors==0.8.0
 encodec==0.1.1
+# IPython: imported by SCAPES/inference/FlowInference.py and the notebooks (dependency pass, phase 1)
+ipython==9.11.0
+# torchlibrosa: imported by msclap, which is installed with --no-deps (dependency pass, phase 1)
+torchlibrosa==0.1.0
