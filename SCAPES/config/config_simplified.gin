@@ -1,0 +1,10 @@
+# SCAPES configuration: the minimum.
+# Changing codec or conditioning_rate after dataprep needs a new build folder (the run says so).
+
+codec = "music2latent"              # encodec24 | spectrostream | encodec48 | music2latent
+conditioning_rate = 10.0            # Hz
+conditioning_memory_seconds = 0.5   # s; 0.5 for atoms, 1.0 for autoregressive codecs
+model.size = "large"                # petite | tiny | small | medium | large | extra_large
+
+# Optional: path to a cherry_picking.csv. Leave empty if you do not use it. Relative paths start at the folder of this file.
+cherry_picking = ""

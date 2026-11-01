@@ -45,7 +45,7 @@ def _resolve_device(requested):
     return requested
 
 
-# A Subset that remembers its time region ("train" | "val" | "reserve")
+# A Subset that remembers its time region ("train" | "val" | "test")
 class RegionSubset(Subset):
     def __init__(self, dataset, indices, region):
         super().__init__(dataset, indices)
@@ -100,7 +100,7 @@ class AtomSequenceDataset(Dataset):
             self._units[fname] = data["latent"].shape[0] if self.per_atom else data["latent"].shape[-1]
 
         self._bounds = {f: region_bounds(self._entries[f]["duration_s"], config.val_split_ratio,
-                                         config.reserve_split_ratio) for f in self.filenames}
+                                         config.test_split_ratio) for f in self.filenames}
         self.all_indices, self._regions = self._enumerate()
 
         # CLAP arrays, only when they are requested
@@ -177,14 +177,14 @@ class AtomSequenceDataset(Dataset):
         print("\nDataset summary ---------------------------------------------------------------")
         print(f"    {len(self.filenames)} files, representation {self.store.key}")
         if self.is_atoms:
-            counts = {r: self._regions.count(r) for r in ("train", "val", "reserve")}
+            counts = {r: self._regions.count(r) for r in ("train", "val", "test")}
             print(f"    atom {g.atom_samples} samples, hop {g.hop_samples}, stride {g.stride_ticks} hops, past {g.memory_units} atoms")
             print(f"    {len(self.all_indices)} samples: {counts}")
             print(f"    Requested keys: {sorted(self.requested_keys)}")
             return
         print(f"    unit {g.unit_frames} frames ({g.unit_frames / g.frame_rate:.4f} s), stride {g.stride_frames} frames, "
               f"past {g.past_frames} frames, conditioning rate {g.frame_rate / g.stride_frames:.2f} Hz")
-        counts = {r: self._regions.count(r) for r in ("train", "val", "reserve")}
+        counts = {r: self._regions.count(r) for r in ("train", "val", "test")}
         print(f"    {len(self.all_indices)} samples: {counts}")
         print(f"    Requested keys: {sorted(self.requested_keys)}")
 
@@ -197,11 +197,11 @@ class AtomSequenceDataset(Dataset):
 
     def get_splits(self):
         train, val = self._subset("train"), self._subset("val")
-        print(f"Time split: {len(train)} train samples, {len(val)} val samples, {len(self._subset('reserve'))} reserve.")
+        print(f"Time split: {len(train)} train samples, {len(val)} val samples, {len(self._subset('test'))} test.")
         return train, val
 
-    def get_reserve(self):
-        return self._subset("reserve")
+    def get_test(self):
+        return self._subset("test")
 
     # Start of the target in seconds
     def target_time(self, idx) -> float:
@@ -215,7 +215,7 @@ class AtomSequenceDataset(Dataset):
     def latent_stats(self, subset):
         region = getattr(subset, "region", None)
         if region is None:
-            raise ValueError("latent_stats needs a subset from get_splits() or get_reserve()")
+            raise ValueError("latent_stats needs a subset from get_splits() or get_test()")
         if self.is_atoms:
             return self._latent_stats_new(region)
         f, H = self.geom.frame_rate, self.geom.unit_hop_frames

@@ -1,0 +1,58 @@
+# SCAPES configuration: everything you can choose.
+# One file for dataprep, training and generation. Lines marked [dataprep] are baked into the build folder's dataset:
+# changing one later needs a new build folder (the run refuses and says which key). Lines marked [training] only change
+# the model you train. Commented lines show the default.
+
+# ---- Generation (the codec and the geometry) [dataprep]
+codec = "music2latent"              # encodec24 | spectrostream (autoregressive) | encodec48 | music2latent (atoms)
+conditioning_rate = 10.0            # Hz; rounded to the nearest rate the codec allows (docs/generation_modes.html)
+conditioning_memory_seconds = 0.5   # s [training]; 0.5 for atoms, 1.0 for autoregressive codecs. Part of the model folder name
+
+# ---- Cherry picking (optional) [dataprep]
+# Path to a cherry_picking.csv (file, start, end, flag per line). Empty = no cherry picking. Relative paths start at the
+# folder of this file. The path is a dataprep spec; the content of the csv is not, so editing it needs no new dataprep.
+cherry_picking = ""
+
+# ---- Dataprep [dataprep]
+semantic.context_seconds = 1.0      # seconds of audio behind each CLAP embedding
+semantic.random_extension = True    # random extension of short files for the CLAP embedding
+precompute.batch_size = 128         # CLAP batch size (not the training batch)
+splits.val_split_ratio = 0.1        # validation share: the end of each file, used to pick the model
+splits.test_ratio = 0.0             # last part of each file, never used for training or selection; 0.0 = no test part
+dataset.hop_atoms = 1               # [dataprep] atoms mode: spacing between training examples, in atoms.
+                                    # 1 = every atom is an example (most data); 2 = every second atom
+                                    # (half the examples, faster epochs). Changing it needs a new build folder.
+seed = 42                           # dataprep seed (splits, random extension)
+device = "auto"                     # "auto" | "cuda" | "cpu"
+
+# ---- Model size [training]
+model.size = "large"                # petite | tiny | small | medium | large | extra_large
+local_encoder.hidden_dim = 256
+local_encoder.time_entanglement = True
+
+# ---- Training [training]
+training.max_epochs = 400           # the run stops earlier when the validation loss stops improving (patience)
+# training.max_steps = 2000         # a step budget instead of epochs
+training.batch_size = "auto"        # "auto": the largest batch that fits the free GPU memory, at most 128; or an integer
+training.learning_rate = 1e-4
+training.past_dropout = 0.25
+training.conditioning_dropout = 0.2
+training.context_source = "clap"
+training.log_every = 50             # steps between log lines
+# training.seed = 0                 # training seed (default: the dataprep seed)
+# training.val_every_steps = 500    # validate every N steps instead of once per epoch
+training.audio_val_freq = 15        # epochs between validation audio
+# training.val_files = ["file1.wav", "file2.wav"]   # or ["all"], or ["random=3"]
+# training.val_duration = 5.0       # seconds of each validation file
+training.regularizers_and_weights = [["time_phase", 1], ["fft_phase", 0.1]]
+# training.use_discriminator = True # adversarial second stage
+# training.disc_epochs = 10         # epochs of that second stage
+
+# ---- Checkpoints [training]
+training.checkpoint_freq = 15       # epochs between checkpoints; 0 = best and last only
+# training.save_resume_states = True  # also save optimizer states, to resume a run
+
+# ---- Generation and validation [inference]
+inference.nfe = 16                  # ODE steps for generation and for the timing check in the notebook
+training.val_nfe = 16               # ODE steps for validation audio
+inference.cfg_scale = 1.0           # guidance off (1.0). Above 1 it applies to every step and every codec

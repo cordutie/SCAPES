@@ -1,4 +1,5 @@
 import ast
+import difflib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
@@ -18,12 +19,13 @@ class DataprepConfig:
     semantic_random_extension: bool = True
     precompute_batch_size: int = 128
     val_split_ratio: float = 0.1
-    reserve_split_ratio: float = 0.1
+    test_split_ratio: float = 0.0
     train_split: Optional[str] = None
     val_split: Optional[str] = None
     hop_atoms: int = 1
     seed: int = 42
     device: str = "auto"
+    cherry_picking: str = ""     # path to cherry_picking.csv; "" = none
 
 
 _GIN_MAP = [
@@ -34,12 +36,13 @@ _GIN_MAP = [
     (["semantic", "random_extension"], "semantic_random_extension"),
     (["precompute", "batch_size"], "precompute_batch_size"),
     (["splits", "val_split_ratio"], "val_split_ratio"),
-    (["splits", "reserve_ratio"], "reserve_split_ratio"),
+    (["splits", "test_ratio"], "test_split_ratio"),
     (["splits", "train_split"], "train_split"),
     (["splits", "val_split"], "val_split"),
     (["dataset", "hop_atoms"], "hop_atoms"),
     (["seed"], "seed"),
     (["device"], "device"),
+    (["cherry_picking"], "cherry_picking"),
 ]
 
 
@@ -182,12 +185,15 @@ def load_dataprep_config(gin_path: Path) -> DataprepConfig:
     written = []
     raw = parse_gin_config(path, written)
     _check_rejected_keys(written, path)
+    _check_known_keys(written, path)
     cfg = DataprepConfig()
     for keys, attr in _GIN_MAP:
         val = _get_nested(raw, keys, None)
         if val is not None:
             setattr(cfg, attr, val)
     _check_required(cfg, path)
+    if not isinstance(cfg.cherry_picking, str):
+        raise ConfigError(f"{path}: cherry_picking must be a quoted path, or \"\" for none")
     return cfg
 
 
@@ -216,6 +222,20 @@ def _check_rejected_keys(written, path):
                               f"(docs/generation_modes.html)")
 
 
+# Refused by the two loaders only: old model folders still write the line in inference.gin, and geometry reads that file.
+def _check_known_keys(written, path):
+    for key in written:
+        if key in _REFUSED_KEYS:
+            raise ConfigError(f"{path}: '{key}' {_REFUSED_KEYS[key]}")
+        if key in KNOWN_KEYS:
+            continue
+        if key in _RENAMED_KEYS:
+            raise ConfigError(f"{path}: '{key}' was renamed: write {_RENAMED_KEYS[key]}")
+        close = difflib.get_close_matches(key, sorted(KNOWN_KEYS), n=1)
+        hint = f"; did you mean '{close[0]}'?" if close else ""
+        raise ConfigError(f"{path}: unknown key '{key}'{hint}")
+
+
 def _check_required(cfg, path):
     from SCAPES.generation import CODECS, WRAPPER_TO_CANONICAL
 
@@ -240,7 +260,7 @@ def _get_nested(config, keys, default=None):
 
 # ─── Training Config ────────────────────────────────────────────────────────────
 
-# Canonical names in size order: petite, tiny, small, medium, large, extra_large (audiobox is unnamed). Musical-dynamics aliases:
+# Canonical names in size order: petite, tiny, small, medium, large, extra_large. Musical-dynamics aliases:
 # pp = petite, p = tiny, mp = small, mf = medium, f = large, ff = extra_large. Explicit d_model/nhead/num_layers/ff keep working.
 _SIZE_TABLE = {
     "petite":      {"d_model": 256,  "num_layers": 4,  "nhead": 4,  "dim_feedforward": 1024},
@@ -249,7 +269,6 @@ _SIZE_TABLE = {
     "medium":      {"d_model": 768,  "num_layers": 8,  "nhead": 12, "dim_feedforward": 2048},
     "large":       {"d_model": 1024, "num_layers": 12, "nhead": 16, "dim_feedforward": 2048},
     "extra_large": {"d_model": 1280, "num_layers": 16, "nhead": 20, "dim_feedforward": 2048},
-    "audiobox":    {"d_model": 1024, "num_layers": 24, "nhead": 16, "dim_feedforward": 4096},
 }
 _SIZE_TABLE.update({"pp": _SIZE_TABLE["petite"], "p": _SIZE_TABLE["tiny"], "mp": _SIZE_TABLE["small"], "mf": _SIZE_TABLE["medium"],
                     "f": _SIZE_TABLE["large"], "ff": _SIZE_TABLE["extra_large"]})
@@ -257,7 +276,7 @@ _SIZE_TABLE.update({"pp": _SIZE_TABLE["petite"], "p": _SIZE_TABLE["tiny"], "mp":
 
 @dataclass
 class TrainingConfig:
-    # Model size — picks from the size table (small/medium/large/extra_large/audiobox).
+    # Model size — picks from the size table (petite ... extra_large).
     # Either 'size' OR all of (d_model, nhead, num_layers, dim_feedforward) must be set.
     size: Optional[str] = None
 
@@ -275,13 +294,14 @@ class TrainingConfig:
     local_encoder_temporal_compression: int = 1
 
     # Training loop
-    epochs: int = 75
+    epochs: int = 400   # training.max_epochs: the run stops earlier by patience (FlowTrainer.train, patience 10)
     batch_size: Union[int, str] = "auto"   # "auto": from the free GPU memory (on CPU: 128)
     learning_rate: float = 1e-4
     past_dropout: float = 0.25
     conditioning_dropout: float = 0.2
     audio_val_freq: int = 15
     val_nfe: int = 16
+    nfe: int = 16              # inference.nfe: ODE steps of the timing check in the notebook
     context_source: str = "clap"
 
     # Checkpointing
@@ -320,8 +340,7 @@ _TRAINING_GIN_MAP = [
     (["model", "dim_feedforward"], "dim_feedforward"),
     (["local_encoder", "hidden_dim"], "local_encoder_hidden_dim"),
     (["local_encoder", "time_entanglement"], "local_encoder_time_entanglement"),
-    (["local_encoder", "temporal_compression"], "local_encoder_temporal_compression"),
-    (["training", "epochs"], "epochs"),
+    (["training", "max_epochs"], "epochs"),
     (["training", "batch_size"], "batch_size"),
     (["training", "learning_rate"], "learning_rate"),
     (["training", "past_dropout"], "past_dropout"),
@@ -335,6 +354,7 @@ _TRAINING_GIN_MAP = [
     (["training", "val_duration"], "val_duration"),
     (["inference", "cfg_scale"], "cfg_scale"),
     (["training", "use_discriminator"], "use_discriminator"),
+    (["training", "disc_epochs"], "disc_epochs"),
     (["training", "stage2_epochs"], "stage2_epochs"),
     (["training", "regularizers_and_weights"], "regularizers_and_weights"),
     (["training", "standardize_latents"], "standardize_latents"),
@@ -343,7 +363,18 @@ _TRAINING_GIN_MAP = [
     (["training", "val_every_steps"], "val_every_steps"),
     (["training", "log_every"], "log_every"),
     (["training", "seed"], "seed"),
+    (["inference", "nfe"], "nfe"),
 ]
+
+# Every dotted key that the two loaders read: any other key in a config file is refused (A7).
+KNOWN_KEYS = {".".join(keys) for keys, _ in _GIN_MAP + _TRAINING_GIN_MAP}
+
+# Keys that were renamed: the message names the new key.
+_RENAMED_KEYS = {"training.epochs": "training.max_epochs", "splits.reserve_ratio": "splits.test_ratio"}
+
+# Keys that are no longer read at all: the message says why.
+_REFUSED_KEYS = {"local_encoder.temporal_compression": "is not a key any more: the local encoder always uses temporal "
+                                                        "compression 1"}
 
 
 def _resolve_size_table(cfg: TrainingConfig) -> TrainingConfig:
@@ -381,7 +412,10 @@ def load_training_config(gin_path: Path) -> TrainingConfig:
     if not path.exists():
         raise FileNotFoundError(f"Gin config not found: {path}")
 
-    raw = parse_gin_config(path)
+    written = []
+    raw = parse_gin_config(path, written)
+    _check_rejected_keys(written, path)
+    _check_known_keys(written, path)
     cfg = TrainingConfig()
     for keys, attr in _TRAINING_GIN_MAP:
         val = _get_nested(raw, keys, None)
