@@ -37,13 +37,13 @@ def measure_per_item(step_fn):
 
 # Batch for one step. The memory the models already hold is not free any more, so it is taken out of the fixed cost;
 # extra_fixed_bytes adds what the step does not allocate yet (the optimizer state). One step_fn(b) call runs
-# items_per_call * b items. Returns (batch in items, free, fixed, per_item).
-def auto_batch(step_fn, cap=None, extra_fixed_bytes=0, fraction=0.8, items_per_call=1):
+# items_per_call * b items. floor is the smallest batch returned. Returns (batch in items, free, fixed, per_item).
+def auto_batch(step_fn, cap=None, extra_fixed_bytes=0, fraction=0.8, items_per_call=1, floor=1):
     base = torch.cuda.memory_allocated()
     fixed, per_call = measure_per_item(step_fn)
     per_item = per_call / items_per_call
     torch.cuda.empty_cache()
     free = free_gpu_bytes()
     fixed = max(0, fixed - base) + extra_fixed_bytes
-    batch = batch_from_memory(per_item, fixed_bytes=fixed, free_bytes=free, fraction=fraction, cap=cap)
+    batch = batch_from_memory(per_item, fixed_bytes=fixed, free_bytes=free, fraction=fraction, cap=cap, floor=floor)
     return batch, free, fixed, per_item

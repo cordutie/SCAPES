@@ -14,7 +14,6 @@ Clone the repository with its codec wrappers (the git submodule `external/audio_
 ```bash
 git clone --recurse-submodules https://github.com/cordutie/SCAPES.git
 cd SCAPES
-git checkout v2                # until v2 is merged into main
 git submodule update --init    # only needed if you cloned without --recurse-submodules
 ```
 

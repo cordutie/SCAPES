@@ -214,9 +214,10 @@ def _auto_training_batch(trainer, split):
     params = [p for group in trainer.optimizer.param_groups for p in group["params"]]
     adam_bytes = 2 * sum(p.numel() * p.element_size() for p in params)
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
-        # capped at the split: a larger batch gives no step at all (drop_last)
-        batch, free, fixed, per_item = auto_batch(_training_probe(trainer, split), cap=len(split),
-                                                  extra_fixed_bytes=adam_bytes, items_per_call=PROBE_UNIT)
+        # capped at 128, and at the split: a larger batch gives no step at all (drop_last);
+        # floor 2: a batch of 1 fails in the batch-norm layer with structure features
+        batch, free, fixed, per_item = auto_batch(_training_probe(trainer, split), cap=min(128, len(split)),
+                                                  extra_fixed_bytes=adam_bytes, items_per_call=PROBE_UNIT, floor=2)
     print(f"batch_size auto -> {batch} (free {free / 2**30:.2f} GiB, fixed {fixed / 2**20:.0f} MiB, "
           f"per item {per_item / 2**20:.1f} MiB)")
     return batch
