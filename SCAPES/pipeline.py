@@ -1,11 +1,15 @@
 """Entry points of the V2 pipeline: build_run_config, run_dataprep, build_trainer, run_training and run_generation."""
 import dataclasses
 import math
+import os
 import random
+import shutil
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from SCAPES.errors import ConfigError
 
 # gin keys owned by the codec snippet: a dataset's own lines in these namespaces are dropped
 _GEOMETRY_KEYS = ("codec", "conditioning_rate", "conditioning_memory_seconds")
@@ -32,9 +36,18 @@ def build_run_config(dataset_config_dir, snippets: list[Path], overrides: list[s
     return out
 
 
+# The two config files of an entry point. A file is the universal config (both loaders read it); a folder is the old
+# layout with dataprep.gin and training.gin.
+def _gin_files(config_dir):
+    path = Path(config_dir)
+    if path.is_dir():
+        return path / "dataprep.gin", path / "training.gin"
+    return path, path
+
+
 # Dataprep: latents and CLAP arrays of every raw file into <dataset>/representations/<key>/.
-# config_dir defaults to <dataset>/config and must hold dataprep.gin. clap_embedder replaces the CLAP model (tests).
-# Returns the RepresentationStore.
+# config_dir defaults to <dataset>/config: a config file, or a folder holding dataprep.gin. clap_embedder replaces the
+# CLAP model (tests). Returns the RepresentationStore.
 def run_dataprep(dataset_path, config_dir=None, device=None, clap_embedder=None):
     from SCAPES.data.config_loader import load_dataprep_config
     from SCAPES.data.dataprep import latents_maker, precompute_semantic_annotations
@@ -42,7 +55,8 @@ def run_dataprep(dataset_path, config_dir=None, device=None, clap_embedder=None)
 
     dataset_path = Path(dataset_path)
     config_dir = Path(config_dir) if config_dir is not None else dataset_path / "config"
-    config = load_dataprep_config(config_dir / "dataprep.gin")
+    dataprep_gin, _ = _gin_files(config_dir)
+    config = load_dataprep_config(dataprep_gin)
     if device is None or device == "auto":
         device = config.device
     if device == "auto":
@@ -82,8 +96,9 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
 
     dataset_path = Path(dataset_path)
     config_dir = Path(config_dir) if config_dir is not None else dataset_path / "config"
-    dataprep_config = load_dataprep_config(config_dir / "dataprep.gin")
-    training_config = load_training_config(config_dir / "training.gin")
+    dataprep_gin, training_gin = _gin_files(config_dir)
+    dataprep_config = load_dataprep_config(dataprep_gin)
+    training_config = load_training_config(training_gin)
     geom = resolve_geometry(dataprep_config, get_codec_info(dataprep_config.codec_name))
     print_resolution(geom.resolution)
 
@@ -210,8 +225,20 @@ def _auto_training_batch(trainer, split):
     return batch
 
 
-# build_trainer + train. max_steps overrides training.max_steps. Returns save_path.
-def run_training(dataset_path, save_path, config_dir=None, resume=None, max_steps=None) -> Path:
+# The cherry-picking CSV of a run when none is given. A folder (old layout) holds cherry_picking.csv; a config file names
+# its CSV with the key cherry_picking, relative to its folder. None: no CSV.
+def _default_cherry_csv(config_dir):
+    from SCAPES.data.config_loader import load_dataprep_config
+    path = Path(config_dir)
+    if path.is_dir():
+        return path / "cherry_picking.csv"
+    key = load_dataprep_config(path).cherry_picking
+    return path.parent / key if key else None
+
+
+# build_trainer + train. max_steps overrides training.max_steps. cherry_csv: the CSV whose semantics go into
+# save_path/semantics (None: _default_cherry_csv). Returns save_path.
+def run_training(dataset_path, save_path, config_dir=None, resume=None, max_steps=None, cherry_csv=None) -> Path:
     from SCAPES.data.dataprep.semantic import build_semantics_folder
     from SCAPES.data.config_loader import load_training_config
 
@@ -222,16 +249,124 @@ def run_training(dataset_path, save_path, config_dir=None, resume=None, max_step
         trainer.max_steps = max_steps
 
     # Semantics folder from the cherry-picking CSV (for the demo)
-    cherry_csv = config_dir / "cherry_picking.csv"
-    if cherry_csv.exists():
+    if cherry_csv is None:
+        cherry_csv = _default_cherry_csv(config_dir)
+    if cherry_csv is not None and Path(cherry_csv).exists():
         build_semantics_folder(csv_path=cherry_csv, output_dir=Path(save_path) / "semantics", dataset=trainer.dataset)
 
-    cfg = load_training_config(config_dir / "training.gin")
+    _, training_gin = _gin_files(config_dir)
+    cfg = load_training_config(training_gin)
     # with a step budget the epoch count must not cut the run short: every epoch has at least one step
     epochs = cfg.epochs if trainer.max_steps is None else max(cfg.epochs, trainer.max_steps)
     trainer.train(epochs=epochs, audio_val_freq=cfg.audio_val_freq, val_nfe=cfg.val_nfe)
     print("Training complete!")
     return Path(save_path)
+
+
+# Name of a model folder: <size>_mem<ms>. The size is its canonical name (f -> large); the memory is in whole
+# milliseconds, so a memory that is not a whole number of milliseconds is refused.
+def model_folder_name(size, memory_seconds) -> str:
+    from SCAPES.data.config_loader import _SIZE_TABLE
+    ms_exact = memory_seconds * 1000
+    ms = round(ms_exact)
+    if abs(ms_exact - ms) > 1e-6:
+        raise ConfigError(f"conditioning_memory_seconds = {memory_seconds} is not a whole number of milliseconds; the "
+                          f"model folder name uses milliseconds")
+    if size is None:
+        raise ConfigError("set model.size: the model folder is named after it")
+    if size not in _SIZE_TABLE:
+        raise ConfigError(f"Invalid size '{size}'. Choose from: {list(_SIZE_TABLE.keys())}")
+    # the aliases share one dictionary with their canonical size, which comes first in the table
+    canonical = next(k for k in _SIZE_TABLE if _SIZE_TABLE[k] is _SIZE_TABLE[size])
+    return f"{canonical}_mem{ms}"
+
+
+# The model folder of a config in a build folder: models/<size>_mem<ms>. Nothing is created.
+def model_folder(build_path, config_path) -> Path:
+    from SCAPES.data.config_loader import load_dataprep_config, load_training_config
+    from SCAPES.generation import resolve_generation
+    tcfg = load_training_config(Path(config_path))
+    dcfg = load_dataprep_config(Path(config_path))
+    memory = resolve_generation(dcfg.codec_name, dcfg.conditioning_rate,
+                                dcfg.conditioning_memory_seconds).requested_memory_seconds
+    return Path(build_path) / "models" / model_folder_name(tcfg.size, memory)
+
+
+# A wav folder must exist and hold audio.
+def _check_wav_folder(wav_path):
+    from SCAPES.data.dataprep.specs import audio_files
+    if not wav_path.is_dir():
+        raise ConfigError(f"wav folder {wav_path} is not a folder")
+    if not audio_files(wav_path):
+        raise ConfigError(f"wav folder {wav_path} has no audio files (wav, mp3, flac, ogg)")
+
+
+# Makes dataset/ and links dataset/raw to the wav folder (no copy). A file system that refuses links stops the run, and
+# the dataset folder made here is removed again.
+def _link_wavs(dataset, wav_path):
+    dataset.mkdir(parents=True)
+    try:
+        os.symlink(wav_path.resolve(), dataset / "raw", target_is_directory=True)
+    except OSError as err:
+        shutil.rmtree(dataset)
+        raise ConfigError(f"could not link {dataset / 'raw'} to the wav folder {wav_path.resolve()} ({err.strerror}): "
+                          f"the file system refuses symbolic links. No copy was made. Keep the build folder on a disk "
+                          f"that allows links, and the wavs on any disk.") from err
+
+
+# Dataprep into the build folder: <build>/dataset/, with dataset/raw linked to the wav folder. When the dataset there was
+# made from the same specs (dataprep_specs.json), dataprep is not run. Otherwise it runs, then the specs are written.
+# A dataset made from other specs or other wavs is refused. Returns the dataset folder.
+def prepare_build(wav_path, build_path, config_path, clap_embedder=None, device=None) -> Path:
+    from SCAPES.data.config_loader import load_dataprep_config
+    from SCAPES.data.dataprep.specs import check_dataset, dataprep_specs, write_specs
+
+    wav_path, build_path, config_path = Path(wav_path), Path(build_path), Path(config_path)
+    cfg = load_dataprep_config(config_path)
+    _check_wav_folder(wav_path)
+    specs = dataprep_specs(cfg, wav_path, config_path)
+    dataset = build_path / "dataset"
+    if check_dataset(build_path, wav_path, specs) == "reuse":
+        print(f"Dataset reused: {dataset} (dataprep_specs.json matches the config). Dataprep not run.")
+        return dataset
+    _link_wavs(dataset, wav_path)
+    run_dataprep(dataset, config_dir=config_path, device=device, clap_embedder=clap_embedder)
+    write_specs(dataset, specs)
+    return dataset
+
+
+# A model folder is never trained over: a new run needs a folder that does not exist, and resume needs one that does.
+def _check_model_folder(model_dir, resume):
+    if resume is None and model_dir.exists():
+        raise ConfigError(f"Model folder {model_dir} already exists. A model with the same size and memory is never "
+                          f"trained over the first. Use another model.size or conditioning_memory_seconds, or resume= "
+                          f"to continue an interrupted run. Nothing was written.")
+    if resume is not None and not model_dir.exists():
+        raise ConfigError(f"resume={resume!r}: there is no model folder {model_dir} to resume. Nothing was written.")
+
+
+# Trains one model in the build folder, into models/<size>_mem<ms>/, with the dataset of prepare_build. No dataprep runs:
+# the dataset must exist and its specs and wavs must match the config and the wav folder. The cherry-picked semantics go
+# into the model folder. max_steps overrides training.max_steps. Returns the model folder.
+def train_in_build(wav_path, build_path, config_path, resume=None, max_steps=None) -> Path:
+    from SCAPES.data.config_loader import load_dataprep_config
+    from SCAPES.data.dataprep.specs import check_dataset, dataprep_specs
+
+    wav_path, build_path, config_path = Path(wav_path), Path(build_path), Path(config_path)
+    model_dir = model_folder(build_path, config_path)
+    dataset = build_path / "dataset"
+    if not dataset.exists():
+        raise ConfigError(f"no dataset in {build_path}: run data_preparation first")
+    _check_wav_folder(wav_path)
+    specs = dataprep_specs(load_dataprep_config(config_path), wav_path, config_path)
+    check_dataset(build_path, wav_path, specs)
+    print(f"Dataprep specs match {dataset}; dataprep not run.")
+    _check_model_folder(model_dir, resume)
+    model_dir.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Model folder: {model_dir}")
+    cherry = specs["cherry_picking"] or None
+    return run_training(dataset, model_dir, config_dir=config_path, resume=resume, max_steps=max_steps,
+                        cherry_csv=cherry)
 
 
 # Number of generation units that cover `seconds` of audio: AR blocks of B frames, or atoms placed H frames apart
