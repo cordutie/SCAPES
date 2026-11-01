@@ -20,7 +20,7 @@ def seconds_to_samples(seconds: float, sample_rate: int) -> int:
     return max(0, math.ceil(seconds * sample_rate - 1e-6))
 
 
-ATOM_TYPES = ("frames", "consistent")   # "frames" is the AR layout; "consistent" is the atoms layout
+ATOM_TYPES = ("frames", "atoms")   # "frames" is the AR layout; "atoms" is the atoms layout
 
 
 # Number of atoms of C samples placed H samples apart that fit in num_samples (0 if the audio is shorter than one atom).
@@ -51,7 +51,7 @@ class Geometry:
     has_scale: bool           # the codec normalises its input
     frame_dim: int            # latent_dim + has_scale
     encoding: str             # "whole" | f"atoms-f{F}-h{H}" (AR) | f"atoms-c{C}-h{H}" (atoms)
-    atom_type: str = "frames"          # "frames" (AR) | "consistent" (atoms)
+    atom_type: str = "frames"          # "frames" (AR) | "atoms" (atoms)
     atom_samples: int = 0              # C: B*h (AR), the chunk (atoms)
     hop_samples: int = 0               # H: B*h (AR), the hop (atoms)
     hop_atoms: int = 1                 # dataset.hop_atoms
@@ -140,7 +140,7 @@ def _make_atoms_geometry(info, res, F, H, X, M, hop_atoms, context_seconds):
         unit_frames=F, unit_hop_frames=0, memory_units=M, memory_frames=F, stride_frames=0, crossfade_samples=X,
         prefix_frames=0, decode="ola", context_seconds=context_seconds, has_scale=bool(info.normalizes_input),
         frame_dim=info.latent_dim + int(bool(info.normalizes_input)), encoding=f"atoms-c{C}-h{H}",
-        atom_type="consistent", atom_samples=C, hop_samples=H, hop_atoms=hop_atoms, resolution=res,
+        atom_type="atoms", atom_samples=C, hop_samples=H, hop_atoms=hop_atoms, resolution=res,
     )
 
 
