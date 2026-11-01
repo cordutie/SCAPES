@@ -37,3 +37,4 @@ experiments/
 # Other training experiments
 all_experiments_log.txt
 inference_log.txt
+development/
