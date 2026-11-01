@@ -2,110 +2,65 @@
 
 **SCAPES** (Semantically Conditioned Auto-Regressive Prior for Environmental Sounds) is a generative audio framework for high-fidelity environmental texture synthesis with semantic control.
 
-## Features
-
-- **Semantic control** with CLAP-based conditioning (no manual labels)
-- **Continuous latent generation** (no token quantization bottleneck)
-- **Efficient training** on consumer GPUs
-- **Long-term texture stability** in autoregressive generation
-- **Smooth semantic interpolation** between environmental classes
-
-## Demo
-
-[![HuggingFace Spaces](https://img.shields.io/badge/%F0%9F%A4%97-HuggingFace%20Spaces-yellow)](https://huggingface.co/spaces/cordutie/SCAPES-demo)
-
-Try the online demo to generate environmental sounds with semantic control.
-
-## Quick Start
-
-### Simplified Tutorial
-
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cordutie/SCAPES/blob/main/quickstart/tutorial_simplified.ipynb) 
-
-Train with default parameters and generate sounds quickly.
-
+Try the online demo: [![HuggingFace Spaces](https://img.shields.io/badge/%F0%9F%A4%97-HuggingFace%20Spaces-yellow)](https://huggingface.co/spaces/cordutie/SCAPES-demo)
 
 ## Installation
 
-SCAPES installs together with its codec wrappers ([audio_codec_wrappers](https://github.com/cordutie/audio_codec_wrappers), included as the git submodule `external/audio_codec_wrappers/`) in a single virtual environment.
-
 Requirements: Linux, Python 3.12, an NVIDIA GPU with a recent driver (CUDA 12), git.
 
+Clone the repository with its codec wrappers (the git submodule `external/audio_codec_wrappers/`):
+
+<!-- install:get -->
 ```bash
 git clone --recurse-submodules https://github.com/cordutie/SCAPES.git
 cd SCAPES
-git checkout v2        # until v2 is merged into main
-git submodule update --init   # only needed if you cloned without --recurse-submodules
+git checkout v2                # until v2 is merged into main
+git submodule update --init    # only needed if you cloned without --recurse-submodules
+```
 
+Create the virtual environment and install SCAPES in it:
+
+<!-- install:env -->
+```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-
-# 1. Pinned packages (torch, jax, ...). If you need a specific CUDA build of PyTorch, install it first.
 pip install -r requirements.txt
-
-# 2. Packages that must be installed without their own dependency pins:
-#    msclap, magenta-rt, music2latent, and the wrappers (editable, from ./external/audio_codec_wrappers)
-pip install --no-deps -r requirements-nodeps.txt
-
-# 3. One-time download of the SpectroStream weights (EnCodec and Music2Latent download themselves on first use)
+pip install --no-deps msclap==1.3.4 "magenta-rt @ git+https://github.com/magenta/magenta-realtime@694a545e4ba0b88bf1150137b129582166d3e07f"
+pip install --no-deps music2latent==0.1.8
+pip install --no-deps -e ./external/audio_codec_wrappers
 python external/audio_codec_wrappers/scripts/fetch_weights.py --codec spectrostream
 ```
 
-Check the installation (needs the GPU; the last test trains 20 steps for each of the four codecs and takes a few minutes):
+The last line downloads the SpectroStream weights once. EnCodec and Music2Latent download their weights on first use.
+
+The `--no-deps` flags: msclap declares `numpy<2` and `transformers<5`, which SCAPES does not follow; magenta-rt declares git and cloud dependencies that SCAPES does not use; music2latent and the codec wrappers are installed without their dependencies, so the versions in `requirements.txt` are the ones kept.
+
+Check that the installation works:
 
 ```bash
-python -m pytest -q tests_v3 -m slow
+python -c "import SCAPES.pipeline, audio_codec_wrappers"
 ```
 
-Notes:
-- The wrappers are pinned by the submodule commit. To move to a newer version: `git -C external/audio_codec_wrappers pull origin main`, then `git add external/audio_codec_wrappers` and commit. To change the wrappers, edit them in `external/audio_codec_wrappers/` (it is its own git repository; commit and push there, then commit the new submodule pointer here).
-- The weights are stored in `~/.cache/audio_codec_wrappers` (set `ACW_CACHE` to change it).
-- `msclap` asks for numpy < 2; this is why it is installed with `--no-deps`. Its embeddings are unchanged with numpy 2 (checked by `tests/test_env_scapes.py`).
+## Tutorials
 
-## Codecs and overlap-add
+Both tutorials run on Google Colab and on your computer. Each has a setup cell (it installs SCAPES on Colab, or finds the repository locally) and a parameters cell (the dataset, the model folder, the codec and the generation settings). Edit the placeholders in the parameters cell, or set the environment variables `SCAPES_<NAME>` (for example `SCAPES_DATASET_PATH`) before you start Jupyter.
 
-Supported codecs: `encodec24`, `spectrostream` (causal, autoregressive mode), `encodec48`, `music2latent` (non-causal, atoms mode). The generation settings are three keys in `SCAPES/config/generation.gin`:
+- [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cordutie/SCAPES/blob/main/quickstart/tutorial_simplified.ipynb) **Simplified tutorial** ([`quickstart/tutorial_simplified.ipynb`](quickstart/tutorial_simplified.ipynb)): prepare a dataset, train with the default settings and generate sounds, in a few cells.
+- [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cordutie/SCAPES/blob/main/quickstart/tutorial.ipynb) **Full tutorial** ([`quickstart/tutorial.ipynb`](quickstart/tutorial.ipynb)): the whole pipeline, one cell per stage: dataset preparation, training, and inference (full reconstruction, semantic reconstruction, interpolation and generation).
 
-| key | default | meaning |
-|---|---|---|
-| `codec` | `"music2latent"` | `encodec24`, `spectrostream` (autoregressive) or `encodec48`, `music2latent` (atoms) |
-| `conditioning_rate` | `10.0` Hz | how often the semantic condition changes; rounded to the nearest rate the codec offers |
-| `conditioning_memory_seconds` | 0.5 s (atoms), 1.0 s (autoregressive) | how much past the model attends to |
+To run a notebook on your computer, activate the environment, install Jupyter and open the notebook:
 
-The mode and the geometry are derived from these keys, and a startup line prints the resolved values and any rounding. The per-codec tables, formulas and diagrams are in [docs/generation_modes.html](docs/generation_modes.html).
+```bash
+pip install jupyter
+jupyter notebook quickstart/tutorial_simplified.ipynb
+```
 
-The keys reach a run through a merged config: `build_run_config(<dataset>/config, [SCAPES/config/generation.gin], overrides, <run>/config)` (in `SCAPES/pipeline.py`) writes `dataprep.gin` and `training.gin` with the three keys appended, and `run_dataprep` and `run_training` take that folder as `config_dir`. `python scripts/make_run_configs.py --dataset <dataset> --out <dir> codec:rate[:memory] ...` writes one such config per spec, and `quickstart/wrappers.py` does it for the notebook.
+The simplified tutorial calls two functions from [`quickstart/wrappers.py`](quickstart/wrappers.py): `data_preparation` and `training_loop`. Each merges the dataset's config with the generation settings and runs the step.
 
-In atoms mode the generated atoms are decoded one by one and overlap-added on the decoded audio. The geometry of both generation modes is in [docs/generation_modes.html](docs/generation_modes.html).
+## Documentation
 
-## Pipeline
-
-1. **Audio → Atoms**: Segment audio into overlapping windows and encode with EnCodec
-2. **Semantic Context**: Precompute CLAP embeddings for conditioning
-
-<p align="center">
-  <img src="SCAPES/auxiliar/figures/dataprep.svg" width="100%" alt="Data Preparation Pipeline">
-</p>
-
-3. **Flow Training**: Train conditional CNF (Flow Matching) to generate atoms from context
-4. **Autoregressive Synthesis**: Generate atoms iteratively with overlap-and-add crossfade
-
-<p align="center">
-  <img src="SCAPES/auxiliar/figures/architecture.svg" width="100%" alt="SCAPES Architecture">
-</p>
-
-## Future Work
-
-Potential areas for collaboration:
-
-- **New Audio Codecs**: Explore alternatives to EnCodec
-- **Perceptual Losses**: Train surrogate losses beyond MSE for latent comparison
-- **Alternative Conditioning**: Experiment with features beyond CLAP
-
-## Acknowledgments
-
-This work has been supported by the project "IA y Música: Cá-tedra en Inteligencia Artificial y Música (TSI-100929-2023-1)", funded by the "Secretaría de Estado de Digitalización e Inteligencia Artificial and the Unión Europea-Next Generation EU". We also acknowledge support from NVIDIA Corporation and Meta through academic grant programs. Additionally, we would like to express our sincere gratitude to Daniela Quimis, Clara Charbonnier, Jan Pol Obrador, Marcel Manzano, Omar Hamze, Jordi Fabregat, Eduard Herrera, and Eric Mas, for their valuable insights into extending the model to diverse audio sources, exploring alternative training techniques, and helping shape the design of an intuitive demonstration of SCAPES.
+The generation modes (`encodec24`, `spectrostream`, `encodec48`, `music2latent`), their settings (`codec`, `conditioning_rate`, `conditioning_memory_seconds`) and their geometry are described in [docs/generation_modes.html](docs/generation_modes.html).
 
 ## Citation
 
@@ -120,3 +75,7 @@ If you use SCAPES in your research, please cite:
   address   = {Cambridge, USA}
 }
 ```
+
+## Acknowledgments
+
+This work has been supported by the project "IA y Música: Cá-tedra en Inteligencia Artificial y Música (TSI-100929-2023-1)", funded by the "Secretaría de Estado de Digitalización e Inteligencia Artificial and the Unión Europea-Next Generation EU". We also acknowledge support from NVIDIA Corporation and Meta through academic grant programs. Additionally, we would like to express our sincere gratitude to Daniela Quimis, Clara Charbonnier, Jan Pol Obrador, Marcel Manzano, Omar Hamze, Jordi Fabregat, Eduard Herrera, and Eric Mas, for their valuable insights into extending the model to diverse audio sources, exploring alternative training techniques, and helping shape the design of an intuitive demonstration of SCAPES.
