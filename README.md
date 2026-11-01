@@ -27,14 +27,14 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 pip install --no-deps msclap==1.3.4 "magenta-rt @ git+https://github.com/magenta/magenta-realtime@694a545e4ba0b88bf1150137b129582166d3e07f"
-pip install --no-deps music2latent==0.1.8
-pip install --no-deps -e ./external/audio_codec_wrappers
+pip install music2latent==0.1.8
+pip install -e ./external/audio_codec_wrappers
 python external/audio_codec_wrappers/scripts/fetch_weights.py --codec spectrostream
 ```
 
 The last line downloads the SpectroStream weights once. EnCodec and Music2Latent download their weights on first use.
 
-The `--no-deps` flags: msclap declares `numpy<2` and `transformers<5`, which SCAPES does not follow; magenta-rt declares git and cloud dependencies that SCAPES does not use; music2latent and the codec wrappers are installed without their dependencies, so the versions in `requirements.txt` are the ones kept.
+The `--no-deps` flags: msclap declares `numpy<2` and `transformers<5`, which SCAPES does not follow; magenta-rt declares git and cloud dependencies that SCAPES does not use. music2latent and the codec wrappers take their dependencies normally: a `pip install --dry-run` in a fresh environment showed nothing to change for them.
 
 Check that the installation works:
 
