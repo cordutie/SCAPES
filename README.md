@@ -43,7 +43,7 @@ python -c "import SCAPES.pipeline, audio_codec_wrappers"
 
 ## Tutorials
 
-Both tutorials run on Google Colab and on your computer. Each has a setup cell (it installs SCAPES on Colab, or finds the repository locally) and a parameters cell (the dataset, the model folder, the codec and the generation settings). Edit the placeholders in the parameters cell, or set the environment variables `SCAPES_<NAME>` (for example `SCAPES_DATASET_PATH`) before you start Jupyter.
+Both tutorials run on Google Colab and on your computer. Each has a setup cell (it installs SCAPES on Colab, or finds the repository locally) and a parameters cell (the wav folder, the build folder and the config file; the codec and the generation settings are in the config file). Edit the placeholders in the parameters cell, or set the environment variables `SCAPES_<NAME>` (for example `SCAPES_WAV_PATH`) before you start Jupyter.
 
 - [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cordutie/SCAPES/blob/main/quickstart/tutorial_simplified.ipynb) **Simplified tutorial** ([`quickstart/tutorial_simplified.ipynb`](quickstart/tutorial_simplified.ipynb)): prepare a dataset, train with the default settings and generate sounds, in a few cells.
 - [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/cordutie/SCAPES/blob/main/quickstart/tutorial.ipynb) **Full tutorial** ([`quickstart/tutorial.ipynb`](quickstart/tutorial.ipynb)): the whole pipeline, one cell per stage: dataset preparation, training, and inference (full reconstruction, semantic reconstruction, interpolation and generation).
@@ -55,7 +55,7 @@ pip install jupyter
 jupyter notebook quickstart/tutorial_simplified.ipynb
 ```
 
-The simplified tutorial calls two functions from [`quickstart/wrappers.py`](quickstart/wrappers.py): `data_preparation` and `training_loop`. Each merges the dataset's config with the generation settings and runs the step.
+The simplified tutorial calls two functions from [`quickstart/wrappers.py`](quickstart/wrappers.py): `data_preparation` and `training_loop`. Each reads one config file and a build folder (`dataset/` and `models/<size>_mem<ms>/`) and runs the step.
 
 ## Documentation
 
