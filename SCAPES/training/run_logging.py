@@ -45,7 +45,7 @@ def environment_record() -> dict:
     except ImportError:
         wrappers_root = None
 
-    lock = scapes_root / "requirements.lock"
+    lock = scapes_root / "development" / "requirements.lock"
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
     driver = _run(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"])
     return {
