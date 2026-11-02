@@ -80,7 +80,8 @@ def run_dataprep(dataset_path, config_dir=None, device=None, clap_embedder=None)
 
 
 # Dataset, loaders, models, optimiser and FlowTrainer, as run_training uses them. config_dir defaults to <dataset>/config
-# and must hold dataprep.gin and training.gin. resume: None, "latest", "best" or an epoch number.
+# and must hold the config file (or the old folder with dataprep.gin and training.gin).
+# resume: None, "latest", "best" or an epoch number.
 def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
     import random
     from torch.optim import AdamW
@@ -102,7 +103,7 @@ def build_trainer(dataset_path, save_path, config_dir=None, resume=None):
     geom = resolve_geometry(dataprep_config, get_codec_info(dataprep_config.codec_name))
     print_resolution(geom.resolution)
 
-    # standardize_latents and past_noise absent from training.gin: the codec's default from the table
+    # standardize_latents and past_noise absent from the config: the codec's default from the table
     spec = CODECS[geom.codec]
     if training_config.standardize_latents is None:
         training_config = dataclasses.replace(training_config, standardize_latents=spec.standardize_latents)
