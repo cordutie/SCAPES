@@ -35,6 +35,17 @@ The `--extra-index-url` line gives the PyTorch CUDA 12.8 build that `requirement
 
 The `--no-deps` flags: msclap declares `numpy<2` and `transformers<5`, which SCAPES does not follow; magenta-rt declares git and cloud dependencies that SCAPES does not use. music2latent and the codec wrappers take their dependencies normally: a `pip install --dry-run` in a fresh environment showed nothing to change for them.
 
+### As a library (pip)
+
+SCAPES can also be installed as a package, for example by the demos. Install PyTorch first (the build for your CUDA, see `requirements.txt`), then the codec wrappers and SCAPES:
+
+```bash
+pip install "audio_codec_wrappers @ git+https://github.com/cordutie/audio_codec_wrappers"
+pip install "scapes[atlas] @ git+https://github.com/cordutie/SCAPES@v0.1.0"
+```
+
+The package lists only the libraries without a special build. `msclap` (installed with `--no-deps`) and the jax set of SpectroStream are still installed as in the steps above.
+
 Check that the installation works:
 
 ```bash

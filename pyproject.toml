@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scapes"
+version = "0.1.0"
+description = "SCAPES: Semantically Conditioned Auto-Regressive Prior for Environmental Sounds."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.11"
+# Only the libraries that have no special build. These are left to you, because they depend on your machine:
+#   torch and torchaudio (pick the build for your CUDA: see requirements.txt),
+#   audio_codec_wrappers (the git submodule external/audio_codec_wrappers, or its repository),
+#   msclap (installed with --no-deps) and the jax set of SpectroStream. requirements.txt lists the versions of the results.
+dependencies = [
+  "numpy>=2.0,<2.5",
+  "scipy>=1.2",
+  "librosa>=0.10.2",
+  "soundfile>=0.12.1",
+  "matplotlib>=3.5",
+  "pandas>=2.0.0,<3.0.0",
+  "transformers>=5,<6",
+  "torchdiffeq==0.2.5",
+  "tqdm",
+  "ipython",
+  "einops",
+]
+
+[project.optional-dependencies]
+atlas = ["scikit-learn"]                     # the atlas of the demos (SCAPES/auxiliar/atlas.py)
+music2latent = ["music2latent==0.1.8"]
+encodec = ["encodec==0.1.1"]
+
+[tool.setuptools.packages.find]
+include = ["SCAPES*"]
+
+[tool.setuptools.package-data]
+SCAPES = ["config/*.gin", "config/*.csv"]
