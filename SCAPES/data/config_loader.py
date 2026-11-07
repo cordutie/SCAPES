@@ -26,6 +26,7 @@ class DataprepConfig:
     seed: int = 42
     device: str = "auto"
     cherry_picking: str = ""     # path to cherry_picking.csv; "" = none
+    GUI: bool = False            # True: dataprep ends with the atlas step (SCAPES/auxiliar/atlas.py)
 
 
 _GIN_MAP = [
@@ -43,6 +44,7 @@ _GIN_MAP = [
     (["seed"], "seed"),
     (["device"], "device"),
     (["cherry_picking"], "cherry_picking"),
+    (["GUI"], "GUI"),
 ]
 
 
@@ -192,6 +194,8 @@ def load_dataprep_config(gin_path: Path) -> DataprepConfig:
         if val is not None:
             setattr(cfg, attr, val)
     _check_required(cfg, path)
+    if not isinstance(cfg.GUI, bool):
+        raise ConfigError(f"{path}: GUI must be True or False")
     if not isinstance(cfg.cherry_picking, str):
         raise ConfigError(f"{path}: cherry_picking must be a quoted path, or \"\" for none")
     return cfg

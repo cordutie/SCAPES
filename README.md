@@ -61,6 +61,8 @@ The simplified tutorial calls two functions from [`quickstart/wrappers.py`](quic
 
 The generation modes (`encodec24`, `spectrostream`, `encodec48`, `music2latent`), their settings (`codec`, `conditioning_rate`, `conditioning_memory_seconds`) and their geometry are described in [docs/generation_modes.html](docs/generation_modes.html).
 
+**GUI = True.** With `GUI = True` in the config, dataprep ends by fitting an atlas (`SCAPES/auxiliar/atlas.py`) on the CLAP embeddings and replaces them by their atlas version, so the model trains on those. The atlas is saved as `atlas.npz` in the dataset folder and copied into each model folder; `Atlas.load(path)` reads it (`encode`, `decode`, `autoencode`). Inference then rewrites the CLAP embeddings that come from audio with it. A dataset needs a new build folder to change this key.
+
 ## Citation
 
 If you use SCAPES in your research, please cite:

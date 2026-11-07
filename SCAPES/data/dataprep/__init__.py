@@ -1,5 +1,5 @@
 from .atoms import latents_maker, list_audio_files
-from .semantic import build_semantics_folder, make_clap_embedder, precompute_semantic_annotations
+from .semantic import apply_atlas, build_semantics_folder, make_clap_embedder, precompute_semantic_annotations
 
 
 def precompute_annotations(*_args, **_kwargs):
@@ -11,6 +11,7 @@ def precompute_annotations(*_args, **_kwargs):
 __all__ = [
     "latents_maker",
     "list_audio_files",
+    "apply_atlas",
     "build_semantics_folder",
     "make_clap_embedder",
     "precompute_semantic_annotations",

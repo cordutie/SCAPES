@@ -56,6 +56,34 @@ def precompute_semantic_annotations(dataset, embedder=None, batch_size: int = 12
     print("CLAP embeddings saved.")
 
 
+ATLAS_FILE = "atlas.npz"
+
+
+def apply_atlas(dataset):
+    """
+    GUI = True: fit an Atlas (SCAPES/auxiliar/atlas.py) on all the CLAP arrays, save it as <dataset>/atlas.npz, and
+    replace every array by its autoencode. The original embeddings are not kept: training reads the new ones.
+    Not run again when atlas.npz exists (the arrays are then already the autoencoded ones).
+    """
+    from SCAPES.auxiliar.atlas import Atlas
+    store, key = dataset.store, dataset.clap_key
+    path = Path(dataset.dataset_path) / ATLAS_FILE
+    if path.exists():
+        print(f"Atlas already fitted: {path}")
+        return path
+    print("\n--- Atlas (GUI = True) ---")
+    files = [dataset.audio_path(f) for f in dataset.filenames]
+    arrays = [store.load_grid_array("clap", key, f) for f in files]
+    atlas = Atlas.fit(torch.cat(arrays))
+    atlas.add_names_and_prior([a for a in arrays], [Path(f).stem for f in files])
+    for f, arr in zip(files, arrays):
+        if len(arr):
+            store.save_grid_array("clap", key, f, atlas.autoencode(arr.float()))
+    atlas.save(path)
+    print(f"Atlas with {atlas.K} clusters saved to {path}; CLAP embeddings replaced by their atlas version.")
+    return path
+
+
 def build_semantics_folder(csv_path, output_dir, dataset, overwrite: bool = False) -> int:
     """
     Reads the cherry-picking CSV (columns filename, start_sec, end_sec, flag, icon, description) and writes, for each

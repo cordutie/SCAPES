@@ -15,7 +15,7 @@ SPEC_FORMAT = 1
 AUDIO_EXTENSIONS = ("*.wav", "*.mp3", "*.flac", "*.ogg")
 # the spec keys that the config must match (the file also holds wavs, format and created, which are not compared here)
 CONFIG_SPEC_KEYS = ("codec", "conditioning_rate", "semantic.context_seconds", "semantic.random_extension",
-                    "splits.val_split_ratio", "splits.test_ratio", "dataset.hop_atoms", "seed", "cherry_picking")
+                    "splits.val_split_ratio", "splits.test_ratio", "dataset.hop_atoms", "seed", "cherry_picking", "GUI")
 MAX_NAMES = 10
 
 
@@ -55,6 +55,7 @@ def dataprep_specs(cfg, wav_folder, config_file) -> dict:
         "dataset.hop_atoms": cfg.hop_atoms if res.mode == "atoms" else 1,
         "seed": cfg.seed,
         "cherry_picking": cherry,
+        "GUI": cfg.GUI,
         "wavs": {"folder": str(Path(wav_folder).resolve()), "files": audio_files(wav_folder)},
     }
 
@@ -85,7 +86,7 @@ def read_specs(dataset_dir):
 def compare_specs(stored, current):
     config_lines = []
     for key in CONFIG_SPEC_KEYS:
-        a, b = stored.get(key), current[key]
+        a, b = stored.get(key, False if key == "GUI" else None), current[key]
         if a != b:
             config_lines.append(f"  {key}: dataset has {_show(key, stored)}, config has {_show(key, current)}")
 

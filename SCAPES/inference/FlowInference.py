@@ -15,6 +15,7 @@ from SCAPES.generation import print_resolution
 from SCAPES.data.geometry import geometry_from_inference_gin, resolve_geometry
 from SCAPES.data.representations import frames_to_samples_48k
 from SCAPES.data.geometry import atom_count
+from SCAPES.auxiliar.atlas import Atlas
 from SCAPES.models.flow.FlowModel import FlowModel
 from SCAPES.models.factorization.LocalEncoder import LocalEncoder
 from SCAPES.inference.render import StreamRenderer, render_atoms
@@ -343,6 +344,9 @@ class FlowInference:
                 raise ConfigError(f"{gin_path}: model architecture is missing (model.size or the four model.* lines)")
             arch = dict(_SIZE_TABLE[size])
         self._setup(raw, info, geom, arch, device, verbose)
+        # trained with GUI = True: the CLAP embeddings of audio are rewritten with the atlas of the training data
+        if (model_dir / "atlas.npz").exists():
+            self.atlas = Atlas.load(model_dir / "atlas.npz")
 
         # ─── Load checkpoint weights ───
         flow_name, local_name = self._resolve_checkpoint_names(checkpoint, model_dir)
@@ -403,13 +407,14 @@ class FlowInference:
         self.info = info
         self.geom = geom
         self.mode = geom.mode
-        print_resolution(geom.resolution)
+        # print_resolution(geom.resolution)
         self.sr = info.sample_rate            # output rate (codec rate)
         self.load_sr = 48000                  # rate of the audio given to CLAP and the helper pipelines
         self.frame_rate = info.frame_rate
         self.latent_dim = geom.latent_dim
         self._codec = None
         self._context_model = None
+        self.atlas = None   # set by __init__ for a model trained with GUI = True
         self.mu = self.std = None
         self.standardize = bool(_get_nested(raw, ["training", "standardize_latents"], False))
 
@@ -580,6 +585,8 @@ class FlowInference:
                 context_embeddings.append(last_valid_emb)
             else:
                 raise ValueError("Audio file is too short to compute even one context window!")
+        if self.atlas is not None:
+            context_embeddings = list(self.atlas.autoencode(torch.stack(context_embeddings)))
         return context_embeddings
 
     def build_base_timeline(self, atoms_129D, context_embeddings, default_TF=False):
@@ -664,6 +671,35 @@ class FlowInference:
         prefix = past[..., -o:].transpose(1, 2).contiguous() if o > 0 else None
         return encoded_past, prefix
 
+    # One step of generate: the unit of step t from the units before it and the step's context embedding. It is stored
+    # in timeline[t]["atom_generated"] and returned ([1, frame_dim, U]). Real-time use: append a step to the timeline,
+    # call this, decode the unit. The models must be in eval mode (generate sets it).
+    @torch.no_grad()
+    def generate_step(self, timeline: List[Dict[str, Any]], t: int, NFE: int = 32, cfg_scale: float = 1.0):
+        g = self.geom
+        if g.mode == "autoregressive":
+            encoded_past, prefix = self._ar_past(timeline, t)
+        else:
+            encoded_past, prefix = self._atoms_past(timeline, t)
+
+        context = timeline[t]["context_embedding"].to(self.device)
+        if context.dim() == 1:
+            context = context.unsqueeze(0)
+
+        x0 = torch.randn(1, g.unit_frames, g.frame_dim, device=self.device)
+
+        pred = self.model.generate(
+            x0=x0,
+            encoded_past=encoded_past,
+            clap_context=context,
+            max_nfe=NFE,
+            cfg_scale=cfg_scale,
+            prefix=prefix,
+        )
+
+        timeline[t]["atom_generated"] = pred.transpose(1, 2)
+        return timeline[t]["atom_generated"]
+
     @torch.no_grad()
     def generate(self, timeline: List[Dict[str, Any]], NFE: int = 32, cfg_scale: float = 1.0) -> List[Dict[str, Any]]:
         self.model.eval()
@@ -678,27 +714,7 @@ class FlowInference:
             print(f"\n--- Starting Generation over {total_steps} steps (NFE={NFE}, CFG={cfg_scale}) ---")
 
         for t in tqdm(range(total_steps), desc="Solving ODE", disable=not self.verbose):
-            if g.mode == "autoregressive":
-                encoded_past, prefix = self._ar_past(timeline, t)
-            else:
-                encoded_past, prefix = self._atoms_past(timeline, t)
-
-            context = timeline[t]["context_embedding"].to(self.device)
-            if context.dim() == 1:
-                context = context.unsqueeze(0)
-
-            x0 = torch.randn(1, g.unit_frames, g.frame_dim, device=self.device)
-
-            pred = self.model.generate(
-                x0=x0,
-                encoded_past=encoded_past,
-                clap_context=context,
-                max_nfe=NFE,
-                cfg_scale=cfg_scale,
-                prefix=prefix,
-            )
-
-            timeline[t]["atom_generated"] = pred.transpose(1, 2)
+            self.generate_step(timeline, t, NFE, cfg_scale)
 
         if self.verbose:
             print("✅ Generation Complete!")

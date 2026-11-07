@@ -50,7 +50,7 @@ def _gin_files(config_dir):
 # CLAP model (tests). Returns the RepresentationStore.
 def run_dataprep(dataset_path, config_dir=None, device=None, clap_embedder=None):
     from SCAPES.data.config_loader import load_dataprep_config
-    from SCAPES.data.dataprep import latents_maker, precompute_semantic_annotations
+    from SCAPES.data.dataprep import apply_atlas, latents_maker, precompute_semantic_annotations
     from SCAPES.data.dataset import AtomSequenceDataset
 
     dataset_path = Path(dataset_path)
@@ -68,13 +68,17 @@ def run_dataprep(dataset_path, config_dir=None, device=None, clap_embedder=None)
     torch.manual_seed(config.seed)
 
     print(f"Dataset: {dataset_path}\nConfig:  {config_dir}\nDevice:  {device}")
-    print("\n[1/2] Latents...")
+    steps = 3 if config.GUI else 2
+    print(f"\n[1/{steps}] Latents...")
     store = latents_maker(dataset_path, config, device=device)
 
     dataset = AtomSequenceDataset(dataset_path, config, requested_keys=["index"], device="cpu", verbose=True)
-    print(f"\n[2/2] CLAP annotations (batch_size={config.precompute_batch_size})...")
+    print(f"\n[2/{steps}] CLAP annotations (batch_size={config.precompute_batch_size})...")
     precompute_semantic_annotations(dataset, embedder=clap_embedder, batch_size=config.precompute_batch_size,
                                     device=device)
+    if config.GUI:
+        print("\n[3/3] Atlas...")
+        apply_atlas(dataset)
     print("\nDone!")
     return store
 
@@ -241,11 +245,18 @@ def _default_cherry_csv(config_dir):
 # save_path/semantics (None: _default_cherry_csv). Returns save_path.
 def run_training(dataset_path, save_path, config_dir=None, resume=None, max_steps=None, cherry_csv=None) -> Path:
     from SCAPES.data.dataprep.semantic import build_semantics_folder
-    from SCAPES.data.config_loader import load_training_config
+    from SCAPES.data.config_loader import load_dataprep_config, load_training_config
 
     dataset_path = Path(dataset_path)
     config_dir = Path(config_dir) if config_dir is not None else dataset_path / "config"
     trainer = build_trainer(dataset_path, save_path, config_dir=config_dir, resume=resume)
+    # GUI = True: the model keeps the atlas of its training embeddings (inference rewrites CLAP embeddings with it)
+    atlas = dataset_path / "atlas.npz"
+    if load_dataprep_config(_gin_files(config_dir)[0]).GUI and not atlas.exists():
+        raise ConfigError(f"GUI = True but {atlas} does not exist: run dataprep with GUI = True")
+    if atlas.exists():
+        Path(save_path).mkdir(parents=True, exist_ok=True)
+        shutil.copy(atlas, Path(save_path) / "atlas.npz")
     if max_steps is not None:
         trainer.max_steps = max_steps
 
