@@ -257,6 +257,8 @@ def run_training(dataset_path, save_path, config_dir=None, resume=None, max_step
     if atlas.exists():
         Path(save_path).mkdir(parents=True, exist_ok=True)
         shutil.copy(atlas, Path(save_path) / "atlas.npz")
+        if (dataset_path / "snippets").is_dir():
+            shutil.copytree(dataset_path / "snippets", Path(save_path) / "snippets", dirs_exist_ok=True)
     if max_steps is not None:
         trainer.max_steps = max_steps
 

@@ -33,7 +33,8 @@ import torch
 
 TRIM = 0.1          # share of the rows of each cluster, farthest from the mean, left out of the PCA and the scale
 SCALE_QUANTILE = 0.9
-K_RANGE = (8, 32)   # K is the one of this range with the best cosine silhouette (fewer clusters if fewer rows)
+K_RANGE = (9, 60)   # K is the one of this range with the best cosine silhouette (fewer clusters if fewer rows)
+K_STEP = 3          # only the multiples of 3 from the start of the range are tried: they fit the three columns of the demo
 FIT_ROWS = 20000    # rows used to choose K and the centres (all rows are used for the means, PCA and scale)
 SILHOUETTE_ROWS = 2000
 CLOUD_ROWS = 4000   # the 3-D plot keeps at most this many points (the GUI ran well with 3968)
@@ -71,8 +72,33 @@ def _silhouette(x, labels, k):
     return float(torch.where(size > 1, s, torch.zeros_like(s)).mean())
 
 
+# The representatives of the clusters (atlas_reps.py): real rows of the corpus, 1 to 3 per cluster, each with the place of its audio.
+# cluster [R], vec [R, d] (the row as the model saw it in training), file [R] (index into files), start [R] seconds into that file.
+class Representatives:
+    def __init__(self, cluster, vec, file, start, files):
+        self.cluster = np.asarray(cluster, dtype=np.int64)
+        self.vec = np.asarray(vec, dtype=np.float32)
+        self.file = np.asarray(file, dtype=np.int64)
+        self.start = np.asarray(start, dtype=np.float32)
+        self.files = [str(f) for f in files]
+
+    def __len__(self):
+        return len(self.cluster)
+
+    def name(self, i):
+        return f"{self.files[self.file[i]]}@{self.start[i]:.1f}s"
+
+    def to_arrays(self):
+        return {"reps_cluster": self.cluster, "reps_vec": self.vec, "reps_file": self.file, "reps_start": self.start,
+                "reps_files": np.array(self.files)}
+
+    @classmethod
+    def from_arrays(cls, z):
+        return cls(z["reps_cluster"], z["reps_vec"], z["reps_file"], z["reps_start"], z["reps_files"])
+
+
 class Atlas:
-    def __init__(self, centres, mu, P, s, view_mean, view_P3, view_scale, cloud, cloud_labels, names=None, prior=None):
+    def __init__(self, centres, mu, P, s, view_mean, view_P3, view_scale, cloud, cloud_labels, names=None, prior=None, reps=None):
         self.centres = torch.as_tensor(centres, dtype=torch.float64)   # [K, d] assignment centres
         self.mu = torch.as_tensor(mu, dtype=torch.float64)             # [K, d] unit cluster means
         self.P = torch.as_tensor(P, dtype=torch.float64)               # [d, 2] orthonormal error basis
@@ -84,6 +110,7 @@ class Atlas:
         self.cloud_labels = torch.as_tensor(cloud_labels, dtype=torch.int64)  # [m] their cluster
         self.names = list(names) if names is not None else [f"cluster {k}" for k in range(len(self.mu))]
         self.prior = prior                                                  # AtlasPrior, or None
+        self.reps = reps                                                    # Representatives (below), or None
 
     @property
     def K(self):
@@ -102,7 +129,7 @@ class Atlas:
             centres = _unit(v.mean(dim=0, keepdim=True))
         else:
             best = None
-            for k in range(k_min, k_max + 1):
+            for k in range(k_min, k_max + 1, K_STEP):
                 c = _kmeans(sub, k, generator)
                 labels = (sub @ c.T).argmax(dim=1)
                 score = _silhouette(sub[:SILHOUETTE_ROWS], labels[:SILHOUETTE_ROWS], k)
@@ -143,6 +170,8 @@ class Atlas:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         extra = {} if self.prior is None else self.prior.to_arrays()
+        if self.reps is not None:
+            extra.update(self.reps.to_arrays())
         np.savez(path, centres=self.centres.numpy(), mu=self.mu.numpy(), P=self.P.numpy(), s=np.float64(self.s),
                  view_mean=self.view_mean.numpy(), view_P3=self.view_P3.numpy(), view_scale=np.float64(self.view_scale),
                  cloud=self.cloud.numpy(), cloud_labels=self.cloud_labels.numpy(), names=np.array(self.names), **extra)
@@ -155,8 +184,9 @@ class Atlas:
             if "prior_0_weight" in z.files:
                 from SCAPES.auxiliar.atlas_prior import AtlasPrior
                 prior = AtlasPrior.from_arrays(z, len(z["mu"]))
+            reps = Representatives.from_arrays(z) if "reps_cluster" in z.files else None
             return cls(z["centres"], z["mu"], z["P"], float(z["s"]), z["view_mean"], z["view_P3"],
-                       float(z["view_scale"]), z["cloud"], z["cloud_labels"], names, prior)
+                       float(z["view_scale"]), z["cloud"], z["cloud_labels"], names, prior, reps)
 
     # rows [n, d] or [d] (torch or numpy) -> unit float64 rows [n, d] and whether the input was a single vector
     def _rows(self, v):
@@ -201,6 +231,24 @@ class Atlas:
         self.prior = None
         if any(len(a) > N for a in arrays):
             self.prior = AtlasPrior.fit([c.numpy() for c in codes], [c.numpy() for c in clusters], self.K)
+
+    # Representatives (atlas_reps.py). real: one [G, d] array per file, the rows as CLAP gave them (the groups are found in them);
+    # stored: the same rows as the model sees them (the atlas version; the same arrays when they are the same); starts: for each file
+    # the start in seconds of each of its rows; stems: the file names. Chosen among the rows of stored's clusters.
+    def add_representatives(self, real, stored, starts, stems, seed=0):
+        from SCAPES.auxiliar.atlas_reps import pick
+        real_rows = torch.cat([torch.as_tensor(a).float() for a in real])
+        stored_rows = torch.cat([torch.as_tensor(a).float() for a in stored])
+        labels = self.encode(stored_rows)[0]
+        chosen = pick(real_rows, labels, self.K, seed)
+        sizes = np.cumsum([0] + [len(a) for a in stored])
+        out = []
+        for k, row in chosen:
+            f = int(np.searchsorted(sizes, row, side="right")) - 1
+            out.append((k, row, f, float(starts[f][row - sizes[f]])))
+        self.reps = Representatives([o[0] for o in out], stored_rows[[o[1] for o in out]].numpy(), [o[2] for o in out],
+                                    [o[3] for o in out], stems)
+        return self.reps
 
     # 3-D coordinates [n, 3] (or [3]) of CLAP vectors, in the view of the cloud: (v - view_mean) @ view_P3 / view_scale
     def to3d(self, v):

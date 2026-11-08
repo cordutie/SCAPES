@@ -1,9 +1,11 @@
 import csv
 from pathlib import Path
 
+import numpy as np
 import torch
 from tqdm import tqdm
 
+from SCAPES.data.dataprep.snippets import write_snippets
 from SCAPES.data.representations import grid_starts_48k
 from audio_codec_wrappers.audio import adapt_audio, load_audio
 
@@ -57,6 +59,7 @@ def precompute_semantic_annotations(dataset, embedder=None, batch_size: int = 12
 
 
 ATLAS_FILE = "atlas.npz"
+SNIPPETS_DIR = "snippets"        # next to the atlas: the audio of its representatives
 
 
 def apply_atlas(dataset):
@@ -75,12 +78,21 @@ def apply_atlas(dataset):
     files = [dataset.audio_path(f) for f in dataset.filenames]
     arrays = [store.load_grid_array("clap", key, f) for f in files]
     atlas = Atlas.fit(torch.cat(arrays))
-    atlas.add_names_and_prior([a for a in arrays], [Path(f).stem for f in files])
-    for f, arr in zip(files, arrays):
+    stems = [Path(f).stem for f in files]
+    atlas.add_names_and_prior([a for a in arrays], stems)
+    stored = [atlas.autoencode(a.float()) if len(a) else a for a in arrays]
+    # the representatives: found in the CLAP embeddings as they are, kept as the model will see them; then their audio
+    geom = dataset.geom
+    starts = [np.arange(len(a)) * geom.stride_samples / geom.sample_rate for a in arrays]
+    reps = atlas.add_representatives(arrays, stored, starts, stems)
+    paths = dict(zip(stems, files))
+    n = write_snippets(reps, lambda stem: paths[stem], Path(dataset.dataset_path) / SNIPPETS_DIR)
+    for f, arr in zip(files, stored):
         if len(arr):
-            store.save_grid_array("clap", key, f, atlas.autoencode(arr.float()))
+            store.save_grid_array("clap", key, f, arr)
     atlas.save(path)
-    print(f"Atlas with {atlas.K} clusters saved to {path}; CLAP embeddings replaced by their atlas version.")
+    print(f"Atlas with {atlas.K} clusters and {len(reps)} representatives ({n} audio snippets) saved to {path}; "
+          f"CLAP embeddings replaced by their atlas version.")
     return path
 
 

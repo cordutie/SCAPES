@@ -74,6 +74,8 @@ The generation modes (`encodec24`, `spectrostream`, `encodec48`, `music2latent`)
 
 **GUI = True.** With `GUI = True` in the config, dataprep ends by fitting an atlas (`SCAPES/auxiliar/atlas.py`) on the CLAP embeddings and replaces them by their atlas version, so the model trains on those. The atlas is saved as `atlas.npz` in the dataset folder and copied into each model folder; `Atlas.load(path)` reads it (`encode`, `decode`, `autoencode`). Inference then rewrites the CLAP embeddings that come from audio with it. A dataset needs a new build folder to change this key.
 
+The number of clusters K is the one of 9, 12, …, 60 with the best cosine silhouette. Inside each cluster the atlas also keeps 1 to 3 *representatives*: real rows of the corpus, each the nearest to the centre of a group found inside the cluster (a group only counts when it is well separated and not tiny: `SCAPES/auxiliar/atlas_reps.py`). `atlas.reps` holds them with the file and the time they come from, and dataprep writes the first second of audio of each to `snippets/000.mp3`, `001.mp3`, … next to the atlas (mono, about 128 kbps; a few MB), so a score view can play where a representative comes from.
+
 ## Citation
 
 If you use SCAPES in your research, please cite:
