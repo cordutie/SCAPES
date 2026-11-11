@@ -66,7 +66,7 @@ pip install jupyter
 jupyter notebook quickstart/tutorial_simplified.ipynb
 ```
 
-The simplified tutorial calls two functions from [`quickstart/wrappers.py`](quickstart/wrappers.py): `data_preparation` and `training_loop`. Each reads one config file and a build folder (`dataset/` and `models/<size>_mem<ms>/`) and runs the step.
+The simplified tutorial calls two functions from [`quickstart/wrappers.py`](quickstart/wrappers.py): `data_preparation` and `training_loop`. Each reads one config file and a build folder (`dataset/` and `models/<size>_<ms>ms/`) and runs the step.
 
 ## Documentation
 

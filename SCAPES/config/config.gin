@@ -7,6 +7,10 @@
 codec = "music2latent"              # encodec24 | spectrostream (autoregressive) | encodec48 | music2latent (atoms)
 conditioning_rate = 10.0            # Hz; rounded to the nearest rate the codec allows (docs/generation_modes.html)
 conditioning_memory_seconds = 0.5   # s [training]; 0.5 for atoms, 1.0 for autoregressive codecs. Part of the model folder name
+# Atom rule (atoms codecs only; autoregressive codecs ignore it). Written into inference.gin of every model.
+#   "fixed" (default): music2latent crossfade x = min(2, n), zeroed part o = 4 latents; encodec48 crossfade x = min(15, n), zeroed o = 15.
+#   "old": crossfade x = min(ceil(n/2), crossfade cap), overlap o = max(n, minimum atom - x - n) (the first rule, kept for comparison).
+atoms_rule = "fixed"
 
 # ---- Cherry picking (optional) [dataprep]
 # Path to a cherry_picking.csv (file, start, end, flag per line). Empty = no cherry picking. Relative paths start at the
@@ -16,7 +20,7 @@ cherry_picking = ""
 # ---- GUI [dataprep]
 # True: dataprep ends by fitting an atlas on the CLAP embeddings and replaces them by their atlas version (the models
 # train on those); the atlas is saved as dataset/atlas.npz and copied into each model folder. See SCAPES/auxiliar/atlas.py.
-GUI = False
+GUI = True
 
 # ---- Dataprep [dataprep]
 semantic.context_seconds = 1.0      # seconds of audio behind each CLAP embedding

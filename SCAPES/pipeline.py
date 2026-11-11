@@ -277,7 +277,7 @@ def run_training(dataset_path, save_path, config_dir=None, resume=None, max_step
     return Path(save_path)
 
 
-# Name of a model folder: <size>_mem<ms>. The size is its canonical name (f -> large); the memory is in whole
+# Name of a model folder: <size>_<ms>ms. The size is its canonical name (f -> large); the memory is in whole
 # milliseconds, so a memory that is not a whole number of milliseconds is refused.
 def model_folder_name(size, memory_seconds) -> str:
     from SCAPES.data.config_loader import _SIZE_TABLE
@@ -292,10 +292,10 @@ def model_folder_name(size, memory_seconds) -> str:
         raise ConfigError(f"Invalid size '{size}'. Choose from: {list(_SIZE_TABLE.keys())}")
     # the aliases share one dictionary with their canonical size, which comes first in the table
     canonical = next(k for k in _SIZE_TABLE if _SIZE_TABLE[k] is _SIZE_TABLE[size])
-    return f"{canonical}_mem{ms}"
+    return f"{canonical}_{ms}ms"
 
 
-# The model folder of a config in a build folder: models/<size>_mem<ms>. Nothing is created.
+# The model folder of a config in a build folder: models/<size>_<ms>ms. Nothing is created.
 def model_folder(build_path, config_path) -> Path:
     from SCAPES.data.config_loader import load_dataprep_config, load_training_config
     from SCAPES.generation import resolve_generation
@@ -359,7 +359,7 @@ def _check_model_folder(model_dir, resume):
         raise ConfigError(f"resume={resume!r}: there is no model folder {model_dir} to resume. Nothing was written.")
 
 
-# Trains one model in the build folder, into models/<size>_mem<ms>/, with the dataset of prepare_build. No dataprep runs:
+# Trains one model in the build folder, into models/<size>_<ms>ms/, with the dataset of prepare_build. No dataprep runs:
 # the dataset must exist and its specs and wavs must match the config and the wav folder. The cherry-picked semantics go
 # into the model folder. max_steps overrides training.max_steps. Returns the model folder.
 def train_in_build(wav_path, build_path, config_path, resume=None, max_steps=None) -> Path:

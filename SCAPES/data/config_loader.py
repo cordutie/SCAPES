@@ -26,7 +26,7 @@ class DataprepConfig:
     seed: int = 42
     device: str = "auto"
     cherry_picking: str = ""     # path to cherry_picking.csv; "" = none
-    GUI: bool = False            # True: dataprep ends with the atlas step (SCAPES/auxiliar/atlas.py)
+    GUI: bool = True             # True (default): dataprep ends with the atlas step (SCAPES/auxiliar/atlas.py)
     atoms_rule: str = "fixed"    # the atom rule of atoms codecs: "fixed" (default, generation_fixed.py) or "old" (generation.py)
 
 
