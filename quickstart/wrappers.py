@@ -124,3 +124,9 @@ def data_preparation(wav_path, build_path, config_path):
 # Trains one model into <build>/models/<size>_<ms>ms, and returns that folder
 def training_loop(wav_path, build_path, config_path, resume=None):
     return train_in_build(wav_path, build_path, config_path, resume=resume)
+
+from SCAPES.packer import gui_packer
+
+# One zip (or folder, with zip=False) per trained model of the build folder, with only what the GUI needs (best checkpoints, atlas, snippets)
+def pack_for_gui(build_path, out_dir=None, zip=True):
+    return gui_packer(build_path, out_dir=out_dir, zip=zip)
