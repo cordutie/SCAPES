@@ -76,6 +76,7 @@ class Resolution:
     memory_window: int = 0
     attended: int = 0
     notes: tuple = ()
+    atoms_rule: str = "fixed"         # which atom rule made crossfade/overlapped (see ATOMS_RULES)
 
     @property
     def hop_seconds(self) -> float:
@@ -106,6 +107,16 @@ class Resolution:
         return self.atom + (self.memory_atoms - 1) * self.n
 
 
+ATOMS_RULES = ("old", "fixed")       # old: crossfade and overlap from atom_geometry; fixed (the default): generation_fixed.py
+
+
+def _atom_geometry(spec: CodecSpec, n: int, rule: str):
+    if rule == "fixed":
+        from SCAPES.generation_fixed import atom_geometry_fixed     # lazy: generation_fixed imports this module
+        return atom_geometry_fixed(spec.name, n)
+    return atom_geometry(spec, n)
+
+
 def rate_range(spec: CodecSpec, n: int) -> tuple:
     """(low, high) in Hz: the requested rates that resolve to n, as [low, high). The bounds are the midpoints in Hz
     to the neighbouring rates (a midpoint goes to the smaller n, as in resolve_generation). None means no bound."""
@@ -115,10 +126,12 @@ def rate_range(spec: CodecSpec, n: int) -> tuple:
     return low, high
 
 
-def resolve_generation(codec, conditioning_rate=None, conditioning_memory_seconds=None) -> Resolution:
+def resolve_generation(codec, conditioning_rate=None, conditioning_memory_seconds=None, atoms_rule="fixed") -> Resolution:
     if codec not in CODECS:
         users = [k for k, v in CODECS.items() if v.user]
         raise ConfigError(f"unknown codec {codec!r}, one of {users}")
+    if atoms_rule not in ATOMS_RULES:
+        raise ConfigError(f"atoms_rule must be one of {ATOMS_RULES}, got {atoms_rule!r}")
     spec = CODECS[codec]
     c = DEFAULT_RATE if conditioning_rate is None else conditioning_rate
     m_s = spec.default_memory_seconds if conditioning_memory_seconds is None else conditioning_memory_seconds
@@ -127,7 +140,11 @@ def resolve_generation(codec, conditioning_rate=None, conditioning_memory_second
     if not m_s > 0:
         raise ConfigError(f"conditioning_memory_seconds must be > 0, got {m_s}")
     r = spec.latent_rate
-    hi = n_max(spec)
+    if spec.mode == _AT and atoms_rule == "fixed":
+        from SCAPES.generation_fixed import n_max_fixed
+        hi = n_max_fixed(codec)
+    else:
+        hi = n_max(spec)
 
     # nearest available rate; ties go to the smaller n
     n, best = spec.n_min, abs(r / spec.n_min - c)
@@ -141,13 +158,13 @@ def resolve_generation(codec, conditioning_rate=None, conditioning_memory_second
     common = dict(codec=codec, mode=spec.mode, latent_rate=r, requested_rate=c, requested_memory_seconds=m_s,
                   n=n, rate=r / n, memory_latents=m_l)
     if spec.mode == _AT:
-        x, o, A = atom_geometry(spec, n)
+        x, o, A = _atom_geometry(spec, n, atoms_rule)
         K = max(1, -(-(m_l - x) // n))
         if K * A > CAP:
             K = CAP // A
             notes.append("cap")
         return Resolution(**common, crossfade=x, overlapped=o, atom=A, memory_atoms=K, k_max=CAP // A,
-                          attended=K * A, notes=tuple(notes))
+                          attended=K * A, notes=tuple(notes), atoms_rule=atoms_rule)
     W = min(m_l, CAP)
     if m_l > CAP:
         notes.append("cap")

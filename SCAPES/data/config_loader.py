@@ -27,6 +27,7 @@ class DataprepConfig:
     device: str = "auto"
     cherry_picking: str = ""     # path to cherry_picking.csv; "" = none
     GUI: bool = False            # True: dataprep ends with the atlas step (SCAPES/auxiliar/atlas.py)
+    atoms_rule: str = "fixed"    # the atom rule of atoms codecs: "fixed" (default, generation_fixed.py) or "old" (generation.py)
 
 
 _GIN_MAP = [
@@ -45,6 +46,7 @@ _GIN_MAP = [
     (["device"], "device"),
     (["cherry_picking"], "cherry_picking"),
     (["GUI"], "GUI"),
+    (["atoms_rule"], "atoms_rule"),
 ]
 
 

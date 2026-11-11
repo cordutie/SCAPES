@@ -97,6 +97,7 @@ class Geometry:
         lines = [f'codec = "{self.codec}"', f"conditioning_rate = {res.requested_rate}",
                  f"conditioning_memory_seconds = {res.requested_memory_seconds}",
                  f'resolved.mode = "{res.mode}"', f"resolved.new_latents = {res.n}"]
+        lines.append(f'atoms_rule = "{res.atoms_rule}"')
         if res.mode == "atoms":
             lines += [f"resolved.crossfade_latents = {res.crossfade}", f"resolved.overlapped_latents = {res.overlapped}",
                       f"resolved.atom_latents = {res.atom}", f"resolved.memory_atoms = {res.memory_atoms}"]
@@ -160,7 +161,7 @@ def crossfade_window(geom) -> torch.Tensor:
 def resolve_geometry(cfg: DataprepConfig, info=None) -> Geometry:
     if info is None:
         info = get_codec_info(cfg.codec_name)
-    res = resolve_generation(cfg.codec_name, cfg.conditioning_rate, cfg.conditioning_memory_seconds)
+    res = resolve_generation(cfg.codec_name, cfg.conditioning_rate, cfg.conditioning_memory_seconds, cfg.atoms_rule)
     return _geometry_from_resolution(info, res, int(cfg.hop_atoms), cfg.semantic_context_seconds)
 
 
@@ -185,7 +186,8 @@ def geometry_from_inference_gin(raw: dict, info) -> Geometry:
     codec = raw["codec"]
     if canonical(info.name) != codec:
         raise ConfigError(f"inference.gin codec {codec!r} does not match the codec {info.name!r} that was loaded")
-    res = resolve_generation(codec, raw.get("conditioning_rate"), raw.get("conditioning_memory_seconds"))
+    res = resolve_generation(codec, raw.get("conditioning_rate"), raw.get("conditioning_memory_seconds"),
+                             raw.get("atoms_rule", "fixed"))
     if res.mode == "atoms":
         counts = {"new_latents": res.n, "crossfade_latents": res.crossfade, "overlapped_latents": res.overlapped,
                   "atom_latents": res.atom, "memory_atoms": res.memory_atoms}

@@ -12,7 +12,7 @@ import torch
 from SCAPES.errors import ConfigError
 
 # gin keys owned by the codec snippet: a dataset's own lines in these namespaces are dropped
-_GEOMETRY_KEYS = ("codec", "conditioning_rate", "conditioning_memory_seconds")
+_GEOMETRY_KEYS = ("codec", "conditioning_rate", "conditioning_memory_seconds", "atoms_rule")
 _GEOMETRY_PREFIXES = ("atoms.", "ar.", "codec.", "generation.", "resolved.", "dataset.memory_buffer_atoms")  # noqa: rejected key kept so old lines are dropped
 
 
@@ -302,7 +302,7 @@ def model_folder(build_path, config_path) -> Path:
     tcfg = load_training_config(Path(config_path))
     dcfg = load_dataprep_config(Path(config_path))
     memory = resolve_generation(dcfg.codec_name, dcfg.conditioning_rate,
-                                dcfg.conditioning_memory_seconds).requested_memory_seconds
+                                dcfg.conditioning_memory_seconds, dcfg.atoms_rule).requested_memory_seconds
     return Path(build_path) / "models" / model_folder_name(tcfg.size, memory)
 
 

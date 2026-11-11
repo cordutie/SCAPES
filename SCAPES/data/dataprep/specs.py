@@ -34,7 +34,7 @@ def audio_files(folder) -> list[dict]:
 # step, atom spacing for atoms codecs) and the absolute cherry-picking path. config_file is the universal config file;
 # a relative cherry_picking path starts at its folder. A cherry path that does not exist is refused.
 def dataprep_specs(cfg, wav_folder, config_file) -> dict:
-    res = resolve_generation(cfg.codec_name, cfg.conditioning_rate)
+    res = resolve_generation(cfg.codec_name, cfg.conditioning_rate, atoms_rule=cfg.atoms_rule)
     cherry = ""
     if cfg.cherry_picking:
         path = Path(config_file).parent / cfg.cherry_picking
