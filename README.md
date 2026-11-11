@@ -41,7 +41,7 @@ SCAPES can also be installed as a package, for example by the demos. Install PyT
 
 ```bash
 pip install "audio_codec_wrappers @ git+https://github.com/cordutie/audio_codec_wrappers"
-pip install "scapes[atlas] @ git+https://github.com/cordutie/SCAPES@v0.1.0"
+pip install "scapes[atlas] @ git+https://github.com/cordutie/SCAPES@v0.3.0"
 ```
 
 The package lists only the libraries without a special build. `msclap` (installed with `--no-deps`) and the jax set of SpectroStream are still installed as in the steps above.
