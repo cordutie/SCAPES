@@ -42,3 +42,4 @@ development/
 # Packaging output
 build/
 *.egg-info/
+!setup.sh
