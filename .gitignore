@@ -43,3 +43,4 @@ development/
 build/
 *.egg-info/
 !setup.sh
+.venv/

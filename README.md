@@ -6,7 +6,17 @@ Try the online demo: [![HuggingFace Spaces](https://img.shields.io/badge/%F0%9F%
 
 ## Installation
 
-Requirements: Linux, Python 3.12, an NVIDIA GPU with a recent driver (CUDA 12), git.
+Requirements: Linux (Ubuntu or similar), Python 3.12, git. An NVIDIA GPU is optional: without one, the CPU builds are installed.
+
+On Ubuntu, if they are missing: `sudo apt install -y git python3-venv`. Then:
+
+```bash
+git clone --recurse-submodules https://github.com/cordutie/SCAPES.git && cd SCAPES
+./setup.sh                     # environment in .venv, all packages, codec wrappers and the SpectroStream weights
+source .venv/bin/activate
+```
+
+`setup.sh` picks the CUDA 12.8 builds when `nvidia-smi` works and the CPU builds otherwise (`CUDA=0` or `CUDA=1` forces one; `PYTHON=python3.12` and `VENV=...` choose the Python and the folder). The same steps by hand:
 
 Clone the repository with its codec wrappers (the git submodule `external/audio_codec_wrappers/`):
 
@@ -41,7 +51,7 @@ SCAPES can also be installed as a package, for example by the demos. Install PyT
 
 ```bash
 pip install "audio_codec_wrappers @ git+https://github.com/cordutie/audio_codec_wrappers"
-pip install "scapes[atlas] @ git+https://github.com/cordutie/SCAPES@v0.3.0"
+pip install "scapes[atlas] @ git+https://github.com/cordutie/SCAPES@v0.3.1"
 ```
 
 The package lists only the libraries without a special build. `msclap` (installed with `--no-deps`) and the jax set of SpectroStream are still installed as in the steps above.
